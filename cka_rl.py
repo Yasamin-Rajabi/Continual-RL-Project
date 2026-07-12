@@ -36,7 +36,9 @@ class CkaRlAgent(nn.Module):
                 # the (already-normalized) alpha weights, giving the model an additional degree of freedom 
                 # to control the overall strength of historical knowledge reuse.
                 fuse_shared = False, 
-                fuse_heads = True,):
+                fuse_heads = True,
+                prev_units_paths = None,
+                distillation = True):
         
         super().__init__()
         self.delta_theta_mode = delta_theta_mode
@@ -46,9 +48,12 @@ class CkaRlAgent(nn.Module):
         self.fuse_shared = fuse_shared
         self.fuse_heads = fuse_heads
         self.pool_size = pool_size
+        self.prev_units_paths = prev_units_paths
+        self.distillation = distillation
 
         assert(fuse_heads or fuse_shared)
         self.setup_vectors(base_dir, latest_dir)
+
         # Alpha Setting
         self.setup_alpha(num_vectors=self.num_vectors, 
                          fix_alpha=fix_alpha,alpha_init=alpha_init,
@@ -186,10 +191,24 @@ class CkaRlAgent(nn.Module):
                 self.fc_logstd_base = base_model.get_base()
                 latest_model = torch.load(f"{latest_dir}/fc_logstd.pt", map_location=None)
                 self.fc_logstd_vectors, self.num_vectors = latest_model.get_vectors(self.fc_logstd_base)
-                logger.info(f"self.num_vectors:{self.num_vectors}")
-                self.merge_vectors(self.fc_mean_vectors, self.fc_logstd_vectors)
-                logger.debug(self.fc_mean_vectors['weight'].shape)
-                logger.debug(self.fc_logstd_vectors['weight'].shape)
+            
+            elif self.fuse_shared and latest_dir is not None:
+                logger.debug("Setup shared's vectors count")
+                temp_fc = torch.load(f"{latest_dir}/fc.pt")
+                if hasattr(temp_fc, 'network'):
+                    layer_idx = temp_fc.fuse_layers[0]
+                    self.num_vectors = temp_fc.network[layer_idx].num_weights + 1
+                else:
+                    self.num_vectors = 1
+
+                logger.info(f"self.num_vectors before merge: {self.num_vectors}")
+            
+            self.merge_vectors(
+                self.fc_mean_vectors if self.fuse_heads else None, 
+                self.fc_logstd_vectors if self.fuse_heads else None
+            )
+            logger.debug(self.fc_mean_vectors['weight'].shape)
+            logger.debug(self.fc_logstd_vectors['weight'].shape)
             
     def setup_alpha(self, num_vectors, fix_alpha, alpha_init, alpha_major, alpha_factor, use_alpha_scale):
         if num_vectors > 0:
@@ -225,7 +244,18 @@ class CkaRlAgent(nn.Module):
     
     #TODO add distillation boolean to arguments and pass merging vectors with most similarity to distillation_policy_merge
     def merge_vectors(self, mean_vectors,logstd_vectors):
-        def merge(vectors):
+        buffers = []
+        if self.prev_units_paths is not None and len(self.prev_units_paths) > 0: 
+            current_buf_path = f"{self.prev_units_paths[-1]}/distill_buffer.pt"
+            if os.path.exists(current_buf_path):
+                buffers.append(torch.load(current_buf_path))
+        if self.prev_units_paths is not None:
+            for p in self.prev_units_paths[:-1]:
+                buf_path = f"{p}/distill_buffer.pt"
+                if os.path.exists(buf_path):
+                    buffers.append(torch.load(buf_path))
+
+        def merge(vectors, layer_type, input_key, target_key, target_dim):
             for name, element in vectors.items():
                 similarities = torch.ones((element.shape[0], element.shape[0])) * -1
                 for i in range(element.shape[0]):
@@ -235,23 +265,94 @@ class CkaRlAgent(nn.Module):
                 max_sim_idx = torch.argmax(similarities)
                 idx1, idx2 = divmod(max_sim_idx.item(), element.shape[0])
                 logger.info(f"Merge vectors, name = {name}, idx1 = {idx1}, idx2 = {idx2}")
-                new_element = (element[idx1] + element[idx2]) / 2
+
+                if self.distillation:
+                    logger.info(f"Merge vectors via Distillation, type = {layer_type}, property = {name}, idx1 = {idx1}, idx2 = {idx2}")
+                    new_w, new_b = self.distillation_policy_merge(
+                        buffers[idx1], buffers[idx2], input_key, target_key, layer_type, target_dim
+                    )
+                    new_element = new_w if name == 'weight' else new_b
+                else:
+                    logger.info(f"Merge vectors via Simple Averaging (Fallback), type = {layer_type}, property = {name}, idx1 = {idx1}, idx2 = {idx2}")
+                    new_element = (element[idx1] + element[idx2]) / 2
+
                 element = torch.cat((element[:idx1], element[idx1+1:idx2], element[idx2+1:], new_element.unsqueeze(0)), dim=0)
                 logger.info(element.shape)
                 vectors[name] = element
         if self.num_vectors > self.pool_size:
             logger.info(f"Merge vectors, pool size = {self.pool_size}, current #vectors = {self.num_vectors}")
-            merge(mean_vectors)
-            merge(logstd_vectors)
+            if self.fuse_heads:
+                merge(mean_vectors, "mean", "shared", "targets", self.act_dim)
+                merge(logstd_vectors, "logstd", "shared", "targets", self.act_dim)
+            
+            if self.fuse_shared and hasattr(self.fc, 'network'):
+                for idx, layer_idx in enumerate(self.fc.fuse_layers):
+                    layer = self.fc.network[layer_idx]
+                    if layer.num_weights > self.pool_size:
+                        base_layout = layer.get_base()
+                        vectors_layout, _ = layer.get_vectors(base_layout)
+                        merge(vectors_layout, f"shared_layer_{layer_idx}", "obs", "shared", layer.out_features)
+                        layer.weights.data.copy_(vectors_layout['weight'])
+                        layer.biaes.data.copy_(vectors_layout['bias'])
             self.num_vectors = self.pool_size
 
 
-    def distillation_policy_merge(...?):
-        #TODO you have two policy with their distillation buffer
-        # the distillation buffer have states as inputs + actions on those state as outputs
-        # with a supervised approach and MSE loss (or any appropiate better loss) train a new policy
-        # return the new weights 
-        raise NotImplementedError
+    #TODO you have two policy with their distillation buffer
+    # the distillation buffer have states as inputs + actions on those state as outputs
+    # with a supervised approach and MSE loss (or any appropiate better loss) train a new policy
+    # return the new weights 
+    def distillation_policy_merge(self, buffer1, buffer2, input_key, target_key, layer_type, target_dim, epochs=5, lr=1e-3, batch_size=128):
+        logger.info(f"Distillation training: matching [{input_key}] to [{target_key}] for layer: {layer_type}")
+        
+        inputs_data = np.concatenate([buffer1[input_key], buffer2[input_key]], axis=0)
+        targets_data = np.concatenate([buffer1[target_key], buffer2[target_key]], axis=0)
+        
+        inputs_tensor = torch.tensor(inputs_data, dtype=torch.float32)
+        targets_tensor = torch.tensor(targets_data, dtype=torch.float32)
+        
+        dataset = torch.utils.data.TensorDataset(inputs_tensor, targets_tensor)
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        
+        device = self.alpha.device if self.alpha is not None else "cpu"
+        input_dim = inputs_tensor.shape[-1]
+        
+        distill_head = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, target_dim)
+        ).to(device)
+        
+        optimizer = torch.optim.Adam(distill_head.parameters(), lr=lr)
+        distill_head.train()
+
+        for epoch in range(epochs):
+            for batch_in, batch_target in dataloader:
+                batch_in = batch_in.to(device)
+                batch_target = batch_target.to(device)
+                
+                if layer_type == "mean":
+                    final_target = batch_target[:, :self.act_dim]
+                elif layer_type == "logstd":
+                    final_target = batch_target[:, self.act_dim:]
+                else:
+                    final_target = batch_target
+                
+                preds = distill_head(batch_in)
+                loss = torch.nn.functional.mse_loss(preds, final_target)
+                
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                
+        weight_vector = distill_head[2].weight.data.clone().cpu()
+        bias_vector = distill_head[2].bias.data.clone().cpu()
+        
+        if "shared" in layer_type and weight_vector.shape != (target_dim, input_dim):
+            padded_weight = torch.zeros((target_dim, input_dim))
+            padded_weight[:weight_vector.shape[0], :weight_vector.shape[1]] = weight_vector
+            weight_vector = padded_weight
+            
+        return weight_vector, bias_vector  
 
     #TODO (where it should be?)
     # make policy network bigger (more layers)

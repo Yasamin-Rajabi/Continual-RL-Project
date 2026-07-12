@@ -91,6 +91,10 @@ class Args:
     """pool size"""
     encoder_from_base: bool = False
     """load encoder from base_dir"""
+    distill_extra_steps: int = 10_000
+    """The number of online steps to take for generating the comprehensive distillation buffer"""
+    distillation: bool = True
+    """Whether to use supervised policy distillation for merging vectors or fallback to simple averaging"""
 
 def make_env(task_id):
     def thunk():
@@ -289,6 +293,8 @@ if __name__ == "__main__":
             fuse_heads=True,
             pool_size=args.pool_size,
             encoder_from_base=args.encoder_from_base,
+            prev_units_paths=args.prev_units,
+            distillation=args.distillation,
         )
     # elif args.model_type == 'masknet':
     #     if len(args.prev_units) == 0:
@@ -519,7 +525,39 @@ if __name__ == "__main__":
     # it is an online policy approch, i mean you choose the actions based on trained policy and step based on
     # these actions  
     # i think it is better (or maybe neccessary) that state includes all observations (?)
-    ############################3 
+    ############################
+
+    print(f"*** Generating online comprehensive distillation buffer for {args.distill_extra_steps} steps ***")
+    distill_obs = []
+    distill_shared = []
+    distill_targets = []
+
+    obs, _ = envs.reset()
+    actor.eval() 
+    for _ in range(args.distill_extra_steps):
+        with torch.no_grad():
+            obs_tensor = torch.Tensor(obs).to(device)
+            distill_obs.append(obs.copy())
+            
+            shared_feats = actor.model.fc(obs_tensor)
+            distill_shared.append(shared_feats.cpu().numpy())
+            
+            mean, log_std = actor.model.fc_mean(shared_feats), actor.model.fc_logstd(shared_feats)
+            target_outputs = torch.cat([mean, log_std], dim=-1).cpu().numpy()
+            distill_targets.append(target_outputs)
+
+        with torch.no_grad():
+            actions, _, _ = actor.get_action(obs_tensor)
+        actions = actions.detach().cpu().numpy()
+        next_obs, _, _, _, _ = envs.step(actions)
+        obs = next_obs
+
+    distill_buffer = {
+        "obs": np.concatenate(distill_obs, axis=0),
+        "shared": np.concatenate(distill_shared, axis=0),
+        "targets": np.concatenate(distill_targets, axis=0)
+    }
+    ##############################
     
     [
         eval_agent(actor, envs.envs[i], args.num_evals, global_step, writer, device)
@@ -532,3 +570,4 @@ if __name__ == "__main__":
     if args.save_dir is not None:
         print(f"Saving trained agent in `{args.save_dir}` with name `{run_name}`")
         actor.model.save(dirname=f"{args.save_dir}/{run_name}")
+        torch.save(distill_buffer, f"{args.save_dir}/{run_name}/distill_buffer.pt")
