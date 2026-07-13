@@ -1,23 +1,26 @@
 import os
 import subprocess
 import torch
+import pathlib
 import numpy as np
 import matplotlib.pyplot as plt
 from cka_rl import CkaRlAgent
 from tasks import get_task
 
-# تنظیمات اصلی برای اجرای تست مینیاتوری سریع
-TAG = "MiniTest"
+# ==========================================
+# CONFIGURATION FOR CLEAN INTEGRATION TEST
+# ==========================================
+TAG = "UltimateBenchmark"
 SAVE_DIR = f"agents/{TAG}"
 SEED = 42
-TOTAL_TIMESTEPS = 50
-LEARNING_STARTS = 5
-DISTILL_STEPS = 100 # تعداد استپ‌های سریع برای پر شدن بافر تست
-NUM_EVAL_EPISODES = 3
+TOTAL_TIMESTEPS = 300_000   # افزایش استپ‌ها به ۳۰۰ هزار برای همگرایی واقعی Teacher
+LEARNING_STARTS = 5000
+DISTILL_STEPS = 15_000      # افزایش استپ‌های بافر جامع برای پوشش کامل فضای حالت
+NUM_EVAL_EPISODES = 10 # تعداد اپیزودهای ارزیابی برای رسم نمودار خطی
 
 def run_sac_for_task(task_id):
-    """اجرای خودکار SAC روی تسک مشخص شده و تولید بافر و وزن‌ها"""
-    run_name = f"task_{task_id}__cka-rl__run_sac__{SEED}"
+    """اجرای استاندارد SAC روی تسک مشخص شده و ذخیره خروجی‌ها"""
+    run_name = f"task_{task_id}__cka-rl__run_sac__42"
     cmd = [
         "python3", "run_sac.py",
         f"--model-type=cka-rl",
@@ -30,25 +33,43 @@ def run_sac_for_task(task_id):
         f"--save-dir={SAVE_DIR}"
     ]
     
-    # اگر تسک ۱ بود، مسیر تسک ۰ را به عنوان یونیت قبلی پاس می‌دهیم
+    # برای تسک ۱، آدرس تسک ۰ را به عنوان یونیت قبلی می‌فرستیم
     if task_id == 1:
-        prev_run = f"task_0__cka-rl__run_sac__{SEED}"
+        prev_run = f"task_0__cka-rl__run_sac__42"
         cmd.extend(["--prev-units", f"{SAVE_DIR}/{prev_run}"])
         
-    print(f"\n--- Running SAC for Task {task_id} ---")
-    print(" ".join(cmd))
+    print(f"\n>>> Running SAC Training for Task {task_id} ({TOTAL_TIMESTEPS} steps) <<<")
     subprocess.run(cmd, check=True)
 
-def evaluate_merged_policy(prev_units, distillation_mode, task_id):
-    """ارزیابی ریوارد مدل مرج شده روی یک تسک مشخص"""
+def evaluate_policy_variant(prev_units, task_id, mode: str):
+    """
+    ارزیابی کاملاً ایزوله برای واریانت‌های مختلف سیاست
+    mode: 'distill' | 'simple' | 'original'
+    """
     env = get_task(task_id)
     obs_dim = np.array(env.observation_space.shape).prod()
     act_dim = np.prod(env.action_space.shape)
     
-    base_dir = prev_units[0]
-    latest_dir = prev_units[-1]
-    
-    # ساخت ایجنت با متد مرج انتخابی
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # کانفیگ دینامیک ایجنت بر اساس نوع ارزیابی برای جلوگیری از تداخل اندیس‌ها
+    if mode == 'original':
+        # مدل خالص و دست‌نخورده همان تسک بدون اعمال فرآیند مرج دیسک
+        base_dir = None
+        latest_dir = prev_units[task_id]
+        distillation_flag = False
+        pool_size = 99  # مقدار بزرگ برای عدم فعال‌شدن مرج
+    elif mode == 'distill':
+        base_dir = prev_units[0]
+        latest_dir = prev_units[-1]
+        distillation_flag = True
+        pool_size = 2
+    elif mode == 'simple':
+        base_dir = prev_units[0]
+        latest_dir = prev_units[-1]
+        distillation_flag = False
+        pool_size = 2
+
     agent = CkaRlAgent(
         base_dir=base_dir,
         latest_dir=latest_dir,
@@ -56,76 +77,83 @@ def evaluate_merged_policy(prev_units, distillation_mode, task_id):
         act_dim=act_dim,
         fuse_shared=False,
         fuse_heads=True,
-        pool_size=2,
+        pool_size=pool_size,
         prev_units_paths=prev_units,
-        distillation=distillation_mode # سوئیچ بین تقطیر و میانگین‌گیری
-    )
+        distillation=distillation_flag
+    ).to(device)
     agent.eval()
     
     episode_rewards = []
-    for _ in range(NUM_EVAL_EPISODES):
-        obs, _ = env.reset(seed=SEED)
+    for ep in range(NUM_EVAL_EPISODES):
+        obs, _ = env.reset(seed=SEED + ep)
         ep_ret = 0
         while True:
-            obs_tensor = torch.Tensor(obs).unsqueeze(0)
+            obs_tensor = torch.Tensor(obs).unsqueeze(0).to(device)
             with torch.no_grad():
                 mean, _ = agent(obs_tensor)
-            action = torch.tanh(mean)[0].numpy() # اعمال اکشن دترمینستیک زمان تست
+            action = torch.tanh(mean)[0].cpu().numpy()
             obs, reward, terminated, truncated, _ = env.step(action)
             ep_ret += reward
             if terminated or truncated:
                 episode_rewards.append(ep_ret)
                 break
     env.close()
-    return np.mean(episode_rewards)
+    return episode_rewards
 
 if __name__ == "__main__":
-    # گام ۱: ران کردن SAC برای هر دو تسک و ذخیره داده‌ها روی دیسک
+    # ۱. اجرای فرآیند آموزش از صفر برای هر دو تسک
     run_sac_for_task(0)
     run_sac_for_task(1)
     
-    # آدرس یونیت‌های تولید شده
-    run0_name = f"task_0__cka-rl__run_sac__{SEED}"
-    run1_name = f"task_1__cka-rl__run_sac__{SEED}"
+    run0_name = "task_0__cka-rl__run_sac__42"
+    run1_name = "task_1__cka-rl__run_sac__42"
     prev_units = (
         pathlib.Path(f"{SAVE_DIR}/{run0_name}"),
         pathlib.Path(f"{SAVE_DIR}/{run1_name}")
     )
     
-    print("\n--- Evaluating Merged Policies ---")
-    # گام ۲: ارزیابی عملکرد متد تقطیر (Distillation Method)
-    distill_reward_task0 = evaluate_merged_policy(prev_units, distillation_mode=True, task_id=0)
-    distill_reward_task1 = evaluate_merged_policy(prev_units, distillation_mode=True, task_id=1)
+    print("\n--- Starting Comprehensive Benchmark Evaluation ---")
     
-    # گام ۳: ارزیابی عملکرد متد میانگین‌گیری ساده (Simple Averaging Method)
-    simple_reward_task0 = evaluate_merged_policy(prev_units, distillation_mode=False, task_id=0)
-    simple_reward_task1 = evaluate_merged_policy(prev_units, distillation_mode=False, task_id=1)
+    # ۲. ارزیابی هر ۳ حالت روی تسک اول (Task 0)
+    rewards_t0_distill = evaluate_policy_variant(prev_units, task_id=0, mode='distill')
+    rewards_t0_simple  = evaluate_policy_variant(prev_units, task_id=0, mode='simple')
+    rewards_t0_original = evaluate_policy_variant(prev_units, task_id=0, mode='original')
     
-    print(f"\nResults Task 0 -> Distillation: {distill_reward_task0:.2f} | Simple Avg: {simple_reward_task0:.2f}")
-    print(f"Results Task 1 -> Distillation: {distill_reward_task1:.2f} | Simple Avg: {simple_reward_task1:.2f}")
+    # ۳. ارزیابی هر ۳ حالت روی تسک دوم (Task 1)
+    rewards_t1_distill = evaluate_policy_variant(prev_units, task_id=1, mode='distill')
+    rewards_t1_simple  = evaluate_policy_variant(prev_units, task_id=1, mode='simple')
+    rewards_t1_original = evaluate_policy_variant(prev_units, task_id=1, mode='original')
     
-    # گام ۴: رسم پلات‌ها و ذخیره‌سازی بصری خروجی
+    # ۴. رسم پلات‌ها
     os.makedirs("plots", exist_ok=True)
-    methods = ['Policy Distillation', 'Simple Averaging']
+    episodes = np.arange(1, NUM_EVAL_EPISODES + 1)
     
-    # پلات اول: عملکرد روی تسک اول (Task 0)
-    plt.figure(figsize=(6, 5))
-    rewards_t0 = [distill_reward_task0, simple_reward_task0]
-    plt.bar(methods, rewards_t0, color=['blue', 'orange'], width=0.4)
-    plt.title('Merged Policy Performance on Task 0')
-    plt.ylabel('Mean Episodic Reward')
-    plt.grid(axis='y', linestyle='--', alpha=0.7)
-    plt.savefig('plots/performance_task_0.png')
+    # 📊 نمودار تسک ۰
+    plt.figure(figsize=(10, 5.5))
+    plt.plot(episodes, rewards_t0_distill, label='Policy Distillation (Ours)', marker='o', color='blue', linewidth=2)
+    plt.plot(episodes, rewards_t0_simple, label='Simple Weight Averaging', marker='s', color='orange', linestyle='--', linewidth=2)
+    plt.plot(episodes, rewards_t0_original, label='Original Task 0 Policy (Upper Bound)', marker='^', color='green', linestyle=':', linewidth=2)
+    plt.title('Merged Policy Performance: Task 0 (Hammer)')
+    plt.xlabel('Evaluation Episode')
+    plt.ylabel('Total Episodic Reward')
+    plt.xticks(episodes)
+    plt.legend(loc='best')
+    plt.grid(True, linestyle=':', alpha=0.6)
+    plt.savefig('plots/reward_timeline_task_0.png', dpi=300)
     plt.close()
     
-    # پلات دوم: عملکرد روی تسک دوم (Task 1)
-    plt.figure(figsize=(6, 5))
-    rewards_t1 = [distill_reward_task1, simple_reward_task1]
-    plt.bar(methods, rewards_t1, color=['blue', 'orange'], width=0.4)
-    plt.title('Merged Policy Performance on Task 1')
-    plt.ylabel('Mean Episodic Reward')
-    plt.grid(axis='y', linestyle='--', alpha=0.7)
-    plt.savefig('plots/performance_task_1.png')
+    # 📊 نمودار تسک ۱
+    plt.figure(figsize=(10, 5.5))
+    plt.plot(episodes, rewards_t1_distill, label='Policy Distillation (Ours)', marker='o', color='blue', linewidth=2)
+    plt.plot(episodes, rewards_t1_simple, label='Simple Weight Averaging', marker='s', color='orange', linestyle='--', linewidth=2)
+    plt.plot(episodes, rewards_t1_original, label='Original Task 1 Policy (Upper Bound)', marker='^', color='green', linestyle=':', linewidth=2)
+    plt.title('Merged Policy Performance: Task 1 (Faucet Close)')
+    plt.xlabel('Evaluation Episode')
+    plt.ylabel('Total Episodic Reward')
+    plt.xticks(episodes)
+    plt.legend(loc='best')
+    plt.grid(True, linestyle=':', alpha=0.6)
+    plt.savefig('plots/reward_timeline_task_1.png', dpi=300)
     plt.close()
     
-    print("\n*** Integration testing finished successfully! Plots saved in `./plots/` directory ***")
+    print("\n*** Full pipeline execution complete! Beautiful plots generated inside `./plots/` ***")

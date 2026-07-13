@@ -23,6 +23,16 @@ from AdamGnT import AdamGnT
 from stable_baselines3.common.buffers import ReplayBuffer
 #from models.cbp_modules import GnT
 
+# ==========================================
+# TORCH SECURITY PATCH FOR KAGGLE (NUMPY 2.0 & WEIGHTS ONLY COMPATIBILITY)
+# ==========================================
+orig_load = torch.load
+def patched_load(*args, **kwargs):
+    if 'weights_only' not in kwargs:
+        kwargs['weights_only'] = False
+    return orig_load(*args, **kwargs)
+torch.load = patched_load
+# ==========================================
 
 @dataclass
 class Args:
@@ -411,7 +421,7 @@ if __name__ == "__main__":
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
         real_next_obs = next_obs.copy()
         for idx, trunc in enumerate(truncations):
-            if trunc:
+            if trunc and "final_observation" in infos:
                 real_next_obs[idx] = infos["final_observation"][idx]
         rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
 
