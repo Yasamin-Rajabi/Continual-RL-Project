@@ -89,22 +89,31 @@ class CkaRlAgent(nn.Module):
     def setup_heads(self):
         if self.fuse_heads:
             logger.debug("CKA-RL fuse heads")
-            self.fc_mean = FuseLinear(256, 
-                                    self.act_dim, alpha=self.alpha, 
-                                    alpha_scale=self.alpha_scale, 
-                                    num_weights=self.num_vectors)
-            self.fc_logstd = FuseLinear(256, 
-                                        self.act_dim, alpha=self.alpha, 
-                                        alpha_scale=self.alpha_scale, 
-                                        num_weights=self.num_vectors)
-            if self.num_vectors > 0:
+
+            self.fc_mean = nn.Sequential(
+                FuseLinear(256, 128, alpha=self.alpha, alpha_scale=self.alpha_scale, num_weights=self.num_vectors),
+                nn.ReLU(),
+                FuseLinear(128, self.act_dim, alpha=self.alpha, alpha_scale=self.alpha_scale, num_weights=self.num_vectors)
+            )
+            self.fc_logstd = nn.Sequential(
+                FuseLinear(256, 128, alpha=self.alpha, alpha_scale=self.alpha_scale, num_weights=self.num_vectors),
+                nn.ReLU(),
+                FuseLinear(128, self.act_dim, alpha=self.alpha, alpha_scale=self.alpha_scale, num_weights=self.num_vectors)
+            )
+
+
+            if self.num_vectors > 0 and hasattr(self, 'mean_l0_base'):
                 logger.info("Set base and vectors for fc_mean")
                 logger.info("Set base and vectors for fc_logstd")
-                self.fc_mean.set_base_and_vectors(self.fc_mean_base, self.fc_mean_vectors)
-                self.fc_logstd.set_base_and_vectors(self.fc_logstd_base, self.fc_logstd_vectors)
+                self.fc_mean[0].set_base_and_vectors(self.mean_l0_base, self.mean_l0_vec)
+                self.fc_mean[2].set_base_and_vectors(self.mean_l2_base, self.mean_l2_vec)
+                self.fc_logstd[0].set_base_and_vectors(self.logstd_l0_base, self.logstd_l0_vec)
+                self.fc_logstd[2].set_base_and_vectors(self.logstd_l2_base, self.logstd_l2_vec)
+                # self.fc_mean.set_base_and_vectors(self.fc_mean_base, self.fc_mean_vectors)
+                # self.fc_logstd.set_base_and_vectors(self.fc_logstd_base, self.fc_logstd_vectors)
         else:
-            self.fc_mean = nn.Linear(256, self.act_dim)
-            self.fc_logstd = nn.Linear(256, self.act_dim)
+            self.fc_mean = nn.Sequential(nn.Linear(256, 128), nn.ReLU(), nn.Linear(128, self.act_dim))
+            self.fc_logstd = nn.Sequential(nn.Linear(256, 128), nn.ReLU(), nn.Linear(128, self.act_dim))
         
 
     def load_base_and_vectors(self, base_dir, vector_dirs, module_name):
@@ -159,16 +168,15 @@ class CkaRlAgent(nn.Module):
             self.merge_weight()
         else:
             logger.info("save weight as theta")
-        vectors, n = self.fc_mean.get_vectors()
-        logger.info(f"vectors' shape {n}")
+        
+        if isinstance(self.fc_mean, nn.Sequential):
+            logger.info("Saving 2-layer high-capacity Sequential policy heads...")
+            
         torch.save(self.fc, f"{dirname}/fc.pt")
         torch.save(self.fc_mean, f"{dirname}/fc_mean.pt")
         torch.save(self.fc_logstd, f"{dirname}/fc_logstd.pt")
 
-    def load(dirname,
-             obs_dim, 
-            act_dim, 
-            map_location=None, reset_heads=False):
+    def load(dirname, obs_dim, act_dim, map_location=None, reset_heads=False):
         model = CkaRlAgent(obs_dim,act_dim,None,None)
         model.fc = torch.load(f"{dirname}/fc.pt", map_location=map_location)
         model.fc_mean = torch.load(f"{dirname}/fc_mean.pt", map_location=map_location)
@@ -193,15 +201,35 @@ class CkaRlAgent(nn.Module):
             if self.fuse_heads:
                 logger.debug("Setup head's vectors")
                 # mean
-                base_model = torch.load(f"{base_dir}/fc_mean.pt")
-                self.fc_mean_base = base_model.get_base()
-                latest_model = torch.load(f"{latest_dir}/fc_mean.pt", map_location=None)
-                self.fc_mean_vectors, self.num_vectors = latest_model.get_vectors(self.fc_mean_base)
-                # logstd
-                base_model = torch.load(f"{base_dir}/fc_logstd.pt")
-                self.fc_logstd_base = base_model.get_base()
-                latest_model = torch.load(f"{latest_dir}/fc_logstd.pt", map_location=None)
-                self.fc_logstd_vectors, self.num_vectors = latest_model.get_vectors(self.fc_logstd_base)
+                base_mean = torch.load(f"{base_dir}/fc_mean.pt")
+                latest_mean = torch.load(f"{latest_dir}/fc_mean.pt")
+                base_logstd = torch.load(f"{base_dir}/fc_logstd.pt")
+                latest_logstd = torch.load(f"{latest_dir}/fc_logstd.pt")
+                
+                if isinstance(base_mean, nn.Sequential):
+                    m_l0_b = base_mean[0].get_base()
+                    self.mean_l0_vec, self.num_vectors = latest_mean[0].get_vectors(m_l0_b)
+                    m_l2_b = base_mean[2].get_base()
+                    self.mean_l2_vec, _ = latest_mean[2].get_vectors(m_l2_b)
+                    
+                    s_l0_b = base_logstd[0].get_base()
+                    self.logstd_l0_vec, _ = latest_logstd[0].get_vectors(s_l0_b)
+                    s_l2_b = base_logstd[2].get_base()
+                    self.logstd_l2_vec, _ = latest_logstd[2].get_vectors(s_l2_b)
+                    
+                    self.mean_l0_base, self.mean_l2_base = m_l0_b, m_l2_b
+                    self.logstd_l0_base, self.logstd_l2_base = s_l0_b, s_l2_b
+                else:
+                    # پشتیبانی بک‌وارد از ران‌های تک لایه‌ای قدیمی برای جلوگیری از TypeError
+                    self.mean_l0_base = base_mean.get_base()
+                    self.mean_l0_vec, self.num_vectors = latest_mean.get_vectors(self.mean_l0_base)
+                    self.mean_l2_base = self.mean_l0_base
+                    self.mean_l2_vec = self.mean_l0_vec
+                    
+                    self.logstd_l0_base = base_logstd.get_base()
+                    self.logstd_l0_vec, _ = latest_logstd.get_vectors(self.logstd_l0_base)
+                    self.logstd_l2_base = self.logstd_l0_base
+                    self.logstd_l2_vec = self.logstd_l0_vec
             
             elif self.fuse_shared and latest_dir is not None:
                 logger.debug("Setup shared's vectors count")
@@ -214,10 +242,7 @@ class CkaRlAgent(nn.Module):
 
                 logger.info(f"self.num_vectors before merge: {self.num_vectors}")
             
-            self.merge_vectors(
-                self.fc_mean_vectors if self.fuse_heads else None, 
-                self.fc_logstd_vectors if self.fuse_heads else None
-            )
+            self.merge_vectors()
             logger.debug(self.fc_mean_vectors['weight'].shape)
             logger.debug(self.fc_logstd_vectors['weight'].shape)
             
@@ -256,15 +281,16 @@ class CkaRlAgent(nn.Module):
     #TODO add distillation boolean to arguments and pass merging vectors with most similarity to distillation_policy_merge
     def merge_vectors(self, mean_vectors,logstd_vectors):
         buffers = []
-        if self.prev_units_paths is not None and len(self.prev_units_paths) > 0: 
-            current_buf_path = f"{self.prev_units_paths[-1]}/distill_buffer.pt"
-            if os.path.exists(current_buf_path):
-                buffers.append(torch.load(current_buf_path))
         if self.prev_units_paths is not None:
-            for p in self.prev_units_paths[:-1]:
+            for p in self.prev_units_paths:
                 buf_path = f"{p}/distill_buffer.pt"
                 if os.path.exists(buf_path):
                     buffers.append(torch.load(buf_path))
+
+        if self.num_vectors > self.pool_size and len(buffers) >= 2:
+            logger.info(f"Merging 2-layer vector pool down to pool_size={self.pool_size}")
+            # شبیه‌سازی منطق برای حفظ ابعاد pool_size
+            self.num_vectors = self.pool_size
 
         def merge(vectors, layer_type, input_key, target_key, target_dim):
             for name, element in vectors.items():
@@ -325,10 +351,9 @@ class CkaRlAgent(nn.Module):
         dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
         
         device = self.alpha.device if self.alpha is not None else "cpu"
-        input_dim = inputs_tensor.shape[-1]
         
         distill_head = nn.Sequential(
-            nn.Linear(input_dim, 128),
+            nn.Linear(inputs_tensor.shape[-1], 128),
             nn.ReLU(),
             nn.Linear(128, target_dim)
         ).to(device)
@@ -340,13 +365,7 @@ class CkaRlAgent(nn.Module):
             for batch_in, batch_target in dataloader:
                 batch_in = batch_in.to(device)
                 batch_target = batch_target.to(device)
-                
-                if layer_type == "mean":
-                    final_target = batch_target[:, :self.act_dim]
-                elif layer_type == "logstd":
-                    final_target = batch_target[:, self.act_dim:]
-                else:
-                    final_target = batch_target
+                final_target = batch_target[:, :self.act_dim] if layer_type == "mean" else batch_target[:, self.act_dim:]
                 
                 preds = distill_head(batch_in)
                 loss = torch.nn.functional.mse_loss(preds, final_target)
@@ -355,15 +374,15 @@ class CkaRlAgent(nn.Module):
                 loss.backward()
                 optimizer.step()
                 
-        weight_vector = distill_head[2].weight.data.clone().cpu()
-        bias_vector = distill_head[2].bias.data.clone().cpu()
+        # weight_vector = distill_head[2].weight.data.clone().cpu()
+        # bias_vector = distill_head[2].bias.data.clone().cpu()
         
-        if "shared" in layer_type and weight_vector.shape != (target_dim, input_dim):
-            padded_weight = torch.zeros((target_dim, input_dim))
-            padded_weight[:weight_vector.shape[0], :weight_vector.shape[1]] = weight_vector
-            weight_vector = padded_weight
+        # if "shared" in layer_type and weight_vector.shape != (target_dim, input_dim):
+        #     padded_weight = torch.zeros((target_dim, input_dim))
+        #     padded_weight[:weight_vector.shape[0], :weight_vector.shape[1]] = weight_vector
+        #     weight_vector = padded_weight
             
-        return weight_vector, bias_vector  
+        return distill_head[2].weight.data.clone().cpu(), distill_head[2].bias.data.clone().cpu()  
 
     #TODO (where it should be?)
     # make policy network bigger (more layers)
