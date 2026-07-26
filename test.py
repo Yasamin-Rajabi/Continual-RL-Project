@@ -7,6 +7,9 @@ import matplotlib.pyplot as plt
 from cka_rl import CkaRlAgent
 from tasks import get_task
 
+import glob
+from tensorboard.backend.event_processing import event_accumulator
+
 # ==========================================
 # CONFIGURATION FOR CLEAN INTEGRATION TEST
 # ==========================================
@@ -20,6 +23,48 @@ NUM_EVAL_EPISODES = 10 # تعداد اپیزودهای ارزیابی برای �
 
 TASK_A = 3  
 TASK_B = 5
+
+def plot_training_metrics(tag, task_id, task_name, save_dir="plots_training"):
+    """استخراج و رسم منحنی‌های آموزش (Reward, Actor Loss, Critic Loss) از فایل‌های TensorBoard"""
+    os.makedirs(save_dir, exist_ok=True)
+    run_dir_pattern = f"runs/{tag}/task_{task_id}__*"
+    run_dirs = glob.glob(run_dir_pattern)
+    
+    if not run_dirs:
+        print(f"⚠️ دایرکتوری لاگ TensorBoard برای تسک {task_id} پیدا نشد.")
+        return
+
+    event_file = glob.glob(f"{run_dirs[0]}/*events.out*")
+    if not event_file:
+        return
+
+    ea = event_accumulator.EventAccumulator(event_file[0])
+    ea.Reload()
+
+    tags_to_extract = {
+        'charts/episodic_return': ('Episodic Return during Training', 'Episodic Return', 'reward_train'),
+        'losses/actor_loss': ('Actor Loss during Training', 'Actor Loss', 'actor_loss'),
+        'losses/qf_loss': ('Critic (Q-Function) Loss during Training', 'Critic Loss', 'critic_loss')
+    }
+
+    available_tags = ea.Tags().get('scalars', [])
+
+    for tag_name, (title, ylabel, filename) in tags_to_extract.items():
+        if tag_name in available_tags:
+            events = ea.Scalars(tag_name)
+            steps = [e.step for e in events]
+            values = [e.value for e in events]
+
+            plt.figure(figsize=(9, 4.5))
+            plt.plot(steps, values, color='purple' if 'loss' in filename else 'teal', alpha=0.85, linewidth=1.5)
+            plt.title(f'{title} - Task {task_id} ({task_name})')
+            plt.xlabel('Timesteps')
+            plt.ylabel(ylabel)
+            plt.grid(True, linestyle=':', alpha=0.6)
+            plt.tight_layout()
+            plt.savefig(f"{save_dir}/{filename}_task_{task_id}.png", dpi=300)
+            plt.close()
+            print(f"📊 نمودار آموزش ذخیره شد: {save_dir}/{filename}_task_{task_id}.png")
 
 def run_sac_for_task(task_id):
     """اجرای استاندارد SAC روی تسک مشخص شده و ذخیره خروجی‌ها"""
@@ -129,7 +174,12 @@ if __name__ == "__main__":
     # ۲. اجرای فرآیند آموزش از صفر برای دو تسک شبیه به هم
     run_sac_for_similar_tasks(TASK_A) # Handle Press Side
     run_sac_for_similar_tasks(TASK_B) # Window Close
-    
+
+    print("\n--- Plotting Training Curves from TensorBoard Logs ---")
+    plot_training_metrics(TAG, TASK_A, "Handle Press Side")
+    plot_training_metrics(TAG, TASK_B, "Window Close")
+
+
     run_a_name = f"task_{TASK_A}__cka-rl__run_sac__42"
     run_b_name = f"task_{TASK_B}__cka-rl__run_sac__42"
     
