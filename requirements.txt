@@ -1,7 +1,7 @@
 # --- RL & Environment Simulation ---
 gymnasium>=0.29.1
 metaworld @ git+https://github.com/Farama-Foundation/Metaworld.git@c822f28f582ba1ad49eb5dcf61016566f28003ba
-mujoco>=2.3.7
+mujoco>=3.0.0
 stable-baselines3>=2.2.1
 cloudpickle>=3.0.0
 
