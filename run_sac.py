@@ -36,12 +36,15 @@ torch.load = patched_load
 
 @dataclass
 class Args:
-    fusion_mode: Literal["classic_cka", "weight_delta"] = "classic_cka"
-    """Choose between original CKARL representation fusion or Weight-Space Delta fusion"""
     model_type: Literal["simple", "finetune", "componet", "packnet", "prognet", "cka-rl", "masknet", "cbpnet", "crelus"]
     """The name of the NN model to use for the agent"""
+    
+    fusion_mode: Literal["classic_cka", "weight_delta"] = "classic_cka"
+    """Choose between original CKARL representation fusion or Weight-Space Delta fusion"""
+    
     save_dir: Optional[str] = None
     """If provided, the model will be saved in the given directory"""
+    
     prev_units: Tuple[pathlib.Path, ...] = ()
     """Paths to the previous models. Not required when model_type is `simple` or `packnet` or `prognet`"""
 
