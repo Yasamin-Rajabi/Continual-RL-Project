@@ -62,6 +62,8 @@ for i, task_id in enumerate(modes):
     if args.debug:
         params += " --total-timesteps=50"
         params += " --learning_starts=5"
+    else:
+        params += " --total-timesteps=300000"
     if args.encoder_from_base:
         params += " --encoder-from-base"
     else:
