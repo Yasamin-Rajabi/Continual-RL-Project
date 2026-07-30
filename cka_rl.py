@@ -222,9 +222,10 @@ class CkaRlAgent(nn.Module):
 
                 logger.info(f"self.num_vectors before merge: {self.num_vectors}")
             
-            self.merge_vectors()
-            logger.debug(self.fc_mean_vectors['weight'].shape)
-            logger.debug(self.fc_logstd_vectors['weight'].shape)
+            if hasattr(self, 'mean_l2_vec'):
+                self.merge_vectors(mean_vectors=self.mean_l2_vec, logstd_vectors=self.logstd_l2_vec)
+            else:
+                self.merge_vectors()
             
     def setup_alpha(self, num_vectors, fix_alpha, alpha_init, alpha_major, alpha_factor, use_alpha_scale):
         if num_vectors > 0:
