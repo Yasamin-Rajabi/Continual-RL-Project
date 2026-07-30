@@ -39,6 +39,7 @@ def parse_args():
     parser.add_argument("--debug", type=str2bool, default=False)
     parser.add_argument("--pool_size", default=20)
     parser.add_argument("--encoder_from_base", action="store_true")
+    parser.add_argument("--fusion-mode", type=str, choices=["classic_cka", "weight_delta"], default="classic_cka")
     return parser.parse_args()
 
 
@@ -58,6 +59,7 @@ run_name = (
 first_idx = modes.index(start_mode)
 for i, task_id in enumerate(modes[first_idx:]):
     params = f"--model-type={args.algorithm} --task-id={task_id} --seed={args.seed} --tag={args.tag}"
+    params += f" --fusion-mode={args.fusion_mode}"
     if args.debug:
         params += " --total-timesteps=50"
         params += " --learning_starts=5"

@@ -24,32 +24,20 @@ class CkaRlAgent(nn.Module):
                 base_dir, 
                 latest_dir, 
                 pool_size = 2,
-                delta_theta_mode = "T", #controls whether the model is saved with its base/alpha/vector 
-                # components kept separate ("T", matching Eq. 2 of the paper) or merged into a single final 
-                # weight tensor ("TAT").
-
+                delta_theta_mode = "T",
                 global_alpha = True, 
                 alpha_init = "Randn", 
-                alpha_major = 0.6, # sets the initial softmax weight (60% by default) given to the most 
-                # relevant prior knowledge vector when initializing α via the "Major" scheme,
-
-                alpha_factor = 1e-3, # is the small initial scalar value (default 1e-3) used to initialize 
-                # alpha when there's a single historical vector or in "Uniform" mode, keeping the initial 
-                # reuse of old knowledge minimal.
-
+                alpha_major = 0.6,
+                alpha_factor = 1e-3,
                 fix_alpha = False,
-                reset_heads = False, # is a flag used after loading a saved model to optionally reinitialize 
-                # the policy output heads (mean/log-std layers) while keeping the shared encoder, useful when 
-                # adapting to a structurally different new task.
-
+                reset_heads = False,
                 encoder_from_base = False,
-                use_alpha_scale = True, # enables an extra learnable global scalar that uniformly scales 
-                # the (already-normalized) alpha weights, giving the model an additional degree of freedom 
-                # to control the overall strength of historical knowledge reuse.
+                use_alpha_scale = True,
                 fuse_shared = False, 
                 fuse_heads = True,
                 prev_units_paths = None,
-                distillation = True):
+                distillation = True,
+                fusion_mode = "classic_cka"):
         
         super().__init__()
         self.delta_theta_mode = delta_theta_mode
@@ -61,11 +49,11 @@ class CkaRlAgent(nn.Module):
         self.pool_size = pool_size
         self.prev_units_paths = prev_units_paths
         self.distillation = distillation
+        self.fusion_mode = fusion_mode
 
         assert(fuse_heads or fuse_shared)
         self.setup_vectors(base_dir, latest_dir)
 
-        # Alpha Setting
         self.setup_alpha(num_vectors=self.num_vectors, 
                          fix_alpha=fix_alpha,alpha_init=alpha_init,
                          alpha_major=alpha_major,alpha_factor=alpha_factor,
@@ -78,7 +66,6 @@ class CkaRlAgent(nn.Module):
             self.fc = torch.load(f"{base_dir}/fc.pt")
         elif latest_dir is not None:
             logger.info(f"Loading latest shared from {latest_dir}")
-            # self.fc = shared(input_dim=obs_dim)
             self.fc = torch.load(f"{latest_dir}/fc.pt")
         else:
             logger.info("Train shared from scratch")
@@ -91,16 +78,15 @@ class CkaRlAgent(nn.Module):
             logger.debug("CKA-RL fuse heads")
 
             self.fc_mean = nn.Sequential(
-                FuseLinear(256, 128, alpha=self.alpha, alpha_scale=self.alpha_scale, num_weights=self.num_vectors),
+                FuseLinear(256, 128, alpha=self.alpha, alpha_scale=self.alpha_scale, num_weights=self.num_vectors, fusion_mode=self.fusion_mode),
                 nn.ReLU(),
-                FuseLinear(128, self.act_dim, alpha=self.alpha, alpha_scale=self.alpha_scale, num_weights=self.num_vectors)
+                FuseLinear(128, self.act_dim, alpha=self.alpha, alpha_scale=self.alpha_scale, num_weights=self.num_vectors, fusion_mode=self.fusion_mode)
             )
             self.fc_logstd = nn.Sequential(
-                FuseLinear(256, 128, alpha=self.alpha, alpha_scale=self.alpha_scale, num_weights=self.num_vectors),
+                FuseLinear(256, 128, alpha=self.alpha, alpha_scale=self.alpha_scale, num_weights=self.num_vectors, fusion_mode=self.fusion_mode),
                 nn.ReLU(),
-                FuseLinear(128, self.act_dim, alpha=self.alpha, alpha_scale=self.alpha_scale, num_weights=self.num_vectors)
+                FuseLinear(128, self.act_dim, alpha=self.alpha, alpha_scale=self.alpha_scale, num_weights=self.num_vectors, fusion_mode=self.fusion_mode)
             )
-
 
             if self.num_vectors > 0 and hasattr(self, 'mean_l0_base'):
                 logger.info("Set base and vectors for fc_mean")
@@ -109,19 +95,15 @@ class CkaRlAgent(nn.Module):
                 self.fc_mean[2].set_base_and_vectors(self.mean_l2_base, self.mean_l2_vec)
                 self.fc_logstd[0].set_base_and_vectors(self.logstd_l0_base, self.logstd_l0_vec)
                 self.fc_logstd[2].set_base_and_vectors(self.logstd_l2_base, self.logstd_l2_vec)
-                # self.fc_mean.set_base_and_vectors(self.fc_mean_base, self.fc_mean_vectors)
-                # self.fc_logstd.set_base_and_vectors(self.fc_logstd_base, self.fc_logstd_vectors)
         else:
             self.fc_mean = nn.Sequential(nn.Linear(256, 128), nn.ReLU(), nn.Linear(128, self.act_dim))
             self.fc_logstd = nn.Sequential(nn.Linear(256, 128), nn.ReLU(), nn.Linear(128, self.act_dim))
         
-
     def load_base_and_vectors(self, base_dir, vector_dirs, module_name):
         num_weights = 0
         base = None
         vectors = None
         if base_dir:
-            # load base weight
             logger.info(f"Loading base from {base_dir}/model.pt")
             base_state_dict = torch.load(f"{base_dir}/model.pt").state_dict()
             base = {"weight":base_state_dict[f"{module_name}.weight"],"bias":base_state_dict[f"{module_name}.bias"]}
@@ -132,13 +114,13 @@ class CkaRlAgent(nn.Module):
         vector_bias = []
         for p in vector_dirs:
             logger.debug(f"Loading vectors from {p}/model.pt")
-            # load theta_i + base weight from prevs
             vector_state_dict = torch.load(f"{p}/model.pt").state_dict()
-            # get theta_i
-            vector_weight.append(base['weight'] - vector_state_dict[f"{module_name}.weight"])
-            vector_bias.append(base['bias'] - vector_state_dict[f"{module_name}.bias"])
+            
+            vector_weight.append(vector_state_dict[f"{module_name}.weight"] - base['weight'])
+            vector_bias.append(vector_state_dict[f"{module_name}.bias"] - base['bias'])
+            
         vectors = {"weight":torch.stack(vector_weight),
-                        "bias":torch.stack(vector_bias)}
+                   "bias":torch.stack(vector_bias)}
         num_weights += vectors["weight"].shape[0] if vectors else 0
         return base, vectors
 
@@ -163,7 +145,6 @@ class CkaRlAgent(nn.Module):
 
     def save(self, dirname):
         os.makedirs(dirname, exist_ok=True)
-        # for actor, merge `theta + alpha * tau` to `theta` if delta_theta_mode  == 'TAT'
         if self.delta_theta_mode == "TAT":
             self.merge_weight()
         else:
@@ -176,6 +157,7 @@ class CkaRlAgent(nn.Module):
         torch.save(self.fc_mean, f"{dirname}/fc_mean.pt")
         torch.save(self.fc_logstd, f"{dirname}/fc_logstd.pt")
 
+    @staticmethod
     def load(dirname, obs_dim, act_dim, map_location=None, reset_heads=False):
         model = CkaRlAgent(obs_dim,act_dim,None,None)
         model.fc = torch.load(f"{dirname}/fc.pt", map_location=map_location)
@@ -200,7 +182,6 @@ class CkaRlAgent(nn.Module):
         else:
             if self.fuse_heads:
                 logger.debug("Setup head's vectors")
-                # mean
                 base_mean = torch.load(f"{base_dir}/fc_mean.pt")
                 latest_mean = torch.load(f"{latest_dir}/fc_mean.pt")
                 base_logstd = torch.load(f"{base_dir}/fc_logstd.pt")
@@ -220,7 +201,6 @@ class CkaRlAgent(nn.Module):
                     self.mean_l0_base, self.mean_l2_base = m_l0_b, m_l2_b
                     self.logstd_l0_base, self.logstd_l2_base = s_l0_b, s_l2_b
                 else:
-                    # پشتیبانی بک‌وارد از ران‌های تک لایه‌ای قدیمی برای جلوگیری از TypeError
                     self.mean_l0_base = base_mean.get_base()
                     self.mean_l0_vec, self.num_vectors = latest_mean.get_vectors(self.mean_l0_base)
                     self.mean_l2_base = self.mean_l0_base
@@ -248,10 +228,10 @@ class CkaRlAgent(nn.Module):
             
     def setup_alpha(self, num_vectors, fix_alpha, alpha_init, alpha_major, alpha_factor, use_alpha_scale):
         if num_vectors > 0:
-            if fix_alpha: # Alpha is untrainable
+            if fix_alpha:
                 self.alpha = nn.Parameter(torch.zeros(self.num_vectors), requires_grad=False)
                 logger.info("Fix alpha to all 0")
-            else: # Alpha is trainable
+            else:
                 logger.info(f"alpha_init, {alpha_init}")
                 logger.info(f"alpha_major, {alpha_major}")
                 if alpha_init == "Uniform" or self.num_vectors == 1:
@@ -277,9 +257,7 @@ class CkaRlAgent(nn.Module):
     def log_alpha(self):
         logger.info(self.alpha)
         
-    
-    #TODO add distillation boolean to arguments and pass merging vectors with most similarity to distillation_policy_merge
-    def merge_vectors(self, mean_vectors,logstd_vectors):
+    def merge_vectors(self, mean_vectors=None, logstd_vectors=None):
         buffers = []
         if self.prev_units_paths is not None:
             for p in self.prev_units_paths:
@@ -289,10 +267,11 @@ class CkaRlAgent(nn.Module):
 
         if self.num_vectors > self.pool_size and len(buffers) >= 2:
             logger.info(f"Merging 2-layer vector pool down to pool_size={self.pool_size}")
-            # شبیه‌سازی منطق برای حفظ ابعاد pool_size
             self.num_vectors = self.pool_size
 
         def merge(vectors, layer_type, input_key, target_key, target_dim):
+            if vectors is None:
+                return
             for name, element in vectors.items():
                 similarities = torch.ones((element.shape[0], element.shape[0])) * -1
                 for i in range(element.shape[0]):
@@ -303,7 +282,7 @@ class CkaRlAgent(nn.Module):
                 idx1, idx2 = divmod(max_sim_idx.item(), element.shape[0])
                 logger.info(f"Merge vectors, name = {name}, idx1 = {idx1}, idx2 = {idx2}")
 
-                if self.distillation:
+                if self.distillation and len(buffers) > max(idx1, idx2):
                     logger.info(f"Merge vectors via Distillation, type = {layer_type}, property = {name}, idx1 = {idx1}, idx2 = {idx2}")
                     new_w, new_b = self.distillation_policy_merge(
                         buffers[idx1], buffers[idx2], input_key, target_key, layer_type, target_dim
@@ -316,11 +295,14 @@ class CkaRlAgent(nn.Module):
                 element = torch.cat((element[:idx1], element[idx1+1:idx2], element[idx2+1:], new_element.unsqueeze(0)), dim=0)
                 logger.info(element.shape)
                 vectors[name] = element
+
         if self.num_vectors > self.pool_size:
             logger.info(f"Merge vectors, pool size = {self.pool_size}, current #vectors = {self.num_vectors}")
             if self.fuse_heads:
-                merge(mean_vectors, "mean", "shared", "targets", self.act_dim)
-                merge(logstd_vectors, "logstd", "shared", "targets", self.act_dim)
+                if mean_vectors is not None:
+                    merge(mean_vectors, "mean", "shared", "targets", self.act_dim)
+                if logstd_vectors is not None:
+                    merge(logstd_vectors, "logstd", "shared", "targets", self.act_dim)
             
             if self.fuse_shared and hasattr(self.fc, 'network'):
                 for idx, layer_idx in enumerate(self.fc.fuse_layers):
@@ -330,14 +312,10 @@ class CkaRlAgent(nn.Module):
                         vectors_layout, _ = layer.get_vectors(base_layout)
                         merge(vectors_layout, f"shared_layer_{layer_idx}", "obs", "shared", layer.out_features)
                         layer.weights.data.copy_(vectors_layout['weight'])
-                        layer.biaes.data.copy_(vectors_layout['bias'])
+                        if layer.biaes is not None and vectors_layout['bias'] is not None:
+                            layer.biaes.data.copy_(vectors_layout['bias'])
             self.num_vectors = self.pool_size
 
-
-    #TODO you have two policy with their distillation buffer
-    # the distillation buffer have states as inputs + actions on those state as outputs
-    # with a supervised approach and MSE loss (or any appropiate better loss) train a new policy
-    # return the new weights 
     def distillation_policy_merge(self, buffer1, buffer2, input_key, target_key, layer_type, target_dim, epochs=5, lr=1e-3, batch_size=128):
         logger.info(f"Distillation training: matching [{input_key}] to [{target_key}] for layer: {layer_type}")
         
@@ -374,19 +352,4 @@ class CkaRlAgent(nn.Module):
                 loss.backward()
                 optimizer.step()
                 
-        # weight_vector = distill_head[2].weight.data.clone().cpu()
-        # bias_vector = distill_head[2].bias.data.clone().cpu()
-        
-        # if "shared" in layer_type and weight_vector.shape != (target_dim, input_dim):
-        #     padded_weight = torch.zeros((target_dim, input_dim))
-        #     padded_weight[:weight_vector.shape[0], :weight_vector.shape[1]] = weight_vector
-        #     weight_vector = padded_weight
-            
-        return distill_head[2].weight.data.clone().cpu(), distill_head[2].bias.data.clone().cpu()  
-
-    #TODO (where it should be?)
-    # make policy network bigger (more layers)
-
-    #TODO make other parts of code syncron with these changes + assume we use cka for both shared and head
-    # weights of policy network like passing boolean arguments, adding arguments + ...
- 
+        return distill_head[2].weight.data.clone().cpu(), distill_head[2].bias.data.clone().cpu()

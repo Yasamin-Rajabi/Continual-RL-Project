@@ -36,6 +36,8 @@ torch.load = patched_load
 
 @dataclass
 class Args:
+    fusion_mode: Literal["classic_cka", "weight_delta"] = "classic_cka"
+    """Choose between original CKARL representation fusion or Weight-Space Delta fusion"""
     model_type: Literal["simple", "finetune", "componet", "packnet", "prognet", "cka-rl", "masknet", "cbpnet", "crelus"]
     """The name of the NN model to use for the agent"""
     save_dir: Optional[str] = None
@@ -305,6 +307,7 @@ if __name__ == "__main__":
             encoder_from_base=args.encoder_from_base,
             prev_units_paths=args.prev_units,
             distillation=args.distillation,
+            fusion_mode=args.fusion_mode  
         )
     # elif args.model_type == 'masknet':
     #     if len(args.prev_units) == 0:
