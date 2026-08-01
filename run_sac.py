@@ -105,6 +105,8 @@ class Args:
     """The number of online steps to take for generating the comprehensive distillation buffer"""
     distillation: bool = True
     """Whether to use supervised policy distillation for merging vectors or fallback to simple averaging"""
+    max_distill_buffer: int = 50_000
+    """Cap on the pooled distillation buffer size (per pool slot) after two buffers are merged; excess rows are randomly subsampled"""
 
 def make_env(task_id):
     def thunk():
@@ -233,7 +235,15 @@ if __name__ == "__main__":
     print(f"*** Device: {device}")
 
     # env setup
-    envs = gym.vector.SyncVectorEnv([make_env(args.task_id)])
+    # SAME_STEP restores the pre-1.0 autoreset behavior this code expects: on the step an
+    # episode ends, the env resets immediately and reports both the terminal AND reset
+    # info via final_info/final_observation (handled below). Gymnasium's newer default,
+    # NEXT_STEP, instead silently ignores the action passed on the following step (it just
+    # resets), which would otherwise get stored as a bogus transition in the replay buffer
+    # at every single episode boundary.
+    envs = gym.vector.SyncVectorEnv(
+        [make_env(args.task_id)], autoreset_mode=gym.vector.AutoresetMode.SAME_STEP
+    )
     assert isinstance(
         envs.single_action_space, gym.spaces.Box
     ), "only continuous action space is supported"
@@ -305,6 +315,7 @@ if __name__ == "__main__":
             encoder_from_base=args.encoder_from_base,
             prev_units_paths=args.prev_units,
             distillation=args.distillation,
+            max_distill_buffer=args.max_distill_buffer,
         )
     # elif args.model_type == 'masknet':
     #     if len(args.prev_units) == 0:
@@ -403,26 +414,35 @@ if __name__ == "__main__":
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
+        # Under Gymnasium >=1.0 (even with SAME_STEP autoreset restored), `final_info` is
+        # ONE dict of batched arrays -- {"episode": {"r": array(...), "l": array(...)},
+        # "success": array(...), ...} -- not a list of per-env dicts like older gym/gymnasium
+        # versions. `infos["_final_info"]` is the boolean mask of which sub-env just finished.
         if "final_info" in infos:
-            for i, info in enumerate(infos["final_info"]):
+            final_info = infos["final_info"]
+            finished_mask = infos["_final_info"]
+            if np.any(finished_mask):
+                idx = int(np.argmax(finished_mask))
                 # print(
-                #     f"global_step={global_step}, episodic_return={info['episode']['r']}, success={info['success']}"
+                #     f"global_step={global_step}, episodic_return={final_info['episode']['r'][idx]}, success={final_info['success'][idx]}"
                 # )
                 writer.add_scalar(
-                    "charts/episodic_return", info["episode"]["r"], global_step
+                    "charts/episodic_return", final_info["episode"]["r"][idx], global_step
                 )
                 writer.add_scalar(
-                    "charts/episodic_length", info["episode"]["l"], global_step
+                    "charts/episodic_length", final_info["episode"]["l"][idx], global_step
                 )
-                writer.add_scalar("charts/success", info["success"], global_step)
+                if "success" in final_info:
+                    writer.add_scalar("charts/success", final_info["success"][idx], global_step)
 
-                break
-
-        # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
+        # TRY NOT TO MODIFY: save data to reply buffer; handle `final_obs`
+        # (renamed from "final_observation" in Gymnasium >=1.0 -- confirmed via check_infos.py)
         real_next_obs = next_obs.copy()
-        for idx, trunc in enumerate(truncations):
-            if trunc and "final_observation" in infos:
-                real_next_obs[idx] = infos["final_observation"][idx]
+        if "final_obs" in infos:
+            finished_mask = infos["_final_obs"]
+            for idx, trunc in enumerate(truncations):
+                if trunc and finished_mask[idx]:
+                    real_next_obs[idx] = infos["final_obs"][idx]
         rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
@@ -528,45 +548,42 @@ if __name__ == "__main__":
             #     # print("cbpnet: selective initailization")
             #     GnT.gen_and_test(actor.model.fc.get_activations())
 
-    #TODO
-    # Here we steps on the environment for Filling the buffer of policy
-    # steps must be in range args.distill_extra_steps
-    # the buffer must contatin S_t and A_t (based on new trained policy) for any steps
-    # it is an online policy approch, i mean you choose the actions based on trained policy and step based on
-    # these actions  
-    # i think it is better (or maybe neccessary) that state includes all observations (?)
-    ############################
+    # This buffer is only ever consumed when a future task runs with distillation=True
+    # and this run's directory is on its prev_units path. When distillation=False here,
+    # skip this entirely: no extra env steps, no distill_buffer.pt written, no effect on
+    # this run's own training/eval results.
+    distill_buffer = None
+    if args.distillation:
+        print(f"*** Generating online comprehensive distillation buffer for {args.distill_extra_steps} steps ***")
+        distill_obs = []
+        distill_shared = []
+        distill_targets = []
 
-    print(f"*** Generating online comprehensive distillation buffer for {args.distill_extra_steps} steps ***")
-    distill_obs = []
-    distill_shared = []
-    distill_targets = []
+        obs, _ = envs.reset()
+        actor.eval()
+        for _ in range(args.distill_extra_steps):
+            with torch.no_grad():
+                obs_tensor = torch.Tensor(obs).to(device)
+                distill_obs.append(obs.copy())
 
-    obs, _ = envs.reset()
-    actor.eval() 
-    for _ in range(args.distill_extra_steps):
-        with torch.no_grad():
-            obs_tensor = torch.Tensor(obs).to(device)
-            distill_obs.append(obs.copy())
-            
-            shared_feats = actor.model.fc(obs_tensor)
-            distill_shared.append(shared_feats.cpu().numpy())
-            
-            mean, log_std = actor.model.fc_mean(shared_feats), actor.model.fc_logstd(shared_feats)
-            target_outputs = torch.cat([mean, log_std], dim=-1).cpu().numpy()
-            distill_targets.append(target_outputs)
+                shared_feats = actor.model.fc(obs_tensor)
+                distill_shared.append(shared_feats.cpu().numpy())
 
-        with torch.no_grad():
-            actions, _, _ = actor.get_action(obs_tensor)
-        actions = actions.detach().cpu().numpy()
-        next_obs, _, _, _, _ = envs.step(actions)
-        obs = next_obs
+                mean, log_std = actor.model.fc_mean(shared_feats), actor.model.fc_logstd(shared_feats)
+                target_outputs = torch.cat([mean, log_std], dim=-1).cpu().numpy()
+                distill_targets.append(target_outputs)
 
-    distill_buffer = {
-        "obs": np.concatenate(distill_obs, axis=0),
-        "shared": np.concatenate(distill_shared, axis=0),
-        "targets": np.concatenate(distill_targets, axis=0)
-    }
+            with torch.no_grad():
+                actions, _, _ = actor.get_action(obs_tensor)
+            actions = actions.detach().cpu().numpy()
+            next_obs, _, _, _, _ = envs.step(actions)
+            obs = next_obs
+
+        distill_buffer = {
+            "obs": np.concatenate(distill_obs, axis=0),
+            "shared": np.concatenate(distill_shared, axis=0),
+            "targets": np.concatenate(distill_targets, axis=0)
+        }
     ##############################
     
     [
@@ -580,4 +597,5 @@ if __name__ == "__main__":
     if args.save_dir is not None:
         print(f"Saving trained agent in `{args.save_dir}` with name `{run_name}`")
         actor.model.save(dirname=f"{args.save_dir}/{run_name}")
-        torch.save(distill_buffer, f"{args.save_dir}/{run_name}/distill_buffer.pt")
+        if distill_buffer is not None:
+            torch.save(distill_buffer, f"{args.save_dir}/{run_name}/distill_buffer.pt")

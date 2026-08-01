@@ -49,7 +49,8 @@ class CkaRlAgent(nn.Module):
                 fuse_shared = False, 
                 fuse_heads = True,
                 prev_units_paths = None,
-                distillation = True):
+                distillation = True,
+                max_distill_buffer = 50_000):
         
         super().__init__()
         self.delta_theta_mode = delta_theta_mode
@@ -61,6 +62,7 @@ class CkaRlAgent(nn.Module):
         self.pool_size = pool_size
         self.prev_units_paths = prev_units_paths
         self.distillation = distillation
+        self.max_distill_buffer = max_distill_buffer
 
         assert(fuse_heads or fuse_shared)
         self.setup_vectors(base_dir, latest_dir)
@@ -175,6 +177,10 @@ class CkaRlAgent(nn.Module):
         torch.save(self.fc, f"{dirname}/fc.pt")
         torch.save(self.fc_mean, f"{dirname}/fc_mean.pt")
         torch.save(self.fc_logstd, f"{dirname}/fc_logstd.pt")
+        # Persist the (already-merged-if-applicable) buffer pool this task inherited,
+        # so the *next* task can prepend its own new buffer to it the same way
+        # get_vectors() prepends this task's own weight delta to the inherited `.weights`.
+        torch.save(getattr(self, "buffer_pool", []), f"{dirname}/distill_buffer_pool.pt")
 
     def load(dirname, obs_dim, act_dim, map_location=None, reset_heads=False):
         model = CkaRlAgent(obs_dim,act_dim,None,None)
@@ -193,6 +199,7 @@ class CkaRlAgent(nn.Module):
             self.fc_logstd.merge_weight()
             
     def setup_vectors(self, base_dir, latest_dir):
+        self.buffer_pool = []
         if base_dir == None:
             self.num_vectors = 0
         elif latest_dir == None:
@@ -241,6 +248,21 @@ class CkaRlAgent(nn.Module):
                     self.num_vectors = 1
 
                 logger.info(f"self.num_vectors before merge: {self.num_vectors}")
+            
+            if self.fuse_heads and latest_dir is not None:
+                # Load the buffer pool exactly the way get_vectors() loads the weight
+                # pool: `latest_dir`'s own freshly-collected buffer (its "new_weight"
+                # equivalent) gets prepended to whatever pool it itself inherited (and
+                # possibly already reduced via its own merge_vectors() call).
+                inherited_pool = []
+                pool_path = f"{latest_dir}/distill_buffer_pool.pt"
+                if os.path.exists(pool_path):
+                    inherited_pool = torch.load(pool_path)
+                own_buffer_path = f"{latest_dir}/distill_buffer.pt"
+                if os.path.exists(own_buffer_path):
+                    self.buffer_pool = [torch.load(own_buffer_path)] + inherited_pool
+                else:
+                    self.buffer_pool = inherited_pool
 
             self.merge_vectors()
             if self.fuse_heads:
@@ -279,92 +301,126 @@ class CkaRlAgent(nn.Module):
         logger.info(self.alpha)
         
     
-    # add distillation boolean to arguments and pass merging vectors with most similarity 
-    # to distillation_policy_merge
     def merge_vectors(self):
         """Reduce the accumulated vector pool down to `self.pool_size`.
 
         Called with no arguments (see `setup_vectors`); reads the per-layer
         vector pools directly off `self` (`self.mean_l0_vec`, `self.mean_l2_vec`,
-        `self.logstd_l0_vec`, `self.logstd_l2_vec`), which is what `setup_vectors`
-        actually populates now that the heads are 2-layer Sequentials.
+        `self.logstd_l0_vec`, `self.logstd_l2_vec`) and the buffer pool
+        (`self.buffer_pool`), all of which `setup_vectors` populates before
+        calling this.
 
-        Vectors are mutated in place (dicts are passed by reference), matching
-        the original single-layer behavior.
+        IMPORTANT: all four FuseLinear layers (mean_l0, mean_l2, logstd_l0,
+        logstd_l2) share the exact same `self.alpha` parameter (see
+        `setup_heads`). That means slot `i` in every one of these pools MUST
+        refer to the same historical task -- alpha[i] can't mean "task A" in
+        one layer and "task B" in another. So we pick exactly ONE
+        (idx1, idx2) pair per round (from the combined weight-delta across
+        all four layers), and apply it everywhere: all four vector pools AND
+        the buffer pool collapse together, in one shot, not independently.
         """
-        buffers = []
-        if self.prev_units_paths is not None:
-            for p in self.prev_units_paths:
-                buf_path = f"{p}/distill_buffer.pt"
-                if os.path.exists(buf_path):
-                    buffers.append(torch.load(buf_path))
-
-        # if self.num_vectors > self.pool_size and len(buffers) >= 2:
-        #     logger.info(f"Merging 2-layer vector pool down to pool_size={self.pool_size}")
-        #     # شبیه‌سازی منطق برای حفظ ابعاد pool_size
-        #     self.num_vectors = self.pool_size
-
-        def merge(vectors, layer_type, input_key, target_key, target_dim, allow_distillation=True):
-            for name, element in vectors.items():
-                similarities = torch.ones((element.shape[0], element.shape[0])) * -1
-                for i in range(element.shape[0]):
-                    for j in range(i + 1, element.shape[0]):
-                        similarities[i, j] = torch.cosine_similarity(element[i].flatten(), element[j].flatten(), dim=0)
-                print(similarities)                 
-                max_sim_idx = torch.argmax(similarities)
-                idx1, idx2 = divmod(max_sim_idx.item(), element.shape[0])
-                logger.info(f"Merge vectors, name = {name}, idx1 = {idx1}, idx2 = {idx2}")
-
-                # Only actually use distillation if buffers exist for both indices being merged;
-                # crashing with an IndexError on `buffers[idx1]` / `buffers[idx2]`.
-                # otherwise fall back to the original simple-averaging behavior instead of
-                use_distillation = self.distillation and allow_distillation and len(buffers) > max(idx1, idx2)
-                if self.distillation and allow_distillation and not use_distillation:
-                    logger.warning(
-                        f"Distillation requested for {layer_type}.{name} but distill buffers are "
-                        f"unavailable/insufficient (have {len(buffers)}, need index {max(idx1, idx2)}); "
-                        f"falling back to simple averaging for this vector."
-                    )
-
-                if use_distillation:
-                    logger.info(f"Merge vectors via Distillation, type = {layer_type}, property = {name}, idx1 = {idx1}, idx2 = {idx2}")
-                    new_w, new_b = self.distillation_policy_merge(
-                        buffers[idx1], buffers[idx2], input_key, target_key, layer_type, target_dim
-                    )
-                    new_element = new_w if name == 'weight' else new_b
-                else:
-                    logger.info(f"Merge vectors via Simple Averaging, type = {layer_type}, property = {name}, idx1 = {idx1}, idx2 = {idx2}")
-                    new_element = (element[idx1] + element[idx2]) / 2
-
-                element = torch.cat((element[:idx1], element[idx1+1:idx2], element[idx2+1:], new_element.unsqueeze(0)), dim=0)
-                logger.info(element.shape)
-                vectors[name] = element
-
         if self.fuse_heads and self.num_vectors > self.pool_size:
             logger.info(f"Merge head vectors, pool size = {self.pool_size}, current #vectors = {self.num_vectors}")
+
+            n = self.num_vectors
+            flat_per_slot = torch.cat([
+                self.mean_l0_vec['weight'].reshape(n, -1), self.mean_l0_vec['bias'].reshape(n, -1),
+                self.mean_l2_vec['weight'].reshape(n, -1), self.mean_l2_vec['bias'].reshape(n, -1),
+                self.logstd_l0_vec['weight'].reshape(n, -1), self.logstd_l0_vec['bias'].reshape(n, -1),
+                self.logstd_l2_vec['weight'].reshape(n, -1), self.logstd_l2_vec['bias'].reshape(n, -1),
+            ], dim=1)
+
+            similarities = torch.ones((n, n)) * -1
+            for i in range(n):
+                for j in range(i + 1, n):
+                    similarities[i, j] = torch.cosine_similarity(flat_per_slot[i], flat_per_slot[j], dim=0)
+            max_sim_idx = torch.argmax(similarities)
+            idx1, idx2 = divmod(max_sim_idx.item(), n)
+            logger.info(f"Merging pool slots idx1={idx1}, idx2={idx2} (one shared pair for all vectors + buffers)")
+
+            buffers = getattr(self, "buffer_pool", [])
+            use_distillation = self.distillation and len(buffers) > max(idx1, idx2)
+            if self.distillation and not use_distillation:
+                logger.warning(
+                    f"Distillation requested but buffer pool is unavailable/insufficient "
+                    f"(have {len(buffers)}, need index {max(idx1, idx2)}); "
+                    f"falling back to simple averaging for this round."
+                )
+
             # Output layer (128 -> act_dim) maps directly onto the mean/log_std values the
             # distillation buffer's `targets` were recorded from, so distillation-based
-            # merging is well-defined here.
-            merge(self.mean_l2_vec, "mean_l2", "shared", "targets", self.act_dim, allow_distillation=True)
-            merge(self.logstd_l2_vec, "logstd_l2", "shared", "targets", self.act_dim, allow_distillation=True)
+            # merging is well-defined here. Trained once per head, reused for weight+bias.
+            distilled = {}
+            if use_distillation:
+                distilled["mean"] = self.distillation_policy_merge(
+                    buffers[idx1], buffers[idx2], "shared", "targets", "mean_l2", self.act_dim
+                )
+                distilled["logstd"] = self.distillation_policy_merge(
+                    buffers[idx1], buffers[idx2], "shared", "targets", "logstd_l2", self.act_dim
+                )
+
+            def collapse(vectors, distilled_wb=None):
+                for name, element in vectors.items():
+                    if distilled_wb is not None:
+                        new_w, new_b = distilled_wb
+                        new_element = new_w if name == 'weight' else new_b
+                    else:
+                        new_element = (element[idx1] + element[idx2]) / 2
+                    # distillation_policy_merge always returns CPU tensors, but `element`
+                    # (the loaded pool) can be on cuda:0 if it was torch.load'd without
+                    # map_location from a checkpoint saved while the model was on GPU.
+                    # Match devices before concatenating either way.
+                    new_element = new_element.to(element.device)
+                    element = torch.cat(
+                        (element[:idx1], element[idx1+1:idx2], element[idx2+1:], new_element.unsqueeze(0)), dim=0
+                    )
+                    vectors[name] = element
+
+            collapse(self.mean_l2_vec, distilled.get("mean"))
+            collapse(self.logstd_l2_vec, distilled.get("logstd"))
             # Hidden layer (256 -> 128) has no supervised target recorded in the distillation
             # buffer (only the shared features and the final mean/log_std are stored), so it
-            # always uses the original simple-averaging method, unmodified.
-            merge(self.mean_l0_vec, "mean_l0", "shared", "targets", 128, allow_distillation=False)
-            merge(self.logstd_l0_vec, "logstd_l0", "shared", "targets", 128, allow_distillation=False)
+            # always uses simple averaging, regardless of the distillation flag.
+            collapse(self.mean_l0_vec, None)
+            collapse(self.logstd_l0_vec, None)
 
+            # Collapse the buffer pool with the SAME (idx1, idx2), capped to max_distill_buffer.
+            if buffers:
+                b1, b2 = buffers[idx1], buffers[idx2]
+                merged_buffer = {k: np.concatenate([b1[k], b2[k]], axis=0) for k in ("obs", "shared", "targets")}
+                n_rows = merged_buffer["obs"].shape[0]
+                if n_rows > self.max_distill_buffer:
+                    keep = np.random.choice(n_rows, size=self.max_distill_buffer, replace=False)
+                    merged_buffer = {k: v[keep] for k, v in merged_buffer.items()}
+                self.buffer_pool = buffers[:idx1] + buffers[idx1+1:idx2] + buffers[idx2+1:] + [merged_buffer]
+
+            self.num_vectors = self.pool_size
+
+        # fuse_shared is unused by run_sac.py (hardcoded False) -- left as its original,
+        # independent per-tensor merge. If you ever enable fuse_shared alongside fuse_heads,
+        # revisit this to share one (idx1, idx2) pair too, for the same alpha-consistency
+        # reason described above.
         if self.fuse_shared and hasattr(self.fc, 'network'):
+            def merge(vectors, layer_type, input_key, target_key, target_dim, allow_distillation=True):
+                for name, element in vectors.items():
+                    similarities = torch.ones((element.shape[0], element.shape[0])) * -1
+                    for i in range(element.shape[0]):
+                        for j in range(i + 1, element.shape[0]):
+                            similarities[i, j] = torch.cosine_similarity(element[i].flatten(), element[j].flatten(), dim=0)
+                    max_sim_idx = torch.argmax(similarities)
+                    idx1, idx2 = divmod(max_sim_idx.item(), element.shape[0])
+                    new_element = (element[idx1] + element[idx2]) / 2
+                    element = torch.cat((element[:idx1], element[idx1+1:idx2], element[idx2+1:], new_element.unsqueeze(0)), dim=0)
+                    vectors[name] = element
+
             for layer_idx in self.fc.fuse_layers:
                 layer = self.fc.network[layer_idx]
                 if layer.num_weights > self.pool_size:
                     base_layout = layer.get_base()
                     vectors_layout, _ = layer.get_vectors(base_layout)
-                    merge(vectors_layout, f"shared_layer_{layer_idx}", "obs", "shared", layer.out_features, allow_distillation=True)
+                    merge(vectors_layout, f"shared_layer_{layer_idx}", "obs", "shared", layer.out_features)
                     layer.weights.data.copy_(vectors_layout['weight'])
                     layer.biaes.data.copy_(vectors_layout['bias'])
-
-        if self.fuse_heads and self.num_vectors > self.pool_size:
-            self.num_vectors = self.pool_size
 
 
     # Trains a small supervised MLP (input_key -> target_key) on the pooled distillation
@@ -382,7 +438,13 @@ class CkaRlAgent(nn.Module):
         dataset = torch.utils.data.TensorDataset(inputs_tensor, targets_tensor)
         dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
         
-        device = self.alpha.device if self.alpha is not None else "cpu"
+        # NOTE: this runs from inside setup_vectors() -> merge_vectors(), which is called
+        # in __init__ BEFORE self.alpha is created (setup_alpha() runs after setup_vectors()
+        # because it needs the num_vectors count that setup_vectors/merge_vectors finalizes).
+        # So this can't read self.alpha -- it doesn't exist yet at this point. The returned
+        # weight/bias are moved to .cpu() below anyway, so training this small MLP on
+        # whatever device is available is fine regardless of where the model ends up.
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         distill_head = nn.Sequential(
             nn.Linear(inputs_tensor.shape[-1], 128),
