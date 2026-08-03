@@ -453,6 +453,9 @@ if __name__ == "__main__":
                     writer.add_scalar(
                         "losses/alpha_loss", alpha_loss.item(), global_step
                     )
+            if global_step % args.eval_every == 0 and global_step > 0:
+                    [eval_agent(actor, envs.envs[i], args.num_evals, global_step, writer, device) for i in range(envs.num_envs)]
+
 
     distill_buffer = None
     if args.distillation:

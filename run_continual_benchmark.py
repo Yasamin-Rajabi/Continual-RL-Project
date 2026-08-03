@@ -53,46 +53,38 @@ from cka_rl import CkaRlAgent
 from tasks import get_task, get_task_name
 
 # ==========================================================================
-# CONFIG -- edit this block, then just run the script.
+# CONFIG
 # ==========================================================================
-QUICK_TEST = False          # True -> tiny smoke-test run to sanity-check the
-                             # whole pipeline (~minutes) before the real run.
+QUICK_TEST = False          
 
 SEED = 42
-POOL_SIZE = 2                # small on purpose: with 5 tasks and pool_size=2,
-                              # merges get triggered repeatedly (tasks 3, 4, 5
-                              # in the chain each force a merge), which is
-                              # exactly what you want to stress-test.
+POOL_SIZE = 5                
 LEARNING_STARTS = 5_000
 DISTILL_EXTRA_STEPS = 15_000
 NUM_EVAL_EPISODES = 10
 
-if QUICK_TEST:
-    TASK_SEQUENCE = [0, 1, 2]
-    TOTAL_TIMESTEPS_PER_TASK = 20_000
-else:
-    TASK_SEQUENCE = [0, 1, 2, 3, 4]     # hammer, faucet-close, stick-pull,
-                                         # handle-press-side, push
-    TOTAL_TIMESTEPS_PER_TASK = 150_000
+TASK_SEQUENCE = [0, 1, 2, 3, 4, 5, 6, 0, 1, 2, 3, 4, 5, 6, 0, 1, 2, 3, 4, 5]
+TOTAL_TIMESTEPS_PER_TASK = 150_000
 
 SAVE_ROOT = "agents"
 RUNS_ROOT = "runs"
 PLOTS_ROOT = "plots_continual_benchmark"
 
 CONDITIONS = {
-    "cka_baseline": {"distillation": False, "tag": "CKA_Baseline"},
-    "cka_distill":  {"distillation": True,  "tag": "CKA_Distill"},
+    "Mode1_Baseline":     {"distillation": False, "fusion_mode": "classic_cka",  "tag": "Mode1_Baseline"},
+    "Mode2_DistillOnly":  {"distillation": True,  "fusion_mode": "classic_cka",  "tag": "Mode2_DistillOnly"},
+    "Mode3_WeightOnly":   {"distillation": False, "fusion_mode": "weight_delta", "tag": "Mode3_WeightOnly"},
+    "Mode4_OursCombined": {"distillation": True,  "fusion_mode": "weight_delta", "tag": "Mode4_OursCombined"},
 }
 
 METRICS = {
     "losses/actor_loss":       ("Actor Loss", "actor_loss"),
-    "losses/qf_loss":          ("Critic (Q-Function) Loss", "critic_loss"),
-    "charts/episodic_return":  ("Episodic Return (reward)", "reward"),
-    "charts/success":          ("Success (1=solved episode)", "success"),
+    "losses/qf_loss":          ("Critic Loss", "critic_loss"),
+    "charts/episodic_return":  ("Episodic Return", "reward"),
+    "charts/success":          ("Success Rate", "success"),
+    "charts/test_success":     ("Evaluation Success", "eval_success"), # اضافه شدن متریک ارزیابی دوره‌ای
 }
-ROLLING_WINDOW = 25   # smoothing window for the noisy per-episode reward/success
-                       # curves ONLY (loss curves are plotted raw, like before).
-
+ROLLING_WINDOW = 25
 # ==========================================================================
 # TRAINING: run the full task chain for one condition
 # ==========================================================================
@@ -117,8 +109,10 @@ def run_task_chain(condition_name, cfg):
                 f"--total-timesteps={TOTAL_TIMESTEPS_PER_TASK}",
                 f"--learning-starts={LEARNING_STARTS}",
                 f"--distill-extra-steps={DISTILL_EXTRA_STEPS}",
+                f"--eval-every=10000",
                 f"--pool-size={POOL_SIZE}",
                 f"--save-dir={save_dir}",
+                f"--fusion-mode={cfg['fusion_mode']}",
                 "--distillation" if cfg["distillation"] else "--no-distillation",
             ]
             if prev_units:
