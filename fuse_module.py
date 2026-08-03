@@ -140,29 +140,42 @@ class FuseLinear(nn.Module):
             if self._bias:
                 self.biaes.data.copy_(vectors['bias'])
 
-    def get_vectors(self, base = None):
-        if self.fusion_mode == "weight_delta":
-            hist_weight = 0
-            hist_bias = 0
+    def get_vectors(self, base=None):
+        if getattr(self, "fusion_mode", "classic_cka") == "weight_delta":
+            hist_weight = 0.0
+            hist_bias = 0.0
+            
             if self.weights is not None:
                 alphas_normalized = F.softmax(self.alpha * self.alpha_scale, dim=0)
                 hist_weight = (alphas_normalized.view(-1, 1, 1) * self.weights.data).sum(dim=0)
-                if self._bias:
-                    hist_bias = (alphas_normalized.view(-1,1) * self.biaes.data).sum(dim=0)
+                if self._bias and self.biaes is not None:
+                    hist_bias = (alphas_normalized.view(-1, 1) * self.biaes.data).sum(dim=0)
             
             # V_t = b + sum(beta * V_i)
             new_weight = self.b_weight.data + hist_weight
-            new_bias = self.b_bias.data + hist_bias if self._bias else None
+            if self._bias:
+                new_bias = self.b_bias.data + hist_bias
+            else:
+                new_bias = None
         else:
             if base is None:
-                base_weight = torch.zeros_like(self.weight)
-                base_bias = torch.zeros_like(self.bias) if self._bias else None
+                base_weight = torch.zeros_like(self.weight.data)
+                if self._bias:
+                    base_bias = torch.zeros_like(self.bias.data)
+                else:
+                    base_bias = None
             else:
                 base_weight = base['weight']
-                base_bias = base['bias']
+                if self._bias:
+                    base_bias = base['bias']
+                else:
+                    base_bias = None
                 
             new_weight = self.weight.data - base_weight
-            new_bias = self.bias.data - base_bias if self._bias else None
+            if self._bias:
+                new_bias = self.bias.data - base_bias
+            else:
+                new_bias = None
         
         if self.weights is not None:
             weights = torch.cat([new_weight.unsqueeze(0), self.weights.data], dim=0)
@@ -177,7 +190,7 @@ class FuseLinear(nn.Module):
         else:
             biaes = None
             
-        return {"weight":weights, "bias":biaes}, weights.shape[0]
+        return {"weight": weights, "bias": biaes}, weights.shape[0]
     
     def get_base(self):
         return {"weight":self.weight, "bias":self.bias}

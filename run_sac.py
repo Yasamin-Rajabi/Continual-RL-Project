@@ -1,4 +1,3 @@
-# docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/sac/#sac_continuous_actionpy
 import os
 import random
 import time
@@ -15,13 +14,14 @@ import tyro
 import pathlib
 from torch.utils.tensorboard import SummaryWriter
 from typing import Literal, Optional, Tuple
-#from models import shared, SimpleAgent, CompoNetAgent, PackNetAgent, ProgressiveNetAgent, CkaRlAgent, MaskNetAgent, CbpAgent, CReLUsAgent
+
+# from models import shared, SimpleAgent, CompoNetAgent, PackNetAgent, ProgressiveNetAgent, CkaRlAgent, MaskNetAgent, CbpAgent, CReLUsAgent
 from cka_rl import CkaRlAgent
 from shared_arch import shared
 from tasks import get_task
 from AdamGnT import AdamGnT
 from stable_baselines3.common.buffers import ReplayBuffer
-#from models.cbp_modules import GnT
+# from models.cbp_modules import GnT
 
 # ==========================================
 # TORCH SECURITY PATCH FOR KAGGLE (NUMPY 2.0 & WEIGHTS ONLY COMPATIBILITY)
@@ -110,6 +110,8 @@ class Args:
     """The number of online steps to take for generating the comprehensive distillation buffer"""
     distillation: bool = True
     """Whether to use supervised policy distillation for merging vectors or fallback to simple averaging"""
+    max_distill_buffer: int = 50_000
+    """Cap on the pooled distillation buffer size (per pool slot) after two buffers are merged; excess rows are randomly subsampled"""
 
 def make_env(task_id):
     def thunk():
@@ -238,7 +240,15 @@ if __name__ == "__main__":
     print(f"*** Device: {device}")
 
     # env setup
-    envs = gym.vector.SyncVectorEnv([make_env(args.task_id)])
+    # SAME_STEP restores the pre-1.0 autoreset behavior this code expects: on the step an
+    # episode ends, the env resets immediately and reports both the terminal AND reset
+    # info via final_info/final_observation (handled below). Gymnasium's newer default,
+    # NEXT_STEP, instead silently ignores the action passed on the following step (it just
+    # resets), which would otherwise get stored as a bogus transition in the replay buffer
+    # at every single episode boundary.
+    envs = gym.vector.SyncVectorEnv(
+        [make_env(args.task_id)], autoreset_mode=gym.vector.AutoresetMode.SAME_STEP
+    )
     assert isinstance(
         envs.single_action_space, gym.spaces.Box
     ), "only continuous action space is supported"
@@ -251,51 +261,7 @@ if __name__ == "__main__":
     print(obs_dim)
     print(act_dim)
     print(f"*** Loading model `{args.model_type}` ***")
-    # if args.model_type in ["finetune", "componet"]:
-    #     assert (
-    #         len(args.prev_units) > 0
-    #     ), f"Model type {args.model_type} requires at least one previous unit"
 
-    # if args.model_type == "simple":
-    #     model = SimpleAgent(obs_dim=obs_dim, act_dim=act_dim).to(device)
-
-    # elif args.model_type == "finetune":
-    #     model = SimpleAgent.load(
-    #         args.prev_units[0], map_location=device, reset_heads=True
-    #     ).to(device)
-
-    # elif args.model_type == "componet":
-    #     model = CompoNetAgent(
-    #         obs_dim=obs_dim,
-    #         act_dim=act_dim,
-    #         prev_paths=args.prev_units,
-    #         map_location=device,
-    #     ).to(device)
-    # elif args.model_type == "packnet":
-    #     packnet_retrain_start = args.total_timesteps - int(args.total_timesteps * 0.2)
-    #     if len(args.prev_units) == 0:
-    #         model = PackNetAgent(
-    #             obs_dim=obs_dim,
-    #             act_dim=act_dim,
-    #             task_id=args.task_id,
-    #             total_task_num=20,
-    #             device=device,
-    #         ).to(device)
-    #     else:
-    #         model = PackNetAgent.load(
-    #             args.prev_units[0],
-    #             task_id=args.task_id + 1,
-    #             restart_heads=True,
-    #             freeze_bias=True,
-    #             map_location=device,
-    #         ).to(device)
-    # elif args.model_type == "prognet":
-    #     model = ProgressiveNetAgent(
-    #         obs_dim=obs_dim,
-    #         act_dim=act_dim,
-    #         prev_paths=args.prev_units,
-    #         map_location=device,
-    #     ).to(device)
     if args.model_type == "cka-rl":
         base_dir = args.prev_units[0] if len(args.prev_units) > 0 else None
         latest_dir = args.prev_units[-1] if len(args.prev_units) > 0 else None
@@ -310,43 +276,9 @@ if __name__ == "__main__":
             encoder_from_base=args.encoder_from_base,
             prev_units_paths=args.prev_units,
             distillation=args.distillation,
-            fusion_mode=args.fusion_mode  
+            max_distill_buffer=args.max_distill_buffer,
+            fusion_mode=args.fusion_mode,
         )
-    # elif args.model_type == 'masknet':
-    #     if len(args.prev_units) == 0:
-    #         model = MaskNetAgent(
-    #             obs_dim=obs_dim,
-    #             act_dim=act_dim,
-    #             num_tasks=20,
-    #         ).to(device)
-    #     else:
-    #         model = MaskNetAgent.load(
-    #             args.prev_units[0],
-    #             map_location=device,
-    #         ).to(device)
-    #     model.set_task(args.task_id, new_task=True)
-    # elif args.model_type == 'cbpnet':
-    #     if len(args.prev_units) == 0:
-    #         model = CbpAgent(
-    #             obs_dim=obs_dim,
-    #             act_dim=act_dim
-    #             ).to(device)
-    #     else:
-    #         model = CbpAgent.load(
-    #             args.prev_units[0],
-    #             map_location=device,
-    #         ).to(device)
-    # elif args.model_type == "crelus":
-    #     if len(args.prev_units) == 0:
-    #         model = CReLUsAgent(
-    #             obs_dim=obs_dim,
-    #             act_dim=act_dim
-    #             ).to(device)
-    #     else:
-    #         model = CReLUsAgent.load(
-    #             args.prev_units[0],
-    #             map_location=device,
-    #         ).to(device)
         
     actor = Actor(envs, model).to(device)
     qf1 = SoftQNetwork(envs).to(device)
@@ -359,10 +291,6 @@ if __name__ == "__main__":
         list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr
     )
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
-    # if args.model_type == 'cbpnet':
-    #     actor_optimizer = AdamGnT(actor.parameters(), lr=args.policy_lr, eps=1e-5)
-    #     GnT = GnT(net=actor.model.fc.net, opt=actor_optimizer,replacement_rate=1e-3, decay_rate=0.99, device=device,
-    #                 maturity_threshold=1000, util_type="contribution")
         
     # Automatic entropy tuning
     if args.autotune:
@@ -410,25 +338,26 @@ if __name__ == "__main__":
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "final_info" in infos:
-            for i, info in enumerate(infos["final_info"]):
-                # print(
-                #     f"global_step={global_step}, episodic_return={info['episode']['r']}, success={info['success']}"
-                # )
+            final_info = infos["final_info"]
+            finished_mask = infos["_final_info"]
+            if np.any(finished_mask):
+                idx = int(np.argmax(finished_mask))
                 writer.add_scalar(
-                    "charts/episodic_return", info["episode"]["r"], global_step
+                    "charts/episodic_return", final_info["episode"]["r"][idx], global_step
                 )
                 writer.add_scalar(
-                    "charts/episodic_length", info["episode"]["l"], global_step
+                    "charts/episodic_length", final_info["episode"]["l"][idx], global_step
                 )
-                writer.add_scalar("charts/success", info["success"], global_step)
+                if "success" in final_info:
+                    writer.add_scalar("charts/success", final_info["success"][idx], global_step)
 
-                break
-
-        # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
+        # TRY NOT TO MODIFY: save data to reply buffer; handle `final_obs`
         real_next_obs = next_obs.copy()
-        for idx, trunc in enumerate(truncations):
-            if trunc and "final_observation" in infos:
-                real_next_obs[idx] = infos["final_observation"][idx]
+        if "final_obs" in infos:
+            finished_mask = infos["_final_obs"]
+            for idx, trunc in enumerate(truncations):
+                if trunc and finished_mask[idx]:
+                    real_next_obs[idx] = infos["final_obs"][idx]
         rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
@@ -474,11 +403,6 @@ if __name__ == "__main__":
 
                     actor_optimizer.zero_grad()
                     actor_loss.backward()
-                    # if args.model_type == "packnet":
-                    #     if global_step >= packnet_retrain_start:
-                    #         # can be called multiple times, only the first counts
-                    #         actor.model.start_retraining()
-                    #     actor.model.before_update()
                     actor_optimizer.step()
 
                     if args.autotune:
@@ -520,7 +444,6 @@ if __name__ == "__main__":
                 writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)
                 writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
                 writer.add_scalar("losses/alpha", alpha, global_step)
-                # print("SPS:", int(global_step / (time.time() - start_time)))
                 writer.add_scalar(
                     "charts/SPS",
                     int(global_step / (time.time() - start_time)),
@@ -530,50 +453,40 @@ if __name__ == "__main__":
                     writer.add_scalar(
                         "losses/alpha_loss", alpha_loss.item(), global_step
                     )
-            # if args.model_type == 'cbpnet':
-            #     # print("cbpnet: selective initailization")
-            #     GnT.gen_and_test(actor.model.fc.get_activations())
 
-    #TODO
-    # Here we steps on the environment for Filling the buffer of policy
-    # steps must be in range args.distill_extra_steps
-    # the buffer must contatin S_t and A_t (based on new trained policy) for any steps
-    # it is an online policy approch, i mean you choose the actions based on trained policy and step based on
-    # these actions  
-    # i think it is better (or maybe neccessary) that state includes all observations (?)
-    ############################
+    distill_buffer = None
+    if args.distillation:
+        print(f"*** Generating online comprehensive distillation buffer for {args.distill_extra_steps} steps ***")
+        distill_obs = []
+        distill_shared = []
+        distill_targets = []
 
-    print(f"*** Generating online comprehensive distillation buffer for {args.distill_extra_steps} steps ***")
-    distill_obs = []
-    distill_shared = []
-    distill_targets = []
+        obs, _ = envs.reset()
+        actor.eval()
+        for _ in range(args.distill_extra_steps):
+            with torch.no_grad():
+                obs_tensor = torch.Tensor(obs).to(device)
+                distill_obs.append(obs.copy())
 
-    obs, _ = envs.reset()
-    actor.eval() 
-    for _ in range(args.distill_extra_steps):
-        with torch.no_grad():
-            obs_tensor = torch.Tensor(obs).to(device)
-            distill_obs.append(obs.copy())
-            
-            shared_feats = actor.model.fc(obs_tensor)
-            distill_shared.append(shared_feats.cpu().numpy())
-            
-            mean, log_std = actor.model.fc_mean(shared_feats), actor.model.fc_logstd(shared_feats)
-            target_outputs = torch.cat([mean, log_std], dim=-1).cpu().numpy()
-            distill_targets.append(target_outputs)
+                shared_feats = actor.model.fc(obs_tensor)
+                distill_shared.append(shared_feats.cpu().numpy())
 
-        with torch.no_grad():
-            actions, _, _ = actor.get_action(obs_tensor)
-        actions = actions.detach().cpu().numpy()
-        next_obs, _, _, _, _ = envs.step(actions)
-        obs = next_obs
+                mean, log_std = actor.model.fc_mean(shared_feats), actor.model.fc_logstd(shared_feats)
+                target_outputs = torch.cat([mean, log_std], dim=-1).cpu().numpy()
+                distill_targets.append(target_outputs)
 
-    distill_buffer = {
-        "obs": np.concatenate(distill_obs, axis=0),
-        "shared": np.concatenate(distill_shared, axis=0),
-        "targets": np.concatenate(distill_targets, axis=0)
-    }
-    ##############################
+            with torch.no_grad():
+                actions, _, _ = actor.get_action(obs_tensor)
+            actions = actions.detach().cpu().numpy()
+            next_obs, _, _, _, _ = envs.step(actions)
+            obs = next_obs
+
+        distill_buffer = {
+            "obs": np.concatenate(distill_obs, axis=0),
+            "shared": np.concatenate(distill_shared, axis=0),
+            "targets": np.concatenate(distill_targets, axis=0)
+        }
+ 
     
     [
         eval_agent(actor, envs.envs[i], args.num_evals, global_step, writer, device)
@@ -586,4 +499,5 @@ if __name__ == "__main__":
     if args.save_dir is not None:
         print(f"Saving trained agent in `{args.save_dir}` with name `{run_name}`")
         actor.model.save(dirname=f"{args.save_dir}/{run_name}")
-        torch.save(distill_buffer, f"{args.save_dir}/{run_name}/distill_buffer.pt")
+        if distill_buffer is not None:
+            torch.save(distill_buffer, f"{args.save_dir}/{run_name}/distill_buffer.pt")

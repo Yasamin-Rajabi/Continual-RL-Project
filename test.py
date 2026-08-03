@@ -7,23 +7,70 @@ import matplotlib.pyplot as plt
 from cka_rl import CkaRlAgent
 from tasks import get_task
 
+import glob
+from tensorboard.backend.event_processing import event_accumulator
+
 # ==========================================
 # CONFIGURATION FOR CLEAN INTEGRATION TEST
 # ==========================================
 TAG = "SimilarTasksBenchmark"
 SAVE_DIR = f"agents/{TAG}"
 SEED = 42
-TOTAL_TIMESTEPS = 300_000   # افزایش استپ‌ها به ۳۰۰ هزار برای همگرایی واقعی Teacher
+TOTAL_TIMESTEPS = 300_000   # Increased to 300k for teacher convergence
 LEARNING_STARTS = 5000
-DISTILL_STEPS = 15_000      # افزایش استپ‌های بافر جامع برای پوشش کامل فضای حالت
-NUM_EVAL_EPISODES = 10 # تعداد اپیزودهای ارزیابی برای رسم نمودار خطی
+DISTILL_STEPS = 15_000      # Increased for comprehensive state space coverage
+NUM_EVAL_EPISODES = 10      # Number of evaluation episodes for line plotting
 
 TASK_A = 3  
 TASK_B = 5
 
+def plot_training_metrics(tag, task_id, task_name, save_dir="plots_training"):
+    """Extracts and plots training metrics (Reward, Actor Loss, Critic Loss) from TensorBoard logs."""
+    os.makedirs(save_dir, exist_ok=True)
+    run_dir_pattern = f"runs/{tag}/task_{task_id}__*"
+    run_dirs = glob.glob(run_dir_pattern)
+    
+    if not run_dirs:
+        print(f"Warning: TensorBoard log directory for Task {task_id} not found.")
+        return
+
+    event_file = glob.glob(f"{run_dirs[0]}/*events.out*")
+    if not event_file:
+        return
+
+    ea = event_accumulator.EventAccumulator(event_file[0])
+    ea.Reload()
+
+    tags_to_extract = {
+        'charts/episodic_return': ('Episodic Return during Training', 'Episodic Return', 'reward_train'),
+        'losses/actor_loss': ('Actor Loss during Training', 'Actor Loss', 'actor_loss'),
+        'losses/qf_loss': ('Critic (Q-Function) Loss during Training', 'Critic Loss', 'critic_loss')
+    }
+
+    available_tags = ea.Tags().get('scalars', [])
+
+    for tag_name, (title, ylabel, filename) in tags_to_extract.items():
+        if tag_name in available_tags:
+            events = ea.Scalars(tag_name)
+            steps = [e.step for e in events]
+            values = [e.value for e in events]
+
+            plt.figure(figsize=(9, 4.5))
+            plt.plot(steps, values, color='purple' if 'loss' in filename else 'teal', alpha=0.85, linewidth=1.5)
+            plt.title(f'{title} - Task {task_id} ({task_name})')
+            plt.xlabel('Timesteps')
+            plt.ylabel(ylabel)
+            plt.grid(True, linestyle=':', alpha=0.6)
+            plt.tight_layout()
+            plt.savefig(f"{save_dir}/{filename}_task_{task_id}.png", dpi=300)
+            plt.close()
+            print(f"Chart saved: {save_dir}/{filename}_task_{task_id}.png")
+
 def run_sac_for_task(task_id):
-    """اجرای استاندارد SAC روی تسک مشخص شده و ذخیره خروجی‌ها"""
-    run_name = f"task_{task_id}__cka-rl__run_sac__42"
+    """Runs standard SAC on the specified task and saves the outputs."""
+    run_name = f"task_{task_id}__cka-rl__run_sac__{SEED}"
+    
+    # Note: Corrected argument formatting (replaced '_' with '-' for tyro compatibility)
     cmd = [
         "python3", "run_sac.py",
         f"--model-type=cka-rl",
@@ -31,14 +78,14 @@ def run_sac_for_task(task_id):
         f"--seed={SEED}",
         f"--tag={TAG}",
         f"--total-timesteps={TOTAL_TIMESTEPS}",
-        f"--learning_starts={LEARNING_STARTS}",
-        f"--distill_extra_steps={DISTILL_STEPS}",
+        f"--learning-starts={LEARNING_STARTS}",
+        f"--distill-extra-steps={DISTILL_STEPS}",
         f"--save-dir={SAVE_DIR}"
     ]
     
-    # برای تسک ۱، آدرس تسک ۰ را به عنوان یونیت قبلی می‌فرستیم
+    # Link previous task if running Task B
     if task_id == TASK_B:
-        prev_run = f"task_{TASK_A}__cka-rl__run_sac__42"
+        prev_run = f"task_{TASK_A}__cka-rl__run_sac__{SEED}"
         cmd.extend(["--prev-units", f"{SAVE_DIR}/{prev_run}"])
         
     print(f"\n>>> Running SAC Training for Task {task_id} ({TOTAL_TIMESTEPS} steps) <<<")
@@ -46,7 +93,7 @@ def run_sac_for_task(task_id):
 
 def evaluate_policy_variant(prev_units, task_id, mode: str):
     """
-    ارزیابی کاملاً ایزوله برای واریانت‌های مختلف سیاست
+    Isolated evaluation for different policy variants.
     mode: 'distill' | 'simple' | 'original'
     """
     env = get_task(task_id)
@@ -103,35 +150,20 @@ def evaluate_policy_variant(prev_units, task_id, mode: str):
     env.close()
     return episode_rewards
 
-if __name__ == "__main__":
-    # ۱. تغییر هایپرپارامترهای محلی برای تسک‌های مشابه جدید
-    
-    # تابع run_sac_for_task را برای تسک‌های ۳ و ۵ بازنویسی موقت می‌کنیم تا با تگ جدید بخواند
-    def run_sac_for_similar_tasks(task_id):
-        cmd = [
-            "python3", "run_sac.py",
-            f"--model-type=cka-rl",
-            f"--task-id={task_id}",
-            f"--seed={SEED}",
-            f"--tag={TAG}",
-            f"--total-timesteps={TOTAL_TIMESTEPS}",
-            f"--learning_starts={LEARNING_STARTS}",
-            f"--distill_extra_steps={DISTILL_STEPS}",
-            f"--save-dir={SAVE_DIR}"
-        ]
-        if task_id == 5: # تسک دوم ما ۵ است، پس یونیت قبلی آن تسک ۳ خواهد بود
-            prev_run = f"task_3__cka-rl__run_sac__42"
-            cmd.extend(["--prev-units", f"{SAVE_DIR}/{prev_run}"])
-            
-        print(f"\n>>> Running SAC Training for Similar Task {task_id} ({TOTAL_TIMESTEPS} steps) <<<")
-        subprocess.run(cmd, check=True)
 
-    # ۲. اجرای فرآیند آموزش از صفر برای دو تسک شبیه به هم
-    run_sac_for_similar_tasks(TASK_A) # Handle Press Side
-    run_sac_for_similar_tasks(TASK_B) # Window Close
+if __name__ == "__main__":
     
-    run_a_name = f"task_{TASK_A}__cka-rl__run_sac__42"
-    run_b_name = f"task_{TASK_B}__cka-rl__run_sac__42"
+    # 1. Execute training from scratch for the two similar tasks
+    # (Removed the redundant nested function and utilized the fixed run_sac_for_task function)
+    run_sac_for_task(TASK_A) # Handle Press Side
+    run_sac_for_task(TASK_B) # Window Close
+
+    print("\n--- Plotting Training Curves from TensorBoard Logs ---")
+    plot_training_metrics(TAG, TASK_A, "Handle Press Side")
+    plot_training_metrics(TAG, TASK_B, "Window Close")
+
+    run_a_name = f"task_{TASK_A}__cka-rl__run_sac__{SEED}"
+    run_b_name = f"task_{TASK_B}__cka-rl__run_sac__{SEED}"
     
     prev_units = {
         TASK_A: pathlib.Path(f"{SAVE_DIR}/{run_a_name}"),
@@ -140,21 +172,21 @@ if __name__ == "__main__":
     
     print("\n--- Starting Comprehensive Similar Tasks Benchmark Evaluation ---")
     
-    # ۳. ارزیابی هر ۳ حالت روی تسک اول جدید 
-    rewards_ta_distill = evaluate_policy_variant(prev_units, task_id=TASK_A, mode='distill')
-    rewards_ta_simple  = evaluate_policy_variant(prev_units, task_id=TASK_A, mode='simple')
+    # 2. Evaluate all 3 modes on Task A
+    rewards_ta_distill  = evaluate_policy_variant(prev_units, task_id=TASK_A, mode='distill')
+    rewards_ta_simple   = evaluate_policy_variant(prev_units, task_id=TASK_A, mode='simple')
     rewards_ta_original = evaluate_policy_variant(prev_units, task_id=TASK_A, mode='original')
     
-    # ۳. ارزیابی هر ۳ حالت روی تسک دوم (Window Close)
-    rewards_tb_distill = evaluate_policy_variant(prev_units, task_id=TASK_B, mode='distill')
-    rewards_tb_simple  = evaluate_policy_variant(prev_units, task_id=TASK_B, mode='simple')
+    # 3. Evaluate all 3 modes on Task B (Window Close)
+    rewards_tb_distill  = evaluate_policy_variant(prev_units, task_id=TASK_B, mode='distill')
+    rewards_tb_simple   = evaluate_policy_variant(prev_units, task_id=TASK_B, mode='simple')
     rewards_tb_original = evaluate_policy_variant(prev_units, task_id=TASK_B, mode='original')
     
-    # ۵. رسم پلات‌های جدید
+    # 4. Generate the new plots
     os.makedirs("plots_similar", exist_ok=True)
     episodes = np.arange(1, NUM_EVAL_EPISODES + 1)
     
-    # نمودار تسک Handle Press
+    # Plot for Handle Press Side
     plt.figure(figsize=(10, 5.5))
     plt.plot(episodes, rewards_ta_distill, label='Policy Distillation (Ours)', marker='o', color='blue', linewidth=2)
     plt.plot(episodes, rewards_ta_simple, label='Simple Weight Averaging', marker='s', color='orange', linestyle='--', linewidth=2)
@@ -168,7 +200,7 @@ if __name__ == "__main__":
     plt.savefig(f'plots_similar/reward_timeline_task_{TASK_A}.png', dpi=300)
     plt.close()
     
-    # نمودار تسک Window Close
+    # Plot for Window Close
     plt.figure(figsize=(10, 5.5))
     plt.plot(episodes, rewards_tb_distill, label='Policy Distillation (Ours)', marker='o', color='blue', linewidth=2)
     plt.plot(episodes, rewards_tb_simple, label='Simple Weight Averaging', marker='s', color='orange', linestyle='--', linewidth=2)
