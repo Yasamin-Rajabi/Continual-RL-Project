@@ -36,6 +36,17 @@ BEFORE YOU RUN
     4 push-v2, 5 window-close-v2, 6 peg-unplug-side-v2
 - This script assumes it lives next to run_sac.py, cka_rl.py, tasks.py, etc.
   (same directory you already run run_sac.py from on Kaggle).
+- If TASK_SEQUENCE repeats a task_id (as the default below does, to test
+  relearning speed), every occurrence gets its OWN save directory and
+  TensorBoard tag, keyed by its POSITION in the sequence (`seq{i}`), not
+  just by task_id. Without this, the resumability check would find the
+  first occurrence's checkpoint already on disk and silently skip training
+  every later occurrence of that task_id -- reusing the wrong-generation
+  checkpoint with no warning. If you've already run an earlier version of
+  this script without the `seq{i}` directories, it won't be recognized as
+  "already done" -- it'll retrain from scratch, which is the correct
+  behavior given the earlier run's later occurrences may have been silently
+  skipped.
 """
 
 import os
@@ -93,25 +104,37 @@ def run_task_chain(condition_name, cfg):
     save_dir = f"{SAVE_ROOT}/{tag}"
     prev_units = []  # cumulative list of completed run dirs in this chain
 
-    for task_id in TASK_SEQUENCE:
+    for seq_idx, task_id in enumerate(TASK_SEQUENCE):
+        # IMPORTANT: run_name/save_dir/tag must be unique per POSITION in
+        # TASK_SEQUENCE, not just per task_id -- the same task_id appears
+        # multiple times by design (to test relearning speed). Without the
+        # `seq{seq_idx}` segment here, the 2nd/3rd occurrence of a task_id
+        # would resolve to the exact same directory as the 1st, the
+        # resumability check below would find it "already exists", and that
+        # occurrence would be silently SKIPPED -- no training at all, and
+        # the wrong-generation checkpoint reused. (This is the exact bug you
+        # flagged -- it was present here too, not just in the merged
+        # version.)
+        position_tag = f"{tag}_seq{seq_idx}"
+        position_save_dir = f"{save_dir}/seq{seq_idx}"
         run_name = f"task_{task_id}__cka-rl__run_sac__{SEED}"
-        run_dir = pathlib.Path(f"{save_dir}/{run_name}")
+        run_dir = pathlib.Path(f"{position_save_dir}/{run_name}")
 
         if run_dir.exists():
-            print(f"[{condition_name}] task {task_id} already trained, skipping -> {run_dir}")
+            print(f"[{condition_name}] seq{seq_idx} (task {task_id}) already trained, skipping -> {run_dir}")
         else:
             cmd = [
                 "python3", "run_sac.py",
                 "--model-type=cka-rl",
                 f"--task-id={task_id}",
                 f"--seed={SEED}",
-                f"--tag={tag}",
+                f"--tag={position_tag}",
                 f"--total-timesteps={TOTAL_TIMESTEPS_PER_TASK}",
                 f"--learning-starts={LEARNING_STARTS}",
                 f"--distill-extra-steps={DISTILL_EXTRA_STEPS}",
                 f"--eval-every=10000",
                 f"--pool-size={POOL_SIZE}",
-                f"--save-dir={save_dir}",
+                f"--save-dir={position_save_dir}",
                 f"--fusion-mode={cfg['fusion_mode']}",
                 "--distillation" if cfg["distillation"] else "--no-distillation",
             ]
@@ -119,7 +142,7 @@ def run_task_chain(condition_name, cfg):
                 cmd.append("--prev-units")
                 cmd.extend(str(p) for p in prev_units)
 
-            print(f"\n>>> [{condition_name}] training task {task_id} "
+            print(f"\n>>> [{condition_name}] training seq{seq_idx}: task {task_id} "
                   f"({get_task_name(task_id)}), prev_units={len(prev_units)} <<<")
             subprocess.run(cmd, check=True)
 
@@ -155,7 +178,7 @@ def rolling_mean(values, window):
     return np.convolve(values, kernel, mode="valid")
 
 
-def plot_during_training(task_id, task_name):
+def plot_during_training(seq_idx, task_id, task_name):
     os.makedirs(PLOTS_ROOT, exist_ok=True)
     run_name = f"task_{task_id}__cka-rl__run_sac__{SEED}"
 
@@ -163,10 +186,11 @@ def plot_during_training(task_id, task_name):
         plt.figure(figsize=(10, 5))
         plotted_anything = False
         for cond_name, cfg in CONDITIONS.items():
-            pattern = f"{RUNS_ROOT}/{cfg['tag']}/{run_name}"
+            position_tag = f"{cfg['tag']}_seq{seq_idx}"
+            pattern = f"{RUNS_ROOT}/{position_tag}/{run_name}"
             steps, values = load_scalar(pattern, scalar_tag)
             if steps is None:
-                print(f"  (no data for {cond_name} / {scalar_tag} / task {task_id})")
+                print(f"  (no data for {cond_name} / {scalar_tag} / seq{seq_idx} task {task_id})")
                 continue
             plotted_anything = True
             if "reward" in fname or "success" in fname:
@@ -181,13 +205,13 @@ def plot_during_training(task_id, task_name):
             plt.close()
             continue
 
-        plt.title(f"{title} during training - Task {task_id} ({task_name})")
+        plt.title(f"{title} during training - seq{seq_idx}: Task {task_id} ({task_name})")
         plt.xlabel("Timesteps")
         plt.ylabel(title)
         plt.legend(loc="best")
         plt.grid(True, linestyle=":", alpha=0.6)
         plt.tight_layout()
-        out_path = f"{PLOTS_ROOT}/{fname}_task_{task_id}.png"
+        out_path = f"{PLOTS_ROOT}/{fname}_seq{seq_idx}_task_{task_id}.png"
         plt.savefig(out_path, dpi=200)
         plt.close()
         print(f"  saved {out_path}")
@@ -287,9 +311,9 @@ if __name__ == "__main__":
         all_prev_units[cond_name] = run_task_chain(cond_name, cfg)
 
     print("\n========== Plotting during-training curves (both conditions overlaid) ==========")
-    for task_id in TASK_SEQUENCE:
-        print(f"-- task {task_id} ({get_task_name(task_id)}) --")
-        plot_during_training(task_id, get_task_name(task_id))
+    for seq_idx, task_id in enumerate(TASK_SEQUENCE):
+        print(f"-- seq{seq_idx}: task {task_id} ({get_task_name(task_id)}) --")
+        plot_during_training(seq_idx, task_id, get_task_name(task_id))
 
     print("\n========== End-of-chain retention evaluation ==========")
     plot_retention(all_prev_units, device)
