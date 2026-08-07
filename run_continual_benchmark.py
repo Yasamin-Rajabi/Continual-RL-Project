@@ -198,23 +198,17 @@ def plot_during_training(task_id, task_name):
 # EARLIER tasks, not just the most recent one?
 # ==========================================================================
 def evaluate_final_model_on_task(prev_units, condition_cfg, eval_task_id, device):
-    base_dir = prev_units[0]
     latest_dir = prev_units[-1]
 
     env = get_task(eval_task_id)
     obs_dim = np.array(env.observation_space.shape).prod()
     act_dim = np.prod(env.action_space.shape)
 
-    agent = CkaRlAgent(
-        base_dir=base_dir,
-        latest_dir=latest_dir,
+    agent = CkaRlAgent.load(
+        dirname=str(latest_dir),
         obs_dim=obs_dim,
         act_dim=act_dim,
-        fuse_shared=False,
-        fuse_heads=True,
-        pool_size=POOL_SIZE,
-        prev_units_paths=prev_units,
-        distillation=condition_cfg["distillation"],
+        map_location=device,
     ).to(device)
     agent.eval()
 

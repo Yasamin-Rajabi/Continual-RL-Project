@@ -270,11 +270,8 @@ if __name__ == "__main__":
             latest_dir=latest_dir,
             obs_dim=obs_dim,
             act_dim=act_dim,
-            fuse_shared=False,
-            fuse_heads=True,
             pool_size=args.pool_size,
             encoder_from_base=args.encoder_from_base,
-            prev_units_paths=args.prev_units,
             distillation=args.distillation,
             max_distill_buffer=args.max_distill_buffer,
             fusion_mode=args.fusion_mode,
@@ -501,6 +498,6 @@ if __name__ == "__main__":
 
     if args.save_dir is not None:
         print(f"Saving trained agent in `{args.save_dir}` with name `{run_name}`")
-        actor.model.save(dirname=f"{args.save_dir}/{run_name}")
         if distill_buffer is not None:
-            torch.save(distill_buffer, f"{args.save_dir}/{run_name}/distill_buffer.pt")
+            actor.model.set_own_buffer(distill_buffer)
+        actor.model.save(dirname=f"{args.save_dir}/{run_name}")
