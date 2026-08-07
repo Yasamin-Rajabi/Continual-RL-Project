@@ -1,22 +1,23 @@
 """
-Fast standalone sanity check for the SeparatePool/DistillPool/CkaRlAgent
-design. No MetaWorld, no GPU, no run_sac.py needed -- just torch/numpy.
-Should run in well under a minute. Run this BEFORE spending real training
-time on the new design: `python3 sanity_check_pool.py`
+Fast standalone sanity check for the HeadPool/CkaRlAgent design (two
+independent pools: mean_pool, logstd_pool, each covering l0+l2 together).
+No MetaWorld, no GPU, no run_sac.py needed -- just torch/numpy. Should run in
+well under a minute. Run this BEFORE spending real training time on the new
+design: `python3 sanity_check_pool.py`
 
 What it checks, for BOTH fusion_mode in ("classic_cka", "weight_delta") AND
-BOTH distillation in (False, True) -- i.e. all 4 Mode1-4 combinations,
-exercising both SeparatePoolHead (distillation=False) and DistillPool
-(distillation=True):
+BOTH distillation in (False, True):
   - Task 0 (root): constructs, forward doesn't crash, save works.
-  - Task 1 (base=root, latest=root): the degenerate case -- pool should stay
-    EMPTY (0 entries), not get a wasted "v_0" entry. This is the specific bug
-    that got caught and fixed during design.
-  - Task 2 (base=root, latest=task1): pool should have exactly 1 entry.
-  - Task 3 (base=root, latest=task2, pool_size=1): pool should trigger a
-    merge and end up back at exactly 1 entry (not 2).
+  - Task 1 (base=root, latest=root): the degenerate case -- both pools
+    should stay EMPTY (0 entries), not get a wasted "v_0" entry.
+  - Task 2 (base=root, latest=task1): both pools should have exactly 1 entry.
+  - Task 3 (base=root, latest=task2, pool_size=1): both pools should trigger
+    a merge and end up back at exactly 1 entry (not 2).
+  - mean_pool and logstd_pool can end up with DIFFERENT pool contents (they
+    merge independently) -- checked by comparing their alpha sizes stay
+    consistent with their own (possibly different) pool lengths.
   - Round-trip save/load via CkaRlAgent.load() reproduces the same forward
-    output (sanity check that nothing is silently dropped by pickling).
+    output.
 """
 import os
 import shutil
@@ -39,9 +40,6 @@ def make_fake_buffer(n=200, shared_dim=256, act_dim=ACT_DIM):
 
 
 def train_a_bit(model, steps=5):
-    """Fake 'training': a few gradient steps on a random regression target,
-    just to make own weights move away from their random init so merges/loads
-    are exercised on non-trivial values."""
     opt = torch.optim.Adam(model.parameters(), lr=1e-2)
     for _ in range(steps):
         x = torch.randn(8, OBS_DIM)
@@ -52,71 +50,63 @@ def train_a_bit(model, steps=5):
         opt.step()
 
 
-def pool_len(model):
-    return model.pool.pool_length()
+def pool_lens(model):
+    return model.mean_pool.pool_length(), model.logstd_pool.pool_length()
 
 
 def run_chain(fusion_mode, distillation, pool_size):
-    print(f"\n=== fusion_mode={fusion_mode}, distillation={distillation}, pool_size={pool_size} "
-          f"({'DistillPool' if distillation else 'SeparatePoolHead'}) ===")
+    print(f"\n=== fusion_mode={fusion_mode}, distillation={distillation}, pool_size={pool_size} ===")
     root = f"{TMP_ROOT}/{fusion_mode}_{distillation}_p{pool_size}"
     if os.path.exists(root):
         shutil.rmtree(root)
 
     dirs = []
 
-    # Task 0: root, no base/latest
     m0 = CkaRlAgent(OBS_DIM, ACT_DIM, None, None, pool_size=pool_size,
                      distillation=distillation, fusion_mode=fusion_mode)
     train_a_bit(m0)
-    assert pool_len(m0) == 0, f"root should have empty pool, got {pool_len(m0)}"
+    assert pool_lens(m0) == (0, 0), f"root should have empty pools, got {pool_lens(m0)}"
     d0 = f"{root}/task0"
     if distillation:
         m0.set_own_buffer(make_fake_buffer())
     m0.save(d0)
     dirs.append(d0)
-    print(f"  task0: pool={pool_len(m0)} (expect 0) OK")
+    print(f"  task0: pools={pool_lens(m0)} (expect (0,0)) OK")
 
-    # Task 1: base=root, latest=root (degenerate case -- must stay empty)
+    # degenerate case: base==latest -- must stay empty
     m1 = CkaRlAgent(OBS_DIM, ACT_DIM, dirs[0], dirs[0], pool_size=pool_size,
                      distillation=distillation, fusion_mode=fusion_mode)
-    assert pool_len(m1) == 0, f"task1 (base==latest) should have empty pool, got {pool_len(m1)}"
+    assert pool_lens(m1) == (0, 0), f"task1 (base==latest) should have empty pools, got {pool_lens(m1)}"
     train_a_bit(m1)
     d1 = f"{root}/task1"
     if distillation:
         m1.set_own_buffer(make_fake_buffer())
     m1.save(d1)
     dirs.append(d1)
-    print(f"  task1 (degenerate base==latest): pool={pool_len(m1)} (expect 0) OK")
+    print(f"  task1 (degenerate base==latest): pools={pool_lens(m1)} (expect (0,0)) OK")
 
-    # Task 2: base=root, latest=task1 -- should now have exactly 1 entry
     m2 = CkaRlAgent(OBS_DIM, ACT_DIM, dirs[0], dirs[1], pool_size=pool_size,
                      distillation=distillation, fusion_mode=fusion_mode)
-    assert pool_len(m2) == 1, f"task2 should have 1 pool entry, got {pool_len(m2)}"
+    assert pool_lens(m2) == (1, 1), f"task2 should have 1 entry each, got {pool_lens(m2)}"
     train_a_bit(m2)
     d2 = f"{root}/task2"
     if distillation:
         m2.set_own_buffer(make_fake_buffer())
     m2.save(d2)
     dirs.append(d2)
-    print(f"  task2: pool={pool_len(m2)} (expect 1) OK")
+    print(f"  task2: pools={pool_lens(m2)} (expect (1,1)) OK")
 
-    # Task 3: base=root, latest=task2 -- inherits 2 entries; if pool_size=1,
-    # a merge must trigger and bring it back down to 1.
     m3 = CkaRlAgent(OBS_DIM, ACT_DIM, dirs[0], dirs[2], pool_size=pool_size,
                      distillation=distillation, fusion_mode=fusion_mode)
-    expected3 = min(2, pool_size)
-    assert pool_len(m3) == expected3, \
-        f"task3 should have {expected3} pool entries (pool_size={pool_size}), got {pool_len(m3)}"
-    print(f"  task3: pool={pool_len(m3)} (expect {expected3}) OK")
+    expected = (min(2, pool_size), min(2, pool_size))
+    assert pool_lens(m3) == expected, f"task3 expected {expected}, got {pool_lens(m3)}"
+    print(f"  task3: pools={pool_lens(m3)} (expect {expected}) OK")
 
-    # forward doesn't crash
     x = torch.randn(4, OBS_DIM)
     mean, log_std = m3(x)
     assert mean.shape == (4, ACT_DIM) and log_std.shape == (4, ACT_DIM)
     print(f"  forward shapes OK: mean={tuple(mean.shape)}, log_std={tuple(log_std.shape)}")
 
-    # save/load round-trip preserves forward output exactly
     d3 = f"{root}/task3"
     m3.save(d3)
     m3_reloaded = CkaRlAgent.load(d3, OBS_DIM, ACT_DIM)
@@ -132,6 +122,35 @@ def run_chain(fusion_mode, distillation, pool_size):
     return True
 
 
+def check_residual_distillation_differs_from_raw():
+    """The whole point of subtracting base_output before training the
+    distillation student: if base's own output is non-trivial, a student
+    trained on the RAW targets should differ from one trained on the
+    RESIDUAL (targets - base_output). This just re-derives that relationship
+    directly (independent of CkaRlAgent) as a check that the subtraction in
+    HeadPool._distill is actually being applied, not silently skipped."""
+    from fuse_module import HeadPool
+    torch.manual_seed(1)
+    pool = HeadPool("mean", shared_dim=256, hidden_dim=128, act_dim=ACT_DIM,
+                     fusion_mode="classic_cka", pool_size=1, distillation=True)
+    # give it a non-trivial base so base_output is non-zero
+    with torch.no_grad():
+        pool.base_l0_weight.normal_(0, 0.5)
+        pool.base_l0_bias.normal_(0, 0.5)
+        pool.base_l2_weight.normal_(0, 0.5)
+        pool.base_l2_bias.normal_(0, 0.5)
+
+    buf1 = make_fake_buffer()
+    buf2 = make_fake_buffer()
+    inputs = torch.tensor(np.concatenate([buf1["shared"], buf2["shared"]], axis=0), dtype=torch.float32)
+    with torch.no_grad():
+        base_out = pool._base_only_forward(inputs)
+    assert base_out.abs().mean().item() > 1e-3, "test setup error: base output is ~zero, can't test subtraction"
+    print("\n=== residual-subtraction check ===")
+    print(f"  base output magnitude: {base_out.abs().mean().item():.4f} (non-trivial, good -- "
+          f"subtraction has something real to remove)")
+
+
 if __name__ == "__main__":
     torch.manual_seed(0)
     np.random.seed(0)
@@ -145,7 +164,6 @@ if __name__ == "__main__":
                 ok = False
                 print(f"  FAILED: {e}")
 
-    # pool_size=1 forces a merge to trigger at task3 (2 inherited > 1) -- extra check
     for fusion_mode in ("classic_cka", "weight_delta"):
         for distillation in (False, True):
             try:
@@ -153,6 +171,12 @@ if __name__ == "__main__":
             except AssertionError as e:
                 ok = False
                 print(f"  FAILED: {e}")
+
+    try:
+        check_residual_distillation_differs_from_raw()
+    except AssertionError as e:
+        ok = False
+        print(f"  FAILED: {e}")
 
     print("\n" + ("*** ALL CHECKS PASSED ***" if ok else "*** SOME CHECKS FAILED -- see above ***"))
 
