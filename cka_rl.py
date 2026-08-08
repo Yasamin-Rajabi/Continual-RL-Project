@@ -92,12 +92,12 @@ class CkaRlAgent(nn.Module):
         # 2. Now each pool's final size is known -- set up its OWN alpha
         #    (independent of the other head's), plus its own alpha_mass if
         #    requested.
-        self.mean_alpha, self.mean_alpha_scale = self._make_alpha(
-            self.mean_pool.pool_length(), fix_alpha, alpha_init, alpha_major, alpha_factor, use_alpha_scale)
-        self.logstd_alpha, self.logstd_alpha_scale = self._make_alpha(
-            self.logstd_pool.pool_length(), fix_alpha, alpha_init, alpha_major, alpha_factor, use_alpha_scale)
-        self.mean_alpha_mass = self._make_alpha_mass(self.mean_pool.pool_length(), fix_alpha, use_alpha_mass)
-        self.logstd_alpha_mass = self._make_alpha_mass(self.logstd_pool.pool_length(), fix_alpha, use_alpha_mass)
+        self.mean_alpha, self.mean_alpha_scale, self.mean_alpha_mass = self._make_alpha(
+            self.mean_pool.pool_length(), fix_alpha, alpha_init, alpha_major, alpha_factor,
+            use_alpha_scale, use_alpha_mass)
+        self.logstd_alpha, self.logstd_alpha_scale, self.logstd_alpha_mass = self._make_alpha(
+            self.logstd_pool.pool_length(), fix_alpha, alpha_init, alpha_major, alpha_factor,
+            use_alpha_scale, use_alpha_mass)
         self.mean_pool.set_alpha(self.mean_alpha, self.mean_alpha_scale, self.mean_alpha_mass)
         self.logstd_pool.set_alpha(self.logstd_alpha, self.logstd_alpha_scale, self.logstd_alpha_mass)
         logger.info(f"mean alpha: {self.mean_alpha}")
@@ -117,9 +117,10 @@ class CkaRlAgent(nn.Module):
             logger.info("Train shared from scratch")
             self.fc = shared(input_dim=obs_dim)
 
-    def _make_alpha(self, num_vectors, fix_alpha, alpha_init, alpha_major, alpha_factor, use_alpha_scale):
+    def _make_alpha(self, num_vectors, fix_alpha, alpha_init, alpha_major, alpha_factor,
+                     use_alpha_scale, use_alpha_mass):
         if num_vectors <= 0:
-            return None, None
+            return None, None, None
         if fix_alpha:
             alpha = nn.Parameter(torch.zeros(num_vectors), requires_grad=False)
         else:
@@ -134,16 +135,8 @@ class CkaRlAgent(nn.Module):
             else:
                 raise NotImplementedError(f"unknown alpha_init: {alpha_init}")
         alpha_scale = nn.Parameter(torch.ones(1), requires_grad=(use_alpha_scale and not fix_alpha))
-        return alpha, alpha_scale
-
-    def _make_alpha_mass(self, num_vectors, fix_alpha, use_alpha_mass):
-        """The learned total-mass scalar (see fuse_module.py's HeadPool for
-        the math): weights = alpha_mass * softmax(alpha * alpha_scale).
-        Starts at 1.0, matching the original behavior exactly until it moves
-        during training. None when disabled or when there's no pool yet."""
-        if not use_alpha_mass or num_vectors <= 0:
-            return None
-        return nn.Parameter(torch.ones(1), requires_grad=not fix_alpha)
+        alpha_mass = nn.Parameter(torch.ones(1), requires_grad=(use_alpha_mass and not fix_alpha)) if use_alpha_mass else None
+        return alpha, alpha_scale, alpha_mass
 
     def get_distill_metrics(self):
         """Distillation train/test MSE from the most recent merge (if any
