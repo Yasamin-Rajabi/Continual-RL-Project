@@ -107,6 +107,12 @@ def run_chain(fusion_mode, distillation, pool_size):
     assert mean.shape == (4, ACT_DIM) and log_std.shape == (4, ACT_DIM)
     print(f"  forward shapes OK: mean={tuple(mean.shape)}, log_std={tuple(log_std.shape)}")
 
+    if distillation:
+        metrics = m3.get_distill_metrics()
+        assert metrics["mean/distill_test_mse"] is not None, \
+            "expected a distillation merge to have happened at task3 (pool_size=1, 2 inherited) -- no test MSE recorded"
+        print(f"  distill metrics OK: {metrics}")
+
     d3 = f"{root}/task3"
     m3.save(d3)
     m3_reloaded = CkaRlAgent.load(d3, OBS_DIM, ACT_DIM)
@@ -120,6 +126,32 @@ def run_chain(fusion_mode, distillation, pool_size):
 
     shutil.rmtree(root)
     return True
+
+
+def check_alpha_mass_restricted_to_new_method():
+    """use_alpha_mass must be rejected for the base method (classic_cka) and
+    accepted for weight_delta, regardless of distillation on/off."""
+    print("\n=== alpha_mass restriction check ===")
+    root = f"{TMP_ROOT}/alpha_mass_check"
+    if os.path.exists(root):
+        shutil.rmtree(root)
+
+    # classic_cka + use_alpha_mass=True must raise
+    raised = False
+    try:
+        CkaRlAgent(OBS_DIM, ACT_DIM, None, None, fusion_mode="classic_cka", use_alpha_mass=True)
+    except AssertionError:
+        raised = True
+    assert raised, "expected use_alpha_mass=True with fusion_mode='classic_cka' to raise, it didn't"
+    print("  classic_cka + use_alpha_mass=True correctly raised OK")
+
+    # weight_delta + use_alpha_mass=True must NOT raise, regardless of distillation
+    for distillation in (False, True):
+        m = CkaRlAgent(OBS_DIM, ACT_DIM, None, None, fusion_mode="weight_delta",
+                        use_alpha_mass=True, distillation=distillation)
+        x = torch.randn(2, OBS_DIM)
+        m(x)  # just needs to not crash
+        print(f"  weight_delta + use_alpha_mass=True + distillation={distillation}: constructed & forward OK")
 
 
 def check_residual_distillation_differs_from_raw():
@@ -171,6 +203,12 @@ if __name__ == "__main__":
             except AssertionError as e:
                 ok = False
                 print(f"  FAILED: {e}")
+
+    try:
+        check_alpha_mass_restricted_to_new_method()
+    except AssertionError as e:
+        ok = False
+        print(f"  FAILED: {e}")
 
     try:
         check_residual_distillation_differs_from_raw()

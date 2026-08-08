@@ -112,6 +112,10 @@ class Args:
     """Whether to use supervised policy distillation for merging vectors or fallback to simple averaging"""
     max_distill_buffer: int = 50_000
     """Cap on the pooled distillation buffer size (per pool slot) after two buffers are merged; excess rows are randomly subsampled"""
+    use_alpha_mass: bool = False
+    """Learned scalar controlling the TOTAL weight given to historical pool entries (normally always exactly 1.0, since softmax sums to 1). Only available with fusion_mode='weight_delta'."""
+    distill_test_frac: float = 0.2
+    """Fraction of the pooled distillation data held out as a test set when a merge uses distillation, to report a generalization MSE rather than a training-set MSE"""
 
 def make_env(task_id):
     def thunk():
@@ -275,8 +279,21 @@ if __name__ == "__main__":
             distillation=args.distillation,
             max_distill_buffer=args.max_distill_buffer,
             fusion_mode=args.fusion_mode,
+            use_alpha_mass=args.use_alpha_mass,
+            distill_test_frac=args.distill_test_frac,
         )
-        
+
+        # Any merge (and its distillation, if used) already happened inside
+        # __init__ above, before any SAC training starts -- log it now at
+        # step 0 rather than losing it, since this reflects a property of
+        # this task's STARTING point, not something that evolves during
+        # training.
+        distill_metrics = model.get_distill_metrics()
+        for metric_name, value in distill_metrics.items():
+            if value is not None:
+                print(f"*** distillation/{metric_name} = {value:.5f} ***")
+                writer.add_scalar(f"distillation/{metric_name}", value, 0)
+
     actor = Actor(envs, model).to(device)
     qf1 = SoftQNetwork(envs).to(device)
     qf2 = SoftQNetwork(envs).to(device)

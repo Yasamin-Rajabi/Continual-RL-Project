@@ -35,6 +35,11 @@ import torch.nn.functional as F
 from torch.nn import Parameter, init
 from loguru import logger
 
+# The base/original method's fusion_mode -- alpha_mass is deliberately
+# restricted away from this one specifically (see the assert in HeadPool
+# below), not tied to distillation on/off.
+BASE_FUSION_MODE = "classic_cka"
+
 
 class HeadPool(nn.Module):
     def __init__(self,
@@ -45,10 +50,22 @@ class HeadPool(nn.Module):
                  fusion_mode: str = "classic_cka",
                  pool_size: int = 9,
                  distillation: bool = True,
-                 max_distill_buffer: int = 50_000):
+                 max_distill_buffer: int = 50_000,
+                 use_alpha_mass: bool = False,
+                 distill_test_frac: float = 0.2):
         super().__init__()
         assert head_type in ("mean", "logstd"), head_type
         assert fusion_mode in ("classic_cka", "weight_delta"), fusion_mode
+        # alpha_mass is deliberately restricted away from the BASE method: the
+        # point is to let a NEW method's alpha distribution carry less (or
+        # more) than 100% total mass; the base method should always match
+        # the original paper's formula (alpha always sums to exactly 1), so
+        # baseline comparisons stay a faithful reproduction. Independent of
+        # distillation on/off -- fusion_mode is the only thing that matters.
+        assert not (use_alpha_mass and fusion_mode == BASE_FUSION_MODE), (
+            f"use_alpha_mass is not available with fusion_mode='{BASE_FUSION_MODE}' "
+            "(the base method) -- not exposed to it on purpose."
+        )
 
         self.head_type = head_type
         self.act_dim = act_dim
@@ -57,6 +74,8 @@ class HeadPool(nn.Module):
         self.pool_size = pool_size
         self.distillation = distillation
         self.max_distill_buffer = max_distill_buffer
+        self.use_alpha_mass = use_alpha_mass
+        self.distill_test_frac = distill_test_frac
 
         # theta_base (frozen), l0 and l2.
         self.register_buffer("base_l0_weight", torch.zeros(hidden_dim, shared_dim))
@@ -87,6 +106,13 @@ class HeadPool(nn.Module):
         # doesn't need alpha, only the forward pass does.
         self.alpha = None
         self.alpha_scale = None
+        self.alpha_mass = None  # only used when use_alpha_mass=True
+
+        # populated by merge() whenever it actually used distillation (stays
+        # None otherwise -- e.g. first task, or a round that fell back to
+        # simple averaging). Read from outside via CkaRlAgent.get_distill_metrics().
+        self.last_distill_train_mse = None
+        self.last_distill_test_mse = None
 
     # ------------------------------------------------------------------
     def _apply(self, fn, *args, **kwargs):
@@ -102,12 +128,18 @@ class HeadPool(nn.Module):
     def _historical(self):
         if not self.pool:
             return {"l0_weight": 0.0, "l0_bias": 0.0, "l2_weight": 0.0, "l2_bias": 0.0}
-        alphas = F.softmax(self.alpha * self.alpha_scale, dim=0)
+        weights = F.softmax(self.alpha * self.alpha_scale, dim=0)
+        if self.use_alpha_mass and self.alpha_mass is not None:
+            # decouples "how mass is distributed across old vectors" (the
+            # softmax's relative proportions, unaffected) from "how much
+            # total weight history gets overall" (this scalar -- normally
+            # always exactly 1.0, since softmax sums to 1 by construction).
+            weights = self.alpha_mass * weights
         out = {}
         for name, ndim in (("l0_weight", 2), ("l0_bias", 1), ("l2_weight", 2), ("l2_bias", 1)):
             stacked = torch.stack([e[name] for e in self.pool], dim=0)
             view_shape = (-1,) + (1,) * ndim
-            out[name] = (alphas.view(*view_shape) * stacked).sum(dim=0)
+            out[name] = (weights.view(*view_shape) * stacked).sum(dim=0)
         return out
 
     def _effective(self):
@@ -173,9 +205,10 @@ class HeadPool(nn.Module):
     def pool_length(self):
         return len(self.pool)
 
-    def set_alpha(self, alpha, alpha_scale):
+    def set_alpha(self, alpha, alpha_scale, alpha_mass=None):
         self.alpha = alpha
         self.alpha_scale = alpha_scale
+        self.alpha_mass = alpha_mass
 
     # ------------------------------------------------------------------
     # Merging
@@ -237,6 +270,13 @@ class HeadPool(nn.Module):
         out what other pool entries' hist would have contributed at the time
         each buffer was recorded) and, for both modes, an approximation
         across the ReLU nonlinearity between l0 and l2.
+
+        Holds out `self.distill_test_frac` of the pooled data as a test set,
+        never seen during training, so the reported MSE reflects how well
+        the distilled sub-network actually generalizes rather than how well
+        it memorized these particular buffer samples. Both train and test
+        MSE are stored on self (last_distill_train_mse/last_distill_test_mse)
+        for the caller to log.
         """
         logger.info(f"[HeadPool:{self.head_type}] distillation training (residual vs. base)")
         inputs = np.concatenate([buffer1["shared"], buffer2["shared"]], axis=0)
@@ -249,11 +289,21 @@ class HeadPool(nn.Module):
             base_out = self._base_only_forward(inputs_for_base).cpu().numpy()
         residual = head_targets - base_out
 
+        n = inputs.shape[0]
+        perm = np.random.permutation(n)
+        n_test = int(n * self.distill_test_frac) if self.distill_test_frac > 0 else 0
+        test_idx, train_idx = perm[:n_test], perm[n_test:]
+        if len(train_idx) == 0:
+            # degenerate case: not enough data for any split at all -- train
+            # on everything, skip the held-out evaluation rather than crash.
+            train_idx, test_idx = perm, np.array([], dtype=int)
+
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         inputs_t = torch.tensor(inputs, dtype=torch.float32)
         residual_t = torch.tensor(residual, dtype=torch.float32)
-        dataset = torch.utils.data.TensorDataset(inputs_t, residual_t)
-        loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+        train_dataset = torch.utils.data.TensorDataset(inputs_t[train_idx], residual_t[train_idx])
+        loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
         student = nn.Sequential(
             nn.Linear(inputs_t.shape[-1], self.hidden_dim), nn.ReLU(),
@@ -269,6 +319,18 @@ class HeadPool(nn.Module):
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+
+        student.eval()
+        with torch.no_grad():
+            preds_train = student(inputs_t[train_idx].to(device))
+            self.last_distill_train_mse = F.mse_loss(preds_train, residual_t[train_idx].to(device)).item()
+            if len(test_idx) > 0:
+                preds_test = student(inputs_t[test_idx].to(device))
+                self.last_distill_test_mse = F.mse_loss(preds_test, residual_t[test_idx].to(device)).item()
+            else:
+                self.last_distill_test_mse = None
+        logger.info(f"[HeadPool:{self.head_type}] distill train_mse={self.last_distill_train_mse:.5f} "
+                    f"test_mse={self.last_distill_test_mse}")
 
         out_device = self.base_l0_weight.device
         l0w = student[0].weight.data.clone().to(out_device)

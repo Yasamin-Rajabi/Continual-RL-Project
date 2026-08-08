@@ -43,6 +43,8 @@ class CkaRlAgent(nn.Module):
                  distillation=True,
                  fusion_mode="classic_cka",
                  max_distill_buffer=50_000,
+                 use_alpha_mass=False,
+                 distill_test_frac=0.2,
                  hidden_dim=128,
                  shared_dim=256):
         super().__init__()
@@ -52,6 +54,7 @@ class CkaRlAgent(nn.Module):
         self.distillation = distillation
         self.fusion_mode = fusion_mode
         self.max_distill_buffer = max_distill_buffer
+        self.use_alpha_mass = use_alpha_mass
 
         # 1. Load the previous task's pools (if any) FIRST -- same reasoning
         #    as before: merge() doesn't need alpha, and alpha's size depends
@@ -69,10 +72,12 @@ class CkaRlAgent(nn.Module):
 
         self.mean_pool = HeadPool("mean", shared_dim, hidden_dim, act_dim,
                                    fusion_mode=fusion_mode, pool_size=pool_size,
-                                   distillation=distillation, max_distill_buffer=max_distill_buffer)
+                                   distillation=distillation, max_distill_buffer=max_distill_buffer,
+                                   use_alpha_mass=use_alpha_mass, distill_test_frac=distill_test_frac)
         self.logstd_pool = HeadPool("logstd", shared_dim, hidden_dim, act_dim,
                                      fusion_mode=fusion_mode, pool_size=pool_size,
-                                     distillation=distillation, max_distill_buffer=max_distill_buffer)
+                                     distillation=distillation, max_distill_buffer=max_distill_buffer,
+                                     use_alpha_mass=use_alpha_mass, distill_test_frac=distill_test_frac)
 
         if base_dir is not None:
             self.mean_pool.load_base(base_dir)
@@ -85,15 +90,21 @@ class CkaRlAgent(nn.Module):
             self.logstd_pool.merge()
 
         # 2. Now each pool's final size is known -- set up its OWN alpha
-        #    (independent of the other head's).
+        #    (independent of the other head's), plus its own alpha_mass if
+        #    requested.
         self.mean_alpha, self.mean_alpha_scale = self._make_alpha(
             self.mean_pool.pool_length(), fix_alpha, alpha_init, alpha_major, alpha_factor, use_alpha_scale)
         self.logstd_alpha, self.logstd_alpha_scale = self._make_alpha(
             self.logstd_pool.pool_length(), fix_alpha, alpha_init, alpha_major, alpha_factor, use_alpha_scale)
-        self.mean_pool.set_alpha(self.mean_alpha, self.mean_alpha_scale)
-        self.logstd_pool.set_alpha(self.logstd_alpha, self.logstd_alpha_scale)
+        self.mean_alpha_mass = self._make_alpha_mass(self.mean_pool.pool_length(), fix_alpha, use_alpha_mass)
+        self.logstd_alpha_mass = self._make_alpha_mass(self.logstd_pool.pool_length(), fix_alpha, use_alpha_mass)
+        self.mean_pool.set_alpha(self.mean_alpha, self.mean_alpha_scale, self.mean_alpha_mass)
+        self.logstd_pool.set_alpha(self.logstd_alpha, self.logstd_alpha_scale, self.logstd_alpha_mass)
         logger.info(f"mean alpha: {self.mean_alpha}")
         logger.info(f"logstd alpha: {self.logstd_alpha}")
+        if use_alpha_mass:
+            logger.info(f"mean alpha_mass: {self.mean_alpha_mass}")
+            logger.info(f"logstd alpha_mass: {self.logstd_alpha_mass}")
 
         # 3. Shared encoder.
         if encoder_from_base and base_dir is not None:
@@ -124,6 +135,27 @@ class CkaRlAgent(nn.Module):
                 raise NotImplementedError(f"unknown alpha_init: {alpha_init}")
         alpha_scale = nn.Parameter(torch.ones(1), requires_grad=(use_alpha_scale and not fix_alpha))
         return alpha, alpha_scale
+
+    def _make_alpha_mass(self, num_vectors, fix_alpha, use_alpha_mass):
+        """The learned total-mass scalar (see fuse_module.py's HeadPool for
+        the math): weights = alpha_mass * softmax(alpha * alpha_scale).
+        Starts at 1.0, matching the original behavior exactly until it moves
+        during training. None when disabled or when there's no pool yet."""
+        if not use_alpha_mass or num_vectors <= 0:
+            return None
+        return nn.Parameter(torch.ones(1), requires_grad=not fix_alpha)
+
+    def get_distill_metrics(self):
+        """Distillation train/test MSE from the most recent merge (if any
+        happened during this construction). None for a metric that never had
+        a merge use distillation (e.g. first task, or a round that fell back
+        to simple averaging)."""
+        return {
+            "mean/distill_train_mse": self.mean_pool.last_distill_train_mse,
+            "mean/distill_test_mse": self.mean_pool.last_distill_test_mse,
+            "logstd/distill_train_mse": self.logstd_pool.last_distill_train_mse,
+            "logstd/distill_test_mse": self.logstd_pool.last_distill_test_mse,
+        }
 
     def forward(self, x):
         x = self.fc(x)
