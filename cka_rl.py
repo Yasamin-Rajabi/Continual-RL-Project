@@ -39,11 +39,11 @@ class CkaRlAgent(nn.Module):
                  alpha_factor=1e-3,
                  fix_alpha=False,
                  use_alpha_scale=True,
+                 use_alpha_mass=True,
                  encoder_from_base=False,
                  distillation=True,
                  fusion_mode="classic_cka",
                  max_distill_buffer=50_000,
-                 use_alpha_mass=False,
                  distill_test_frac=0.2,
                  hidden_dim=128,
                  shared_dim=256):
@@ -64,30 +64,30 @@ class CkaRlAgent(nn.Module):
         #    beyond the root (latest_dir != base_dir) -- the root task IS
         #    theta_base (loaded separately via load_base below); it must not
         #    also become a pool entry.
+
+        self.mean_pool = HeadPool("mean", shared_dim, hidden_dim, act_dim,
+                                           fusion_mode=fusion_mode, pool_size=pool_size,
+                                           distillation=distillation, max_distill_buffer=max_distill_buffer,
+                                           use_alpha_mass=use_alpha_mass, distill_test_frac=distill_test_frac)
+        self.logstd_pool = HeadPool("logstd", shared_dim, hidden_dim, act_dim,
+                                            fusion_mode=fusion_mode, pool_size=pool_size,
+                                            distillation=distillation, max_distill_buffer=max_distill_buffer,
+                                            use_alpha_mass=use_alpha_mass, distill_test_frac=distill_test_frac)
+        
         latest_mean_pool = None
         latest_logstd_pool = None
         if latest_dir is not None and latest_dir != base_dir:
             latest_mean_pool = torch.load(f"{latest_dir}/mean_pool.pt")
             latest_logstd_pool = torch.load(f"{latest_dir}/logstd_pool.pt")
 
-        self.mean_pool = HeadPool("mean", shared_dim, hidden_dim, act_dim,
-                                   fusion_mode=fusion_mode, pool_size=pool_size,
-                                   distillation=distillation, max_distill_buffer=max_distill_buffer,
-                                   use_alpha_mass=use_alpha_mass, distill_test_frac=distill_test_frac)
-        self.logstd_pool = HeadPool("logstd", shared_dim, hidden_dim, act_dim,
-                                     fusion_mode=fusion_mode, pool_size=pool_size,
-                                     distillation=distillation, max_distill_buffer=max_distill_buffer,
-                                     use_alpha_mass=use_alpha_mass, distill_test_frac=distill_test_frac)
-
         if base_dir is not None:
             self.mean_pool.load_base(base_dir)
             self.logstd_pool.load_base(base_dir)
+
         if latest_mean_pool is not None:
             self.mean_pool.inherit_pool_from(latest_mean_pool)
-            self.mean_pool.merge()
         if latest_logstd_pool is not None:
             self.logstd_pool.inherit_pool_from(latest_logstd_pool)
-            self.logstd_pool.merge()
 
         # 2. Now each pool's final size is known -- set up its OWN alpha
         #    (independent of the other head's), plus its own alpha_mass if

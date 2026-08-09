@@ -167,37 +167,70 @@ class HeadPool(nn.Module):
     # ------------------------------------------------------------------
     def load_base(self, base_dir):
         """theta_base = the root task's own effective (fully-formed) weight.
-        The root task always has zero base of its own, included anyway for
-        correctness."""
+        After finalize_own_contribution(), the root's own contribution lives
+        in pool[0] (own_weight itself is zeroed at that point), so that's
+        where we read it from -- not own_weight directly."""
         base_pool = torch.load(f"{base_dir}/{self.head_type}_pool.pt")
-        self.base_l0_weight.copy_(base_pool.base_l0_weight + base_pool.own_l0_weight.data)
-        self.base_l0_bias.copy_(base_pool.base_l0_bias + base_pool.own_l0_bias.data)
-        self.base_l2_weight.copy_(base_pool.base_l2_weight + base_pool.own_l2_weight.data)
-        self.base_l2_bias.copy_(base_pool.base_l2_bias + base_pool.own_l2_bias.data)
+        root_entry = base_pool.pool[0]
+        self.base_l0_weight.copy_(base_pool.base_l0_weight + root_entry["l0_weight"])
+        self.base_l0_bias.copy_(base_pool.base_l0_bias + root_entry["l0_bias"])
+        self.base_l2_weight.copy_(base_pool.base_l2_weight + root_entry["l2_weight"])
+        self.base_l2_bias.copy_(base_pool.base_l2_bias + root_entry["l2_bias"])
 
     def inherit_pool_from(self, latest_pool: "HeadPool"):
-        """Prepend latest_pool's own contribution as one new pool entry, onto
-        whatever it itself already inherited (already merged if it needed to
-        be). classic_cka stores the pure increment; weight_delta stores the
-        full reconstructed offset (own + whatever it itself inherited)."""
+        """Copy latest_pool's pool directly. latest_pool already includes its
+        own contribution as its first entry (folded in by its OWN
+        finalize_own_contribution() call, already merged down to pool_size
+        if it needed to be) -- there's nothing left to compute here anymore,
+        just copy."""
+        self.pool = [dict(e) for e in latest_pool.pool]
+
+    def finalize_own_contribution(self):
+        """Call this ONCE, right after this task's training (and evaluation,
+        and anything else) is completely finished -- right before save().
+        Folds this task's own trainable delta into the pool as a new entry
+        (per fusion_mode: classic_cka stores the pure increment; weight_delta
+        stores the full reconstructed offset, own + whatever was already
+        inherited), then zeros out own_weight/own_bias so they can never
+        double-count if this same saved object is loaded again later (as a
+        base_dir/latest_dir source, or directly via CkaRlAgent.load()), then
+        merges if the pool now exceeds pool_size.
+ 
+        This used to happen lazily, deferred to the NEXT task's construction
+        (inside the old inherit_pool_from). Moved here so a task's own
+        contribution and its merge are finalized immediately, as a normal
+        part of finishing this task -- not postponed to whenever, if ever,
+        another task happens to load this one."""
         if self.fusion_mode == "weight_delta":
-            hist = latest_pool._historical()
+            hist = self._historical()
             entry = {
-                "l0_weight": (latest_pool.own_l0_weight.data + hist["l0_weight"]).clone(),
-                "l0_bias": (latest_pool.own_l0_bias.data + hist["l0_bias"]).clone(),
-                "l2_weight": (latest_pool.own_l2_weight.data + hist["l2_weight"]).clone(),
-                "l2_bias": (latest_pool.own_l2_bias.data + hist["l2_bias"]).clone(),
+                "l0_weight": (self.own_l0_weight.data + hist["l0_weight"]).clone(),
+                "l0_bias": (self.own_l0_bias.data + hist["l0_bias"]).clone(),
+                "l2_weight": (self.own_l2_weight.data + hist["l2_weight"]).clone(),
+                "l2_bias": (self.own_l2_bias.data + hist["l2_bias"]).clone(),
             }
         else:
             entry = {
-                "l0_weight": latest_pool.own_l0_weight.data.clone(),
-                "l0_bias": latest_pool.own_l0_bias.data.clone(),
-                "l2_weight": latest_pool.own_l2_weight.data.clone(),
-                "l2_bias": latest_pool.own_l2_bias.data.clone(),
+                "l0_weight": self.own_l0_weight.data.clone(),
+                "l0_bias": self.own_l0_bias.data.clone(),
+                "l2_weight": self.own_l2_weight.data.clone(),
+                "l2_bias": self.own_l2_bias.data.clone(),
             }
-        entry["buffer"] = latest_pool.own_buffer
-        inherited = [dict(e) for e in latest_pool.pool]
-        self.pool = [entry] + inherited
+            
+        entry["buffer"] = self.own_buffer
+        self.pool = [entry] + self.pool
+ 
+        # own_weight's contribution is now captured in the pool entry above --
+        # zero it so forward() stays correct if this object is ever used
+        # again (it would otherwise double-count: once via own_weight, once
+        # via the new pool entry).
+        self.own_l0_weight.data.zero_()
+        self.own_l0_bias.data.zero_()
+        self.own_l2_weight.data.zero_()
+        self.own_l2_bias.data.zero_()
+ 
+        self.merge()
+
 
     def set_own_buffer(self, buffer):
         self.own_buffer = buffer

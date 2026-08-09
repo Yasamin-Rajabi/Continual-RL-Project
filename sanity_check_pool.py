@@ -5,17 +5,24 @@ No MetaWorld, no GPU, no run_sac.py needed -- just torch/numpy. Should run in
 well under a minute. Run this BEFORE spending real training time on the new
 design: `python3 sanity_check_pool.py`
 
+IMPORTANT: a task's own contribution only enters its pool via finalize(),
+called once training is completely done (right before save()) -- NOT
+automatically. Call order is always: [set_own_buffer() if using
+distillation] -> finalize() -> save().
+
 What it checks, for BOTH fusion_mode in ("classic_cka", "weight_delta") AND
 BOTH distillation in (False, True):
-  - Task 0 (root): constructs, forward doesn't crash, save works.
-  - Task 1 (base=root, latest=root): the degenerate case -- both pools
-    should stay EMPTY (0 entries), not get a wasted "v_0" entry.
-  - Task 2 (base=root, latest=task1): both pools should have exactly 1 entry.
-  - Task 3 (base=root, latest=task2, pool_size=1): both pools should trigger
-    a merge and end up back at exactly 1 entry (not 2).
-  - mean_pool and logstd_pool can end up with DIFFERENT pool contents (they
-    merge independently) -- checked by comparing their alpha sizes stay
-    consistent with their own (possibly different) pool lengths.
+  - Task 0 (root): constructs empty, finalize() gives it exactly 1 pool
+    entry (itself), forward doesn't crash, save works.
+  - Task 1 (base=root, latest=root): the degenerate case -- pools stay EMPTY
+    at construction (not a wasted "v_0" entry), then finalize() gives 1.
+  - Task 2 (base=root, latest=task1): 1 entry at construction (inherited
+    from task1's already-finalized pool); after task2's OWN finalize, either
+    2 entries (pool_size=2, no merge needed) or 1 (pool_size=1, merge
+    triggers -- this is where distillation, if enabled, actually happens now).
+  - Task 3 (base=root, latest=task2): inherits exactly what task2's finalize
+    produced, unchanged (construction is a pure copy, no merging there
+    anymore).
   - Round-trip save/load via CkaRlAgent.load() reproduces the same forward
     output.
 """
@@ -65,15 +72,17 @@ def run_chain(fusion_mode, distillation, pool_size):
     m0 = CkaRlAgent(OBS_DIM, ACT_DIM, None, None, pool_size=pool_size,
                      distillation=distillation, fusion_mode=fusion_mode)
     train_a_bit(m0)
-    assert pool_lens(m0) == (0, 0), f"root should have empty pools, got {pool_lens(m0)}"
+    assert pool_lens(m0) == (0, 0), f"root should have empty pools before finalize, got {pool_lens(m0)}"
     d0 = f"{root}/task0"
     if distillation:
         m0.set_own_buffer(make_fake_buffer())
+    m0.finalize()  # required now: this is where a task's own contribution actually enters the pool
+    assert pool_lens(m0) == (1, 1), f"root should have 1 entry each after finalize, got {pool_lens(m0)}"
     m0.save(d0)
     dirs.append(d0)
-    print(f"  task0: pools={pool_lens(m0)} (expect (0,0)) OK")
+    print(f"  task0: pools after finalize={pool_lens(m0)} (expect (1,1)) OK")
 
-    # degenerate case: base==latest -- must stay empty
+    # degenerate case: base==latest -- must stay empty (at construction, before its own finalize)
     m1 = CkaRlAgent(OBS_DIM, ACT_DIM, dirs[0], dirs[0], pool_size=pool_size,
                      distillation=distillation, fusion_mode=fusion_mode)
     assert pool_lens(m1) == (0, 0), f"task1 (base==latest) should have empty pools, got {pool_lens(m1)}"
@@ -81,39 +90,46 @@ def run_chain(fusion_mode, distillation, pool_size):
     d1 = f"{root}/task1"
     if distillation:
         m1.set_own_buffer(make_fake_buffer())
+    m1.finalize()
+    assert pool_lens(m1) == (1, 1), f"task1 should have 1 entry each after finalize, got {pool_lens(m1)}"
     m1.save(d1)
     dirs.append(d1)
-    print(f"  task1 (degenerate base==latest): pools={pool_lens(m1)} (expect (0,0)) OK")
+    print(f"  task1 (degenerate base==latest): pools after finalize={pool_lens(m1)} (expect (1,1)) OK")
 
     m2 = CkaRlAgent(OBS_DIM, ACT_DIM, dirs[0], dirs[1], pool_size=pool_size,
                      distillation=distillation, fusion_mode=fusion_mode)
-    assert pool_lens(m2) == (1, 1), f"task2 should have 1 entry each, got {pool_lens(m2)}"
+    assert pool_lens(m2) == (1, 1), f"task2 should have 1 entry each at construction, got {pool_lens(m2)}"
     train_a_bit(m2)
     d2 = f"{root}/task2"
     if distillation:
         m2.set_own_buffer(make_fake_buffer())
+    m2.finalize()  # this is where the pool_size=1 merge (task1_entry + task2's own) actually triggers
+    expected2 = (min(2, pool_size), min(2, pool_size))
+    assert pool_lens(m2) == expected2, f"task2 after finalize expected {expected2}, got {pool_lens(m2)}"
+    if distillation and pool_size < 2:
+        metrics = m2.get_distill_metrics()
+        assert metrics["mean/distill_test_mse"] is not None, \
+            "expected task2's finalize (pool_size exceeded) to have used distillation -- no test MSE recorded"
+        print(f"  distill metrics at task2 finalize OK: {metrics}")
     m2.save(d2)
     dirs.append(d2)
-    print(f"  task2: pools={pool_lens(m2)} (expect (1,1)) OK")
+    print(f"  task2: pools after finalize={pool_lens(m2)} (expect {expected2}) OK")
 
     m3 = CkaRlAgent(OBS_DIM, ACT_DIM, dirs[0], dirs[2], pool_size=pool_size,
                      distillation=distillation, fusion_mode=fusion_mode)
-    expected = (min(2, pool_size), min(2, pool_size))
-    assert pool_lens(m3) == expected, f"task3 expected {expected}, got {pool_lens(m3)}"
-    print(f"  task3: pools={pool_lens(m3)} (expect {expected}) OK")
+    assert pool_lens(m3) == expected2, f"task3 at construction expected {expected2}, got {pool_lens(m3)}"
+    print(f"  task3: pools at construction={pool_lens(m3)} (expect {expected2}) OK")
 
     x = torch.randn(4, OBS_DIM)
     mean, log_std = m3(x)
     assert mean.shape == (4, ACT_DIM) and log_std.shape == (4, ACT_DIM)
     print(f"  forward shapes OK: mean={tuple(mean.shape)}, log_std={tuple(log_std.shape)}")
 
-    if distillation:
-        metrics = m3.get_distill_metrics()
-        assert metrics["mean/distill_test_mse"] is not None, \
-            "expected a distillation merge to have happened at task3 (pool_size=1, 2 inherited) -- no test MSE recorded"
-        print(f"  distill metrics OK: {metrics}")
-
+    train_a_bit(m3)
     d3 = f"{root}/task3"
+    if distillation:
+        m3.set_own_buffer(make_fake_buffer())
+    m3.finalize()
     m3.save(d3)
     m3_reloaded = CkaRlAgent.load(d3, OBS_DIM, ACT_DIM)
     m3_reloaded.eval()
@@ -217,4 +233,3 @@ if __name__ == "__main__":
         print(f"  FAILED: {e}")
 
     print("\n" + ("*** ALL CHECKS PASSED ***" if ok else "*** SOME CHECKS FAILED -- see above ***"))
-

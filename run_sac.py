@@ -517,4 +517,12 @@ if __name__ == "__main__":
         print(f"Saving trained agent in `{args.save_dir}` with name `{run_name}`")
         if distill_buffer is not None:
             actor.model.set_own_buffer(distill_buffer)
+        if hasattr(actor.model, "finalize"):
+            actor.model.finalize()
+            distill_metrics = actor.model.get_distill_metrics()
+            for metric_name, value in distill_metrics.items():
+                if value is not None:
+                    print(f"*** distillation/{metric_name} = {value:.5f} ***")
+                    writer.add_scalar(f"distillation/{metric_name}", value, args.total_timesteps)
+                    
         actor.model.save(dirname=f"{args.save_dir}/{run_name}")
