@@ -128,6 +128,7 @@ class HeadPool(nn.Module):
     def _historical(self):
         if not self.pool:
             return {"l0_weight": 0.0, "l0_bias": 0.0, "l2_weight": 0.0, "l2_bias": 0.0}
+        
         weights = F.softmax(self.alpha * self.alpha_scale, dim=0)
         if self.use_alpha_mass and self.alpha_mass is not None:
             # decouples "how mass is distributed across old vectors" (the
@@ -165,17 +166,17 @@ class HeadPool(nn.Module):
     # ------------------------------------------------------------------
     # Loading from disk
     # ------------------------------------------------------------------
-    def load_base(self, base_dir):
-        """theta_base = the root task's own effective (fully-formed) weight.
-        After finalize_own_contribution(), the root's own contribution lives
-        in pool[0] (own_weight itself is zeroed at that point), so that's
-        where we read it from -- not own_weight directly."""
-        base_pool = torch.load(f"{base_dir}/{self.head_type}_pool.pt")
-        root_entry = base_pool.pool[0]
-        self.base_l0_weight.copy_(base_pool.base_l0_weight + root_entry["l0_weight"])
-        self.base_l0_bias.copy_(base_pool.base_l0_bias + root_entry["l0_bias"])
-        self.base_l2_weight.copy_(base_pool.base_l2_weight + root_entry["l2_weight"])
-        self.base_l2_bias.copy_(base_pool.base_l2_bias + root_entry["l2_bias"])
+    # def load_base(self, base_dir):
+    #     """theta_base = the root task's own effective (fully-formed) weight.
+    #     After finalize_own_contribution(), the root's own contribution lives
+    #     in pool[0] (own_weight itself is zeroed at that point), so that's
+    #     where we read it from -- not own_weight directly."""
+    #     base_pool = torch.load(f"{base_dir}/{self.head_type}_pool.pt")
+    #     root_entry = base_pool.pool[0]
+    #     self.base_l0_weight.copy_(base_pool.base_l0_weight + root_entry["l0_weight"])
+    #     self.base_l0_bias.copy_(base_pool.base_l0_bias + root_entry["l0_bias"])
+    #     self.base_l2_weight.copy_(base_pool.base_l2_weight + root_entry["l2_weight"])
+    #     self.base_l2_bias.copy_(base_pool.base_l2_bias + root_entry["l2_bias"])
 
     def inherit_pool_from(self, latest_pool: "HeadPool"):
         """Copy latest_pool's pool directly. latest_pool already includes its
@@ -185,6 +186,55 @@ class HeadPool(nn.Module):
         just copy."""
         self.pool = [dict(e) for e in latest_pool.pool]
 
+        self.base_l0_weight.copy_(latest_pool.base_l0_weight)
+        self.base_l0_bias.copy_(latest_pool.base_l0_bias)
+        self.base_l2_weight.copy_(latest_pool.base_l2_weight)
+        self.base_l2_bias.copy_(latest_pool.base_l2_bias)
+
+
+    def set_base(self):
+        """Call this INSTEAD of finalize_own_contribution() for the very
+        first task in a chain (base_dir is None AND latest_dir is None --
+        there's no existing base or pool to load/inherit, this task IS the
+        root). Makes this task's own just-trained weight into theta_base
+        going forward, and seeds pool[0] according to fusion_mode:
+          - classic_cka (BASE_FUSION_MODE): pool[0] = 0, matching the paper
+            exactly (v_1 = theta_1 - theta_base = 0, included in V).
+          - weight_delta: pool[0] = the same value as base (not zero) -- for
+            this method, the root's own contribution stays revisable via
+            alpha/merging like any other pool entry.
+        """
+        self.base_l0_weight.copy_(self.own_l0_weight.data)
+        self.base_l0_bias.copy_(self.own_l0_bias.data)
+        self.base_l2_weight.copy_(self.own_l2_weight.data)
+        self.base_l2_bias.copy_(self.own_l2_bias.data)
+ 
+        if self.fusion_mode == BASE_FUSION_MODE:
+            entry = {
+                "l0_weight": torch.zeros_like(self.own_l0_weight.data),
+                "l0_bias": torch.zeros_like(self.own_l0_bias.data),
+                "l2_weight": torch.zeros_like(self.own_l2_weight.data),
+                "l2_bias": torch.zeros_like(self.own_l2_bias.data),
+            }
+        else:
+            entry = {
+                "l0_weight": self.own_l0_weight.data.clone(),
+                "l0_bias": self.own_l0_bias.data.clone(),
+                "l2_weight": self.own_l2_weight.data.clone(),
+                "l2_bias": self.own_l2_bias.data.clone(),
+            }
+        entry["buffer"] = self.own_buffer
+        self.pool = [entry]
+ 
+        # own_weight's contribution is now captured in base (and, for
+        # weight_delta, in pool[0] too) -- zero it so forward() doesn't
+        # double/triple-count it if this object is used again.
+        self.own_l0_weight.data.zero_()
+        self.own_l0_bias.data.zero_()
+        self.own_l2_weight.data.zero_()
+        self.own_l2_bias.data.zero_()
+ 
+        
     def finalize_own_contribution(self):
         """Call this ONCE, right after this task's training (and evaluation,
         and anything else) is completely finished -- right before save().
@@ -216,7 +266,7 @@ class HeadPool(nn.Module):
                 "l2_weight": self.own_l2_weight.data.clone(),
                 "l2_bias": self.own_l2_bias.data.clone(),
             }
-            
+
         entry["buffer"] = self.own_buffer
         self.pool = [entry] + self.pool
  

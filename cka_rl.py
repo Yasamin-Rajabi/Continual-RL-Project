@@ -76,13 +76,9 @@ class CkaRlAgent(nn.Module):
         
         latest_mean_pool = None
         latest_logstd_pool = None
-        if latest_dir is not None and latest_dir != base_dir:
+        if latest_dir is not None:
             latest_mean_pool = torch.load(f"{latest_dir}/mean_pool.pt")
             latest_logstd_pool = torch.load(f"{latest_dir}/logstd_pool.pt")
-
-        if base_dir is not None:
-            self.mean_pool.load_base(base_dir)
-            self.logstd_pool.load_base(base_dir)
 
         if latest_mean_pool is not None:
             self.mean_pool.inherit_pool_from(latest_mean_pool)
@@ -162,6 +158,22 @@ class CkaRlAgent(nn.Module):
         save()."""
         self.mean_pool.set_own_buffer(buffer)
         self.logstd_pool.set_own_buffer(buffer)
+
+    def set_base(self):
+        """Call this INSTEAD of finalize() for the very first task in a
+        chain (base_dir is None AND latest_dir is None). See
+        HeadPool.set_base() in fuse_module.py for what it actually does."""
+        self.mean_pool.set_base()
+        self.logstd_pool.set_base()
+
+    def finalize(self):
+        """Call this ONCE, after training (and evaluation, and everything
+        else) is completely finished for this task -- right before save().
+        Folds this task's own contribution into each head's pool and merges
+        if needed. Order matters: call set_own_buffer() first if you have a
+        distillation buffer to attach, then finalize(), then save()."""
+        self.mean_pool.finalize_own_contribution()
+        self.logstd_pool.finalize_own_contribution()
 
     def save(self, dirname):
         os.makedirs(dirname, exist_ok=True)
