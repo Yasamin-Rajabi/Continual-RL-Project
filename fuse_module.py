@@ -62,7 +62,7 @@ class HeadPool(nn.Module):
         # the original paper's formula (alpha always sums to exactly 1), so
         # baseline comparisons stay a faithful reproduction. Independent of
         # distillation on/off -- fusion_mode is the only thing that matters.
-        assert not (use_alpha_mass and fusion_mode == BASE_FUSION_MODE), (
+        assert not (use_alpha_mass and fusion_mode == BASE_FUSION_MODE and distillation == False), (
             f"use_alpha_mass is not available with fusion_mode='{BASE_FUSION_MODE}' "
             "(the base method) -- not exposed to it on purpose."
         )
@@ -145,10 +145,17 @@ class HeadPool(nn.Module):
 
     def _effective(self):
         hist = self._historical()
-        w0 = self.base_l0_weight + self.own_l0_weight + hist["l0_weight"]
-        b0 = self.base_l0_bias + self.own_l0_bias + hist["l0_bias"]
-        w2 = self.base_l2_weight + self.own_l2_weight + hist["l2_weight"]
-        b2 = self.base_l2_bias + self.own_l2_bias + hist["l2_bias"]
+        w0 = self.own_l0_weight + hist["l0_weight"]
+        b0 = self.own_l0_bias + hist["l0_bias"]
+        w2 = self.own_l2_weight + hist["l2_weight"]
+        b2 = self.own_l2_bias + hist["l2_bias"]
+
+        if self.fusion_mode == BASE_FUSION_MODE:
+            w0 = self.base_l0_weight + w0
+            b0 = self.base_l0_bias + b0
+            w2 = self.base_l2_weight + w2
+            b2 = self.base_l2_bias + b2
+            
         return w0, b0, w2, b2
 
     def _base_only_forward(self, shared_features):
@@ -251,6 +258,7 @@ class HeadPool(nn.Module):
         contribution and its merge are finalized immediately, as a normal
         part of finishing this task -- not postponed to whenever, if ever,
         another task happens to load this one."""
+        #CHECK change if you want in delta_weight we start new task with initial weight = base weight
         if self.fusion_mode == "weight_delta":
             hist = self._historical()
             entry = {

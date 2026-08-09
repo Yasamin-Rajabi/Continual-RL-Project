@@ -131,7 +131,7 @@ class CkaRlAgent(nn.Module):
             else:
                 raise NotImplementedError(f"unknown alpha_init: {alpha_init}")
         alpha_scale = nn.Parameter(torch.ones(1), requires_grad=(use_alpha_scale and not fix_alpha))
-        alpha_mass = nn.Parameter(torch.ones(1), requires_grad=(use_alpha_mass and not fix_alpha)) if use_alpha_mass else None
+        alpha_mass = nn.Parameter(torch.ones(1), requires_grad=(use_alpha_mass and not fix_alpha))
         return alpha, alpha_scale, alpha_mass
 
     def get_distill_metrics(self):
