@@ -145,58 +145,77 @@ def run_chain(fusion_mode, distillation, pool_size):
 
 
 def check_alpha_mass_restricted_to_new_method():
-    """use_alpha_mass must be rejected for the base method (classic_cka) and
-    accepted for weight_delta, regardless of distillation on/off."""
+    """use_alpha_mass must be rejected ONLY for the pure baseline
+    (classic_cka + no distillation) -- the other 3 combinations (classic_cka
+    +distillation, weight_delta+no-distillation, weight_delta+distillation)
+    are all allowed."""
     print("\n=== alpha_mass restriction check ===")
-    root = f"{TMP_ROOT}/alpha_mass_check"
-    if os.path.exists(root):
-        shutil.rmtree(root)
 
-    # classic_cka + use_alpha_mass=True must raise
+    # ONLY this exact combination must raise
     raised = False
     try:
-        CkaRlAgent(OBS_DIM, ACT_DIM, None, None, fusion_mode="classic_cka", use_alpha_mass=True)
+        CkaRlAgent(OBS_DIM, ACT_DIM, None, None, fusion_mode="classic_cka",
+                   use_alpha_mass=True, distillation=False)
     except AssertionError:
         raised = True
-    assert raised, "expected use_alpha_mass=True with fusion_mode='classic_cka' to raise, it didn't"
-    print("  classic_cka + use_alpha_mass=True correctly raised OK")
+    assert raised, "expected classic_cka+distillation=False+use_alpha_mass=True to raise, it didn't"
+    print("  classic_cka + distillation=False + use_alpha_mass=True correctly raised OK")
 
-    # weight_delta + use_alpha_mass=True must NOT raise, regardless of distillation
-    for distillation in (False, True):
-        m = CkaRlAgent(OBS_DIM, ACT_DIM, None, None, fusion_mode="weight_delta",
+    # the other 3 combinations must all be allowed
+    allowed_combos = [
+        ("classic_cka", True),
+        ("weight_delta", False),
+        ("weight_delta", True),
+    ]
+    for fusion_mode, distillation in allowed_combos:
+        m = CkaRlAgent(OBS_DIM, ACT_DIM, None, None, fusion_mode=fusion_mode,
                         use_alpha_mass=True, distillation=distillation)
         x = torch.randn(2, OBS_DIM)
         m(x)  # just needs to not crash
-        print(f"  weight_delta + use_alpha_mass=True + distillation={distillation}: constructed & forward OK")
+        print(f"  {fusion_mode} + distillation={distillation} + use_alpha_mass=True: constructed & forward OK")
 
 
-def check_residual_distillation_differs_from_raw():
-    """The whole point of subtracting base_output before training the
-    distillation student: if base's own output is non-trivial, a student
-    trained on the RAW targets should differ from one trained on the
-    RESIDUAL (targets - base_output). This just re-derives that relationship
-    directly (independent of CkaRlAgent) as a check that the subtraction in
-    HeadPool._distill is actually being applied, not silently skipped."""
+def check_fusion_mode_base_handling_in_distill():
+    """Confirms _distill's fusion-mode branch does what it's supposed to:
+    for classic_cka, optimization goes through base+v_k (so a different base
+    must change what gets learned); for weight_delta, base is excluded
+    entirely (matching _effective()), so changing base must NOT change the
+    distilled result at all."""
     from fuse_module import HeadPool
-    torch.manual_seed(1)
-    pool = HeadPool("mean", shared_dim=256, hidden_dim=128, act_dim=ACT_DIM,
-                     fusion_mode="classic_cka", pool_size=1, distillation=True)
-    # give it a non-trivial base so base_output is non-zero
-    with torch.no_grad():
-        pool.base_l0_weight.normal_(0, 0.5)
-        pool.base_l0_bias.normal_(0, 0.5)
-        pool.base_l2_weight.normal_(0, 0.5)
-        pool.base_l2_bias.normal_(0, 0.5)
+    print("\n=== fusion_mode base-handling check ===")
 
     buf1 = make_fake_buffer()
     buf2 = make_fake_buffer()
-    inputs = torch.tensor(np.concatenate([buf1["shared"], buf2["shared"]], axis=0), dtype=torch.float32)
-    with torch.no_grad():
-        base_out = pool._base_only_forward(inputs)
-    assert base_out.abs().mean().item() > 1e-3, "test setup error: base output is ~zero, can't test subtraction"
-    print("\n=== residual-subtraction check ===")
-    print(f"  base output magnitude: {base_out.abs().mean().item():.4f} (non-trivial, good -- "
-          f"subtraction has something real to remove)")
+
+    def make_pool(fusion_mode, base_scale):
+        p = HeadPool("mean", shared_dim=256, hidden_dim=128, act_dim=ACT_DIM,
+                      fusion_mode=fusion_mode, pool_size=1, distillation=True)
+        if base_scale > 0:
+            with torch.no_grad():
+                p.base_l0_weight.normal_(0, base_scale)
+                p.base_l0_bias.normal_(0, base_scale)
+                p.base_l2_weight.normal_(0, base_scale)
+                p.base_l2_bias.normal_(0, base_scale)
+        return p
+
+    # weight_delta: base must NOT affect the result
+    torch.manual_seed(3)
+    result_a = make_pool("weight_delta", 0.0)._distill(buf1, buf2, epochs=2)
+    torch.manual_seed(3)
+    result_b = make_pool("weight_delta", 5.0)._distill(buf1, buf2, epochs=2)
+    for t_a, t_b in zip(result_a, result_b):
+        assert torch.allclose(t_a, t_b, atol=1e-5), \
+            "weight_delta distillation result changed when base changed -- base should be excluded entirely"
+    print("  weight_delta: base correctly excluded from distillation OK")
+
+    # classic_cka: base MUST affect the result
+    torch.manual_seed(3)
+    result_c = make_pool("classic_cka", 0.0)._distill(buf1, buf2, epochs=2)
+    torch.manual_seed(3)
+    result_d = make_pool("classic_cka", 5.0)._distill(buf1, buf2, epochs=2)
+    differs = any(not torch.allclose(t_c, t_d, atol=1e-5) for t_c, t_d in zip(result_c, result_d))
+    assert differs, "classic_cka distillation result did NOT change when base changed -- base should matter"
+    print("  classic_cka: base correctly affects distillation result OK")
 
 
 if __name__ == "__main__":
@@ -227,7 +246,7 @@ if __name__ == "__main__":
         print(f"  FAILED: {e}")
 
     try:
-        check_residual_distillation_differs_from_raw()
+        check_fusion_mode_base_handling_in_distill()
     except AssertionError as e:
         ok = False
         print(f"  FAILED: {e}")
