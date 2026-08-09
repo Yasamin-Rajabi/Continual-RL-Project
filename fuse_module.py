@@ -350,85 +350,86 @@ class HeadPool(nn.Module):
         self.pool = keep
 
     def _distill(self, buffer1, buffer2, epochs=5, lr=1e-3, batch_size=128):
-        """Trains a fresh 2-layer student (same shape as l0+l2: shared_dim ->
-        hidden_dim -> act_dim) on the RESIDUAL target -- targets minus what
-        the frozen base sub-network ALONE would already produce -- so the
-        student's weights directly represent the quantity that gets ADDED to
-        base (v_k for classic_cka, theta_k - theta_base for weight_delta),
-        not the raw absolute output. This is exact for weight_delta (the
-        additive term this replaces IS exactly "output - base_output" in
-        composition); it's an approximation for classic_cka (doesn't isolate
-        out what other pool entries' hist would have contributed at the time
-        each buffer was recorded) and, for both modes, an approximation
-        across the ReLU nonlinearity between l0 and l2.
+        """Directly optimizes a candidate pool entry (v_l0_w, v_l0_b, v_l2_w,
+        v_l2_b) through the SAME composition _effective() actually uses --
+        base + candidate (classic_cka) or just candidate (weight_delta),
+        through the real ReLU -- instead of training a separate scaffold
+        network and subtracting a separately-computed base output. That
+        subtraction doesn't hold once there's a ReLU between two linear layers
+        (ReLU(a)+ReLU(c) != ReLU(a+c) in general), so this optimizes the
+        candidate exactly the way it will actually be used -- no approximation
+        from that source.
 
-        Holds out `self.distill_test_frac` of the pooled data as a test set,
-        never seen during training, so the reported MSE reflects how well
-        the distilled sub-network actually generalizes rather than how well
-        it memorized these particular buffer samples. Both train and test
-        MSE are stored on self (last_distill_train_mse/last_distill_test_mse)
-        for the caller to log.
+        A different, unavoidable approximation remains: combining multiple
+        tasks' contributions in WEIGHT space (before the ReLU) still isn't the
+        same as combining their OUTPUT behavior -- that's inherent to
+        weight-space pooling with a nonlinear network, not something any one
+        merge step can fully remove.
         """
-        logger.info(f"[HeadPool:{self.head_type}] distillation training (residual vs. base)")
+        logger.info(f"[HeadPool:{self.head_type}] distillation training (direct, through real composition)")
         inputs = np.concatenate([buffer1["shared"], buffer2["shared"]], axis=0)
         raw_targets = np.concatenate([buffer1["targets"], buffer2["targets"]], axis=0)
         target_slice = slice(0, self.act_dim) if self.head_type == "mean" else slice(self.act_dim, 2 * self.act_dim)
         head_targets = raw_targets[:, target_slice]
-
-        with torch.no_grad():
-            inputs_for_base = torch.tensor(inputs, dtype=torch.float32, device=self.base_l0_weight.device)
-            base_out = self._base_only_forward(inputs_for_base).cpu().numpy()
-        residual = head_targets - base_out
 
         n = inputs.shape[0]
         perm = np.random.permutation(n)
         n_test = int(n * self.distill_test_frac) if self.distill_test_frac > 0 else 0
         test_idx, train_idx = perm[:n_test], perm[n_test:]
         if len(train_idx) == 0:
-            # degenerate case: not enough data for any split at all -- train
-            # on everything, skip the held-out evaluation rather than crash.
             train_idx, test_idx = perm, np.array([], dtype=int)
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        inputs_t = torch.tensor(inputs, dtype=torch.float32)
-        residual_t = torch.tensor(residual, dtype=torch.float32)
+        inputs_t = torch.tensor(inputs, dtype=torch.float32).to(device)
+        targets_t = torch.tensor(head_targets, dtype=torch.float32).to(device)
 
-        train_dataset = torch.utils.data.TensorDataset(inputs_t[train_idx], residual_t[train_idx])
-        loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        base_l0_w = self.base_l0_weight.detach().to(device)
+        base_l0_b = self.base_l0_bias.detach().to(device)
+        base_l2_w = self.base_l2_weight.detach().to(device)
+        base_l2_b = self.base_l2_bias.detach().to(device)
 
-        student = nn.Sequential(
-            nn.Linear(inputs_t.shape[-1], self.hidden_dim), nn.ReLU(),
-            nn.Linear(self.hidden_dim, self.act_dim)
-        ).to(device)
-        optimizer = torch.optim.Adam(student.parameters(), lr=lr)
-        student.train()
+        v_l0_w = torch.zeros_like(base_l0_w, requires_grad=True)
+        v_l0_b = torch.zeros_like(base_l0_b, requires_grad=True)
+        v_l2_w = torch.zeros_like(base_l2_w, requires_grad=True)
+        v_l2_b = torch.zeros_like(base_l2_b, requires_grad=True)
+
+        def compute(batch_in):
+            if self.fusion_mode == BASE_FUSION_MODE:
+                eff_l0_w, eff_l0_b = base_l0_w + v_l0_w, base_l0_b + v_l0_b
+                eff_l2_w, eff_l2_b = base_l2_w + v_l2_w, base_l2_b + v_l2_b
+            else:
+                eff_l0_w, eff_l0_b = v_l0_w, v_l0_b
+                eff_l2_w, eff_l2_b = v_l2_w, v_l2_b
+            h = F.relu(F.linear(batch_in, eff_l0_w, eff_l0_b))
+            return F.linear(h, eff_l2_w, eff_l2_b)
+
+        optimizer = torch.optim.Adam([v_l0_w, v_l0_b, v_l2_w, v_l2_b], lr=lr)
+        train_inputs, train_targets = inputs_t[train_idx], targets_t[train_idx]
+        n_train = train_inputs.shape[0]
         for _ in range(epochs):
-            for batch_in, batch_target in loader:
-                batch_in, batch_target = batch_in.to(device), batch_target.to(device)
-                preds = student(batch_in)
-                loss = F.mse_loss(preds, batch_target)
+            perm_epoch = torch.randperm(n_train)
+            for start in range(0, n_train, batch_size):
+                idx = perm_epoch[start:start + batch_size]
+                preds = compute(train_inputs[idx])
+                loss = F.mse_loss(preds, train_targets[idx])
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
 
-        student.eval()
         with torch.no_grad():
-            preds_train = student(inputs_t[train_idx].to(device))
-            self.last_distill_train_mse = F.mse_loss(preds_train, residual_t[train_idx].to(device)).item()
+            preds_train = compute(train_inputs)
+            self.last_distill_train_mse = F.mse_loss(preds_train, train_targets).item()
             if len(test_idx) > 0:
-                preds_test = student(inputs_t[test_idx].to(device))
-                self.last_distill_test_mse = F.mse_loss(preds_test, residual_t[test_idx].to(device)).item()
+                preds_test = compute(inputs_t[test_idx])
+                self.last_distill_test_mse = F.mse_loss(preds_test, targets_t[test_idx]).item()
             else:
                 self.last_distill_test_mse = None
         logger.info(f"[HeadPool:{self.head_type}] distill train_mse={self.last_distill_train_mse:.5f} "
                     f"test_mse={self.last_distill_test_mse}")
 
         out_device = self.base_l0_weight.device
-        l0w = student[0].weight.data.clone().to(out_device)
-        l0b = student[0].bias.data.clone().to(out_device)
-        l2w = student[2].weight.data.clone().to(out_device)
-        l2b = student[2].bias.data.clone().to(out_device)
-        return l0w, l0b, l2w, l2b
+        return (v_l0_w.detach().clone().to(out_device), v_l0_b.detach().clone().to(out_device),
+                v_l2_w.detach().clone().to(out_device), v_l2_b.detach().clone().to(out_device))
 
     def _merge_buffers(self, buf1, buf2):
         merged = {k: np.concatenate([buf1[k], buf2[k]], axis=0) for k in ("obs", "shared", "targets")}

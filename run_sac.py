@@ -283,17 +283,6 @@ if __name__ == "__main__":
             distill_test_frac=args.distill_test_frac,
         )
 
-        # Any merge (and its distillation, if used) already happened inside
-        # __init__ above, before any SAC training starts -- log it now at
-        # step 0 rather than losing it, since this reflects a property of
-        # this task's STARTING point, not something that evolves during
-        # training.
-        distill_metrics = model.get_distill_metrics()
-        for metric_name, value in distill_metrics.items():
-            if value is not None:
-                print(f"*** distillation/{metric_name} = {value:.5f} ***")
-                writer.add_scalar(f"distillation/{metric_name}", value, 0)
-
     actor = Actor(envs, model).to(device)
     qf1 = SoftQNetwork(envs).to(device)
     qf2 = SoftQNetwork(envs).to(device)
@@ -488,7 +477,7 @@ if __name__ == "__main__":
                 shared_feats = actor.model.fc(obs_tensor)
                 distill_shared.append(shared_feats.cpu().numpy())
 
-                mean, log_std = actor.model.fc_mean(shared_feats), actor.model.fc_logstd(shared_feats)
+                mean, log_std = actor.model.mean_pool(shared_feats), actor.model.logstd_pool(shared_feats)
                 target_outputs = torch.cat([mean, log_std], dim=-1).cpu().numpy()
                 distill_targets.append(target_outputs)
 
@@ -511,7 +500,6 @@ if __name__ == "__main__":
     ]
 
     envs.close()
-    writer.close()
 
     if args.save_dir is not None:
         print(f"Saving trained agent in `{args.save_dir}` with name `{run_name}`")
@@ -520,10 +508,10 @@ if __name__ == "__main__":
             actor.model.set_own_buffer(distill_buffer)
 
         if base_dir is None and latest_dir is None:
-                actor.model.set_base()
+            actor.model.set_base()
         else:
             actor.model.finalize()
-            
+
         distill_metrics = actor.model.get_distill_metrics()
         for metric_name, value in distill_metrics.items():
             if value is not None:
@@ -531,3 +519,6 @@ if __name__ == "__main__":
                 writer.add_scalar(f"distillation/{metric_name}", value, args.total_timesteps)
 
         actor.model.save(dirname=f"{args.save_dir}/{run_name}")
+
+    writer.close()
+    

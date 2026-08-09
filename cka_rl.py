@@ -76,14 +76,17 @@ class CkaRlAgent(nn.Module):
         
         latest_mean_pool = None
         latest_logstd_pool = None
+
         if latest_dir is not None:
             latest_mean_pool = torch.load(f"{latest_dir}/mean_pool.pt")
             latest_logstd_pool = torch.load(f"{latest_dir}/logstd_pool.pt")
-
-        if latest_mean_pool is not None:
+            assert (latest_mean_pool is not None) and (latest_logstd_pool is not None), (
+                    f"latest_dir is not None and latest_mean_pool or latest_logstd_pool is None."
+                )
+            
             self.mean_pool.inherit_pool_from(latest_mean_pool)
-        if latest_logstd_pool is not None:
             self.logstd_pool.inherit_pool_from(latest_logstd_pool)
+        
 
         # 2. Now each pool's final size is known -- set up its OWN alpha
         #    (independent of the other head's), plus its own alpha_mass if
