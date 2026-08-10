@@ -40,7 +40,10 @@ DISTILL_EXTRA_STEPS = 256
 TASK_SEQUENCE = [0, 1, 2]
 
 SAVE_ROOT = "agents_timing"
-RUNS_ROOT = "runs_timing"
+RUNS_ROOT = "runs"  # NOT configurable via CLI -- run_sac.py hardcodes
+                     # `SummaryWriter(f"runs/{args.tag}/{run_name}")`, so
+                     # this must match that literal "runs" prefix exactly,
+                     # unlike SAVE_ROOT (which IS configurable via --save-dir).
 
 CONDITIONS = {
     "Mode1_Baseline":     {"distillation": False, "fusion_mode": "classic_cka"},
