@@ -15,13 +15,12 @@ import pathlib
 from torch.utils.tensorboard import SummaryWriter
 from typing import Literal, Optional, Tuple
 
-# from models import shared, SimpleAgent, CompoNetAgent, PackNetAgent, ProgressiveNetAgent, CkaRlAgent, MaskNetAgent, CbpAgent, CReLUsAgent
 from cka_rl import CkaRlAgent
 from shared_arch import shared
 from tasks import get_task
 from AdamGnT import AdamGnT
 from stable_baselines3.common.buffers import ReplayBuffer
-# from models.cbp_modules import GnT
+
 
 # ==========================================
 # TORCH SECURITY PATCH FOR KAGGLE (NUMPY 2.0 & WEIGHTS ONLY COMPATIBILITY)

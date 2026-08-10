@@ -181,7 +181,7 @@ def check_fusion_mode_base_handling_in_distill():
     must change what gets learned); for weight_delta, base is excluded
     entirely (matching _effective()), so changing base must NOT change the
     distilled result at all."""
-    from fuse_module import HeadPool
+    from knowledge_pools import HeadPool
     print("\n=== fusion_mode base-handling check ===")
 
     buf1 = make_fake_buffer()

@@ -15,7 +15,7 @@ import numpy as np
 import torch.nn as nn
 from loguru import logger
 
-from fuse_module import HeadPool
+from knowledge_pools import HeadPool
 from shared_arch import shared
 
 
@@ -25,7 +25,7 @@ class CkaRlAgent(nn.Module):
     (`self.mean_pool`, `self.logstd_pool`). mean and logstd share no weights
     with each other, so they merge independently and each gets its OWN
     alpha -- unlike l0/l2 WITHIN one head, which must move together (see
-    fuse_module.py's module docstring for the reasoning).
+    knowledge_pools.py's module docstring for the reasoning).
     """
 
     def __init__(self,
@@ -165,7 +165,7 @@ class CkaRlAgent(nn.Module):
     def set_base(self):
         """Call this INSTEAD of finalize() for the very first task in a
         chain (base_dir is None AND latest_dir is None). See
-        HeadPool.set_base() in fuse_module.py for what it actually does."""
+        HeadPool.set_base() in knowledge_pools.py for what it actually does."""
         self.mean_pool.set_base()
         self.logstd_pool.set_base()
 
