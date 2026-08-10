@@ -459,6 +459,12 @@ if __name__ == "__main__":
                     [eval_agent(actor, envs.envs[i], args.num_evals, global_step, writer, device) for i in range(envs.num_envs)]
 
 
+    train_loop_seconds = time.time() - start_time
+    writer.add_scalar("timing/train_loop_seconds", train_loop_seconds, args.total_timesteps)
+    print(f"*** TRAIN_LOOP_SECONDS: {train_loop_seconds:.4f} for {args.total_timesteps} steps "
+          f"({args.total_timesteps / train_loop_seconds:.2f} steps/sec) ***")
+
+    
     distill_buffer = None
     if args.distillation:
         print(f"*** Generating online comprehensive distillation buffer for {args.distill_extra_steps} steps ***")
@@ -468,6 +474,8 @@ if __name__ == "__main__":
 
         obs, _ = envs.reset()
         actor.eval()
+        distill_start = time.time()
+
         for _ in range(args.distill_extra_steps):
             with torch.no_grad():
                 obs_tensor = torch.Tensor(obs).to(device)
@@ -486,6 +494,12 @@ if __name__ == "__main__":
             next_obs, _, _, _, _ = envs.step(actions)
             obs = next_obs
 
+        distill_buffer_seconds = time.time() - distill_start
+        writer.add_scalar("timing/distill_buffer_seconds", distill_buffer_seconds, args.total_timesteps)
+        print(f"*** DISTILL_BUFFER_SECONDS: {distill_buffer_seconds:.4f} for {args.distill_extra_steps} steps "
+              f"({args.distill_extra_steps / distill_buffer_seconds:.2f} steps/sec) ***")
+
+        
         distill_buffer = {
             "obs": np.concatenate(distill_obs, axis=0),
             "shared": np.concatenate(distill_shared, axis=0),
@@ -506,10 +520,16 @@ if __name__ == "__main__":
         if distill_buffer is not None:
             actor.model.set_own_buffer(distill_buffer)
 
+        merge_start = time.time()
+
         if base_dir is None and latest_dir is None:
             actor.model.set_base()
         else:
             actor.model.finalize()
+            
+        merge_seconds = time.time() - merge_start
+        writer.add_scalar("timing/finalize_seconds", merge_seconds, args.total_timesteps)
+        print(f"*** FINALIZE_SECONDS: {merge_seconds:.4f} ***")
 
         distill_metrics = actor.model.get_distill_metrics()
         for metric_name, value in distill_metrics.items():
