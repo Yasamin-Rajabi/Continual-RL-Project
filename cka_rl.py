@@ -13,6 +13,7 @@ torch.load = patched_load
 import os
 import numpy as np
 import torch.nn as nn
+import torch.nn.functional as F
 from loguru import logger
 
 from knowledge_pools import HeadPool
@@ -86,6 +87,13 @@ class CkaRlAgent(nn.Module):
             
             self.mean_pool.inherit_pool_from(latest_mean_pool)
             self.logstd_pool.inherit_pool_from(latest_logstd_pool)
+
+            # CKA-RL initializes the NEW task vector v_k at zero.  The HeadPool
+            # constructor uses normal neural-network initialization so the root
+            # task can train from scratch; every non-root task must override
+            # that initialization after history has been inherited.
+            self.mean_pool.reset_own_to_zero()
+            self.logstd_pool.reset_own_to_zero()
         
 
         # 2. Now each pool's final size is known -- set up its OWN alpha
@@ -175,8 +183,53 @@ class CkaRlAgent(nn.Module):
         Folds this task's own contribution into each head's pool and merges
         if needed. Order matters: call set_own_buffer() first if you have a
         distillation buffer to attach, then finalize(), then save()."""
-        self.mean_pool.finalize_own_contribution()
-        self.logstd_pool.finalize_own_contribution()
+        # Pass the CURRENT encoder into merging/distillation so historical raw
+        # observations are re-encoded in the feature space used at inference.
+        self.mean_pool.finalize_own_contribution(feature_fn=self.fc)
+        self.logstd_pool.finalize_own_contribution(feature_fn=self.fc)
+
+    @staticmethod
+    def _cpu_clone_dict(d):
+        return {k: v.detach().cpu().clone() for k, v in d.items()}
+
+    def export_effective_policy(self):
+        """Return the exact PRE-finalize actor used for this task.
+
+        The finalized knowledge pool is a data structure for FUTURE tasks and
+        does not, in general, preserve the just-trained alpha/own composition.
+        This compact snapshot stores only the current encoder and the two
+        effective 2-layer heads, with no replay/distillation buffers.
+        """
+        with torch.no_grad():
+            mean_w0, mean_b0, mean_w2, mean_b2 = self.mean_pool._effective()
+            log_w0, log_b0, log_w2, log_b2 = self.logstd_pool._effective()
+            return {
+                "obs_dim": int(self.obs_dim),
+                "act_dim": int(self.act_dim),
+                "fc_state_dict": self._cpu_clone_dict(self.fc.state_dict()),
+                "mean": {
+                    "l0_weight": mean_w0.detach().cpu().clone(),
+                    "l0_bias": mean_b0.detach().cpu().clone(),
+                    "l2_weight": mean_w2.detach().cpu().clone(),
+                    "l2_bias": mean_b2.detach().cpu().clone(),
+                },
+                "logstd": {
+                    "l0_weight": log_w0.detach().cpu().clone(),
+                    "l0_bias": log_b0.detach().cpu().clone(),
+                    "l2_weight": log_w2.detach().cpu().clone(),
+                    "l2_bias": log_b2.detach().cpu().clone(),
+                },
+            }
+
+    def save_policy_snapshot(self, dirname):
+        os.makedirs(dirname, exist_ok=True)
+        torch.save(self.export_effective_policy(), f"{dirname}/policy_snapshot.pt")
+
+    def get_merge_info(self):
+        return {
+            "mean": self.mean_pool.last_merge_info,
+            "logstd": self.logstd_pool.last_merge_info,
+        }
 
     def save(self, dirname):
         os.makedirs(dirname, exist_ok=True)
@@ -191,3 +244,34 @@ class CkaRlAgent(nn.Module):
         model.mean_pool = torch.load(f"{dirname}/mean_pool.pt", map_location=map_location)
         model.logstd_pool = torch.load(f"{dirname}/logstd_pool.pt", map_location=map_location)
         return model
+
+
+class FrozenCkaPolicy(nn.Module):
+    """Compact inference-only policy loaded from policy_snapshot.pt."""
+    def __init__(self, snapshot):
+        super().__init__()
+        self.obs_dim = int(snapshot["obs_dim"])
+        self.act_dim = int(snapshot["act_dim"])
+        self.fc = shared(input_dim=self.obs_dim)
+        self.fc.load_state_dict(snapshot["fc_state_dict"])
+
+        for head_name in ("mean", "logstd"):
+            for tensor_name, tensor in snapshot[head_name].items():
+                self.register_buffer(f"{head_name}_{tensor_name}", tensor.clone())
+
+    def _head(self, x, head_name):
+        w0 = getattr(self, f"{head_name}_l0_weight")
+        b0 = getattr(self, f"{head_name}_l0_bias")
+        w2 = getattr(self, f"{head_name}_l2_weight")
+        b2 = getattr(self, f"{head_name}_l2_bias")
+        h = F.relu(F.linear(x, w0, b0))
+        return F.linear(h, w2, b2)
+
+    def forward(self, obs):
+        z = self.fc(obs)
+        return self._head(z, "mean"), self._head(z, "logstd")
+
+    @staticmethod
+    def load(dirname, map_location=None):
+        snapshot = torch.load(f"{dirname}/policy_snapshot.pt", map_location=map_location)
+        return FrozenCkaPolicy(snapshot)

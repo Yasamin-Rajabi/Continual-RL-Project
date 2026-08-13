@@ -19,6 +19,7 @@ from cka_rl import CkaRlAgent
 from shared_arch import shared
 from tasks import get_task
 from AdamGnT import AdamGnT
+from analysis_logging import effective_theta_vector, log_training_state, save_task_snapshot
 from stable_baselines3.common.buffers import ReplayBuffer
 
 
@@ -115,6 +116,12 @@ class Args:
     """Learned scalar controlling the TOTAL weight given to historical pool entries (normally always exactly 1.0, since softmax sums to 1). Only available with fusion_mode='weight_delta'."""
     distill_test_frac: float = 0.2
     """Fraction of the pooled distillation data held out as a test set when a merge uses distillation, to report a generalization MSE rather than a training-set MSE"""
+    analysis_log_every: int = 5_000
+    """Log lightweight continual-learning state (alphas, theta drift/norms, critic norms) every N environment steps. Set <=0 to disable."""
+    save_analysis_snapshots: bool = True
+    """Save exact task-boundary .pt snapshots for later analysis."""
+    analysis_root: str = "analysis_runs"
+    """Separate root for analysis snapshots, so partial runs never look like completed model checkpoints."""
 
 def make_env(task_id):
     def thunk():
@@ -200,7 +207,11 @@ def eval_agent(agent, test_env, num_evals, global_step, writer, device):
     for _ in range(num_evals):
         while True:
             obs = torch.Tensor(obs).to(device).unsqueeze(0)
-            action, _ = agent(obs)
+            # Actor.forward() returns (raw_mean, bounded_log_std), NOT an action.
+            # For deterministic SAC evaluation use tanh(mean) and the same
+            # action rescaling as Actor.get_action().
+            mean, _ = agent(obs)
+            action = torch.tanh(mean) * agent.action_scale + agent.action_bias
             obs, reward, termination, truncation, info = test_env.step(
                 action[0].cpu().numpy()
             )
@@ -313,6 +324,20 @@ if __name__ == "__main__":
         device,
         handle_timeout_termination=False,
     )
+
+    # Exact task-start theta is kept for drift measurements throughout this
+    # task.  Full tensors are saved only at task boundaries; TensorBoard gets
+    # cheap scalar summaries during training.
+    theta_task_start = effective_theta_vector(actor.model).detach().clone()
+    analysis_dir = f"{args.analysis_root}/{args.tag}/{run_name}"
+    if args.save_analysis_snapshots:
+        save_task_snapshot(
+            f"{analysis_dir}/start.pt", "start", 0, args, actor.model,
+            qf1, qf2, qf1_target, qf2_target, alpha,
+            log_alpha if args.autotune else None,
+            include_effective=True, include_critics=True,
+        )
+    log_training_state(writer, 0, actor.model, qf1, qf2, qf1_target, qf2_target, theta_task_start)
 
     start_time = time.time()
 
@@ -458,6 +483,12 @@ if __name__ == "__main__":
             if global_step % args.eval_every == 0 and global_step > 0:
                     [eval_agent(actor, envs.envs[i], args.num_evals, global_step, writer, device) for i in range(envs.num_envs)]
 
+        if args.analysis_log_every > 0 and global_step > 0 and global_step % args.analysis_log_every == 0:
+            log_training_state(
+                writer, global_step, actor.model, qf1, qf2, qf1_target, qf2_target,
+                theta_task_start,
+            )
+
 
     train_loop_seconds = time.time() - start_time
     writer.add_scalar("timing/train_loop_seconds", train_loop_seconds, args.total_timesteps)
@@ -520,6 +551,21 @@ if __name__ == "__main__":
         if distill_buffer is not None:
             actor.model.set_own_buffer(distill_buffer)
 
+        run_dir = f"{args.save_dir}/{run_name}"
+
+        # IMPORTANT: preserve the exact policy that was actually trained BEFORE
+        # finalize() mutates the knowledge-pool representation.  Future tasks
+        # still load the finalized pool files; evaluation loads this compact
+        # policy snapshot instead.
+        actor.model.save_policy_snapshot(run_dir)
+        if args.save_analysis_snapshots:
+            save_task_snapshot(
+                f"{analysis_dir}/pre_finalize.pt", "pre_finalize", global_step, args, actor.model,
+                qf1, qf2, qf1_target, qf2_target, alpha,
+                log_alpha if args.autotune else None,
+                include_effective=True, include_critics=True,
+            )
+
         merge_start = time.time()
 
         if base_dir is None and latest_dir is None:
@@ -531,13 +577,32 @@ if __name__ == "__main__":
         writer.add_scalar("timing/finalize_seconds", merge_seconds, args.total_timesteps)
         print(f"*** FINALIZE_SECONDS: {merge_seconds:.4f} ***")
 
+        # Post-finalize: pool/merge state is meaningful, but the old alpha no
+        # longer necessarily parameterizes the same policy, so do not export an
+        # 'effective theta' from this mutated representation.
+        if args.save_analysis_snapshots:
+            save_task_snapshot(
+                f"{analysis_dir}/post_finalize.pt", "post_finalize", global_step, args, actor.model,
+                qf1, qf2, qf1_target, qf2_target, alpha,
+                log_alpha if args.autotune else None,
+                include_effective=False, include_critics=False,
+            )
+
+        merge_info = actor.model.get_merge_info()
+        for head_name, info in merge_info.items():
+            if info is not None:
+                writer.add_scalar(f"analysis/{head_name}/merge_cosine_similarity",
+                                  info["cosine_similarity"], args.total_timesteps)
+                writer.add_scalar(f"analysis/{head_name}/merge_used_distillation",
+                                  float(info["used_distillation"]), args.total_timesteps)
+
         distill_metrics = actor.model.get_distill_metrics()
         for metric_name, value in distill_metrics.items():
             if value is not None:
                 print(f"*** distillation/{metric_name} = {value:.5f} ***")
                 writer.add_scalar(f"distillation/{metric_name}", value, args.total_timesteps)
 
-        actor.model.save(dirname=f"{args.save_dir}/{run_name}")
+        actor.model.save(dirname=run_dir)
 
     writer.close()
     

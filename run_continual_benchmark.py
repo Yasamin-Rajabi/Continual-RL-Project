@@ -60,7 +60,7 @@ import torch
 import matplotlib.pyplot as plt
 from tensorboard.backend.event_processing import event_accumulator
 
-from cka_rl import CkaRlAgent
+from cka_rl import CkaRlAgent, FrozenCkaPolicy
 from tasks import get_task, get_task_name
 
 # ==========================================================================
@@ -228,10 +228,11 @@ def evaluate_final_model_on_task(prev_units, condition_cfg, eval_task_id, device
     obs_dim = np.array(env.observation_space.shape).prod()
     act_dim = np.prod(env.action_space.shape)
 
-    agent = CkaRlAgent.load(
+    # Evaluate the exact pre-finalize policy snapshot.  The finalized HeadPool
+    # checkpoint is the continual-learning state for constructing the NEXT task;
+    # its old alpha no longer necessarily represents the just-trained policy.
+    agent = FrozenCkaPolicy.load(
         dirname=str(latest_dir),
-        obs_dim=obs_dim,
-        act_dim=act_dim,
         map_location=device,
     ).to(device)
     agent.eval()

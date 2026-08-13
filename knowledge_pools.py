@@ -113,6 +113,10 @@ class HeadPool(nn.Module):
         # simple averaging). Read from outside via CkaRlAgent.get_distill_metrics().
         self.last_distill_train_mse = None
         self.last_distill_test_mse = None
+        # Lightweight metadata for later analysis.  The actual pool tensors are
+        # saved separately by the analysis snapshot logger; this only records
+        # what the most recent merge decided.
+        self.last_merge_info = None
 
     # ------------------------------------------------------------------
     def _apply(self, fn, *args, **kwargs):
@@ -199,6 +203,20 @@ class HeadPool(nn.Module):
         self.base_l2_bias.copy_(latest_pool.base_l2_bias)
 
 
+    def reset_own_to_zero(self):
+        """Zero the current task's learnable residual.
+
+        For every non-root task this makes the initial policy exactly the
+        historical/base policy selected by alpha, matching CKA-RL's v_k = 0
+        initialization.  The root task is intentionally left with the normal
+        random neural-network initialization and is trained from scratch.
+        """
+        with torch.no_grad():
+            self.own_l0_weight.zero_()
+            self.own_l0_bias.zero_()
+            self.own_l2_weight.zero_()
+            self.own_l2_bias.zero_()
+
     def set_base(self):
         """Call this INSTEAD of finalize_own_contribution() for the very
         first task in a chain (base_dir is None AND latest_dir is None --
@@ -242,7 +260,7 @@ class HeadPool(nn.Module):
         self.own_l2_bias.data.zero_()
  
         
-    def finalize_own_contribution(self):
+    def finalize_own_contribution(self, feature_fn=None):
         """Call this ONCE, right after this task's training (and evaluation,
         and anything else) is completely finished -- right before save().
         Folds this task's own trainable delta into the pool as a new entry
@@ -287,7 +305,7 @@ class HeadPool(nn.Module):
         self.own_l2_weight.data.zero_()
         self.own_l2_bias.data.zero_()
  
-        self.merge()
+        self.merge(feature_fn=feature_fn)
 
 
     def set_own_buffer(self, buffer):
@@ -307,7 +325,7 @@ class HeadPool(nn.Module):
     def needs_merge(self):
         return len(self.pool) > self.pool_size
 
-    def merge(self):
+    def merge(self, feature_fn=None):
         """Collapse the two most-similar pool entries into one -- ONE
         decision covering l0+l2 together (they're one coherent sub-network),
         completely independent of whatever the OTHER head (mean vs logstd)
@@ -324,8 +342,10 @@ class HeadPool(nn.Module):
             for j in range(i + 1, n):
                 similarities[i, j] = F.cosine_similarity(flat[i], flat[j], dim=0)
         idx1, idx2 = divmod(torch.argmax(similarities).item(), n)
+        merge_similarity = float(similarities[idx1, idx2].item())
         logger.info(f"[HeadPool:{self.head_type}:{self.fusion_mode}] "
-                    f"merging idx1={idx1}, idx2={idx2} (l0+l2 together, independent of the other head)")
+                    f"merging idx1={idx1}, idx2={idx2}, cosine={merge_similarity:.6f} "
+                    f"(l0+l2 together, independent of the other head)")
 
         buf1 = self.pool[idx1]["buffer"]
         buf2 = self.pool[idx2]["buffer"]
@@ -335,7 +355,10 @@ class HeadPool(nn.Module):
                             "merging entries have no buffer; falling back to simple averaging.")
 
         if use_distillation:
-            new_l0w, new_l0b, new_l2w, new_l2b = self._distill(buf1, buf2)
+            new_l0w, new_l0b, new_l2w, new_l2b = self._distill(
+                buf1, buf2, feature_fn=feature_fn,
+                init_entry1=self.pool[idx1], init_entry2=self.pool[idx2],
+            )
         else:
             new_l0w = (self.pool[idx1]["l0_weight"] + self.pool[idx2]["l0_weight"]) / 2
             new_l0b = (self.pool[idx1]["l0_bias"] + self.pool[idx2]["l0_bias"]) / 2
@@ -343,55 +366,103 @@ class HeadPool(nn.Module):
             new_l2b = (self.pool[idx1]["l2_bias"] + self.pool[idx2]["l2_bias"]) / 2
 
         merged_buffer = self._merge_buffers(buf1, buf2) if use_distillation else (buf1 or buf2)
+        self.last_merge_info = {
+            "idx1": int(idx1),
+            "idx2": int(idx2),
+            "cosine_similarity": merge_similarity,
+            "used_distillation": bool(use_distillation),
+            "pool_size_before": int(n),
+            "pool_size_after": int(n - 1),
+        }
         entry = {"l0_weight": new_l0w, "l0_bias": new_l0b, "l2_weight": new_l2w, "l2_bias": new_l2b,
                  "buffer": merged_buffer}
         keep = [self.pool[i] for i in range(n) if i not in (idx1, idx2)]
         keep.append(entry)
         self.pool = keep
 
-    def _distill(self, buffer1, buffer2, epochs=5, lr=1e-3, batch_size=128):
-        """Directly optimizes a candidate pool entry (v_l0_w, v_l0_b, v_l2_w,
-        v_l2_b) through the SAME composition _effective() actually uses --
-        base + candidate (classic_cka) or just candidate (weight_delta),
-        through the real ReLU -- instead of training a separate scaffold
-        network and subtracting a separately-computed base output. That
-        subtraction doesn't hold once there's a ReLU between two linear layers
-        (ReLU(a)+ReLU(c) != ReLU(a+c) in general), so this optimizes the
-        candidate exactly the way it will actually be used -- no approximation
-        from that source.
+    def _distill(self, buffer1, buffer2, feature_fn=None, init_entry1=None, init_entry2=None,
+                 epochs=5, lr=1e-3, batch_size=128):
+        """Distill two complete pool entries into one complete pool entry.
 
-        A different, unavoidable approximation remains: combining multiple
-        tasks' contributions in WEIGHT space (before the ReLU) still isn't the
-        same as combining their OUTPUT behavior -- that's inherent to
-        weight-space pooling with a nonlinear network, not something any one
-        merge step can fully remove.
+        Two details are important here:
+
+        1) The student is initialized from the arithmetic average of the two
+           parent entries, not from all-zero weights.  In weight_delta mode an
+           all-zero 2-layer ReLU network has h=0 and W2=0, so gradients to W2
+           and the first layer are exactly zero; only the final bias can learn.
+           Average initialization both avoids that dead network and makes
+           distillation a direct refinement of the baseline merge.
+
+        2) When feature_fn (the CURRENT shared encoder) is provided, raw
+           observations from the historical buffers are re-encoded now.  We do
+           not train on the stale `shared` features that were computed by older
+           versions of the encoder.  The stored teacher targets remain the old
+           policy outputs we want to preserve.
         """
-        logger.info(f"[HeadPool:{self.head_type}] distillation training (direct, through real composition)")
-        inputs = np.concatenate([buffer1["shared"], buffer2["shared"]], axis=0)
+        logger.info(f"[HeadPool:{self.head_type}] distillation training "
+                    f"(average init, current-encoder features)")
+
         raw_targets = np.concatenate([buffer1["targets"], buffer2["targets"]], axis=0)
-        target_slice = slice(0, self.act_dim) if self.head_type == "mean" else slice(self.act_dim, 2 * self.act_dim)
+        target_slice = (slice(0, self.act_dim) if self.head_type == "mean"
+                        else slice(self.act_dim, 2 * self.act_dim))
         head_targets = raw_targets[:, target_slice]
 
-        n = inputs.shape[0]
+        # Use the model's actual device rather than `cuda if available`; this
+        # also works when CUDA exists but the run was explicitly forced to CPU.
+        device = self.base_l0_weight.device
+
+        if feature_fn is not None and "obs" in buffer1 and "obs" in buffer2:
+            raw_obs = np.concatenate([buffer1["obs"], buffer2["obs"]], axis=0)
+            # Re-encode in chunks so a late merge of two 50k-row buffers does
+            # not create an unnecessarily large temporary encoder activation.
+            encoded = []
+            encode_batch_size = 4096
+            with torch.no_grad():
+                for start in range(0, raw_obs.shape[0], encode_batch_size):
+                    obs_t = torch.as_tensor(
+                        raw_obs[start:start + encode_batch_size],
+                        dtype=torch.float32, device=device,
+                    )
+                    encoded.append(feature_fn(obs_t).detach())
+            inputs_t = torch.cat(encoded, dim=0)
+        else:
+            # Backward-compatible fallback for old checkpoints that may not
+            # contain raw observations.
+            inputs = np.concatenate([buffer1["shared"], buffer2["shared"]], axis=0)
+            inputs_t = torch.as_tensor(inputs, dtype=torch.float32, device=device)
+
+        targets_t = torch.as_tensor(head_targets, dtype=torch.float32, device=device)
+
+        n = inputs_t.shape[0]
         perm = np.random.permutation(n)
         n_test = int(n * self.distill_test_frac) if self.distill_test_frac > 0 else 0
         test_idx, train_idx = perm[:n_test], perm[n_test:]
         if len(train_idx) == 0:
             train_idx, test_idx = perm, np.array([], dtype=int)
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        inputs_t = torch.tensor(inputs, dtype=torch.float32).to(device)
-        targets_t = torch.tensor(head_targets, dtype=torch.float32).to(device)
+        base_l0_w = self.base_l0_weight.detach()
+        base_l0_b = self.base_l0_bias.detach()
+        base_l2_w = self.base_l2_weight.detach()
+        base_l2_b = self.base_l2_bias.detach()
 
-        base_l0_w = self.base_l0_weight.detach().to(device)
-        base_l0_b = self.base_l0_bias.detach().to(device)
-        base_l2_w = self.base_l2_weight.detach().to(device)
-        base_l2_b = self.base_l2_bias.detach().to(device)
+        # Start exactly from the baseline arithmetic merge in the real merge
+        # path.  For classic_cka these are averaged DELTAS; for weight_delta
+        # these are averaged full reconstructed head weights.  The fallback to
+        # current own_* keeps old direct unit tests of _distill() working, but
+        # merge() always supplies both parent entries.
+        if init_entry1 is not None and init_entry2 is not None:
+            init_l0_w = (init_entry1["l0_weight"] + init_entry2["l0_weight"]) / 2
+            init_l0_b = (init_entry1["l0_bias"] + init_entry2["l0_bias"]) / 2
+            init_l2_w = (init_entry1["l2_weight"] + init_entry2["l2_weight"]) / 2
+            init_l2_b = (init_entry1["l2_bias"] + init_entry2["l2_bias"]) / 2
+        else:
+            init_l0_w, init_l0_b = self.own_l0_weight, self.own_l0_bias
+            init_l2_w, init_l2_b = self.own_l2_weight, self.own_l2_bias
 
-        v_l0_w = torch.zeros_like(base_l0_w, requires_grad=True)
-        v_l0_b = torch.zeros_like(base_l0_b, requires_grad=True)
-        v_l2_w = torch.zeros_like(base_l2_w, requires_grad=True)
-        v_l2_b = torch.zeros_like(base_l2_b, requires_grad=True)
+        v_l0_w = init_l0_w.detach().clone().requires_grad_(True)
+        v_l0_b = init_l0_b.detach().clone().requires_grad_(True)
+        v_l2_w = init_l2_w.detach().clone().requires_grad_(True)
+        v_l2_b = init_l2_b.detach().clone().requires_grad_(True)
 
         def compute(batch_in):
             if self.fusion_mode == BASE_FUSION_MODE:
@@ -407,7 +478,7 @@ class HeadPool(nn.Module):
         train_inputs, train_targets = inputs_t[train_idx], targets_t[train_idx]
         n_train = train_inputs.shape[0]
         for _ in range(epochs):
-            perm_epoch = torch.randperm(n_train)
+            perm_epoch = torch.randperm(n_train, device=device)
             for start in range(0, n_train, batch_size):
                 idx = perm_epoch[start:start + batch_size]
                 preds = compute(train_inputs[idx])
