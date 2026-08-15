@@ -69,23 +69,30 @@ from tasks import get_task, get_task_name
 QUICK_TEST = False          
 
 SEED = 42
-POOL_SIZE = 5                
+POOL_SIZE = 7              
 LEARNING_STARTS = 5_000
 DISTILL_EXTRA_STEPS = 15_000
 NUM_EVAL_EPISODES = 10
 
-TASK_SEQUENCE = [0, 1, 2, 3, 4, 5, 6, 0, 1, 2, 3, 4, 5, 6, 0, 1, 2, 3, 4, 5]
-TOTAL_TIMESTEPS_PER_TASK = 150_000
+TASK_SEQUENCE = [0, 1, 2, 3, 4, 5, 6, 0, 1, 2, 3, 4, 5, 6, 0, 1]
+TOTAL_TIMESTEPS_PER_TASK = 130000                                
 
 SAVE_ROOT = "agents"
 RUNS_ROOT = "runs"
 PLOTS_ROOT = "plots_continual_benchmark"
 
 CONDITIONS = {
-    "Mode1_Baseline":     {"distillation": False, "fusion_mode": "classic_cka",  "tag": "Mode1_Baseline"},
-    "Mode2_DistillOnly":  {"distillation": True,  "fusion_mode": "classic_cka",  "tag": "Mode2_DistillOnly"},
-    "Mode3_WeightOnly":   {"distillation": False, "fusion_mode": "weight_delta", "tag": "Mode3_WeightOnly"},
-    "Mode4_OursCombined": {"distillation": True,  "fusion_mode": "weight_delta", "tag": "Mode4_OursCombined"},
+    "Mode1_Baseline":     {"use_alpha_mass": False, "distillation": False, 
+                           "fusion_mode": "classic_cka",  "tag": "Mode1_Baseline"},
+
+    "Mode2_DistillOnly":  {"use_alpha_mass": False, "distillation": True,  
+                           "fusion_mode": "classic_cka",  "tag": "Mode2_DistillOnly"},
+
+    "Mode3_WeightOnly":   {"use_alpha_mass": True, "distillation": False, 
+                           "fusion_mode": "weight_delta", "tag": "Mode3_WeightOnly"},
+
+    "Mode4_OursCombined": {"use_alpha_mass": True, "distillation": True,  
+                           "fusion_mode": "weight_delta", "tag": "Mode4_OursCombined"},
 }
 
 METRICS = {
@@ -137,6 +144,7 @@ def run_task_chain(condition_name, cfg):
                 f"--save-dir={position_save_dir}",
                 f"--fusion-mode={cfg['fusion_mode']}",
                 "--distillation" if cfg["distillation"] else "--no-distillation",
+                "--use-alpha-mass" if cfg["use_alpha_mass"] else "--no-use-alpha-mass",
             ]
             if prev_units:
                 cmd.append("--prev-units")
