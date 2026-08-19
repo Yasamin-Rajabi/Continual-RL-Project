@@ -18,7 +18,6 @@ from typing import Literal, Optional, Tuple
 from cka_rl import CkaRlAgent
 from shared_arch import shared
 from tasks import get_task
-from AdamGnT import AdamGnT
 from analysis_logging import effective_theta_vector, log_training_state, save_task_snapshot
 from stable_baselines3.common.buffers import ReplayBuffer
 
