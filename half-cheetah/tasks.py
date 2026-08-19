@@ -1,79 +1,88 @@
-import numpy as np
+"""Deterministic continual HalfCheetah task suites.
 
-from utils import MujocoMetaBenchmark, MujocoTaskSamplerEnv
+Two suites are provided:
+- halfcheetah_vel: target velocity changes across tasks.
+- halfcheetah_wind_vel: both target velocity and a hidden fixed wind change.
 
-# ==========================================================================
-# HalfCheetah-Vel continual setup: each "task" is a fixed target forward
-# velocity for the cheetah to run at (reward = -|actual_velocity -
-# target_velocity| - control_cost, from MujocoTaskSamplerEnv). Unlike
-# MetaWorld, there's no natural notion of a discrete "success" here -- see
-# the note at the bottom of this file.
-#
-# The task list is built ONCE, deterministically, from BENCHMARK_SEED, so
-# task_id -> target velocity is stable across every process/run (each task
-# is trained in its own subprocess -- this must NOT be re-randomized per
-# call, or task_id=3 would mean a different velocity every time it's used).
-# ==========================================================================
-BENCHMARK_SEED = 1
-MIN_VELOCITY = 0.0
-MAX_VELOCITY = 3.0
-NUM_TASKS = 7  # change this to however many distinct velocities you want
+All tasks share the same 17-D observation and 6-D continuous action spaces.
+"""
+from __future__ import annotations
 
-_benchmark = MujocoMetaBenchmark(
-    task_set="HalfCheetahVel",
-    seed=BENCHMARK_SEED,
-    num_train_tasks=NUM_TASKS,
-    min_velocity=MIN_VELOCITY,
-    max_velocity=MAX_VELOCITY,
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
+
+
+@dataclass(frozen=True)
+class HalfCheetahTask:
+    target_velocity: float
+    wind: Tuple[float, float] = (0.0, 0.0)
+
+    def label(self, suite: str) -> str:
+        if suite == "halfcheetah_vel":
+            return f"HC-Vel {self.target_velocity:g}m/s"
+        return (
+            f"HC-WindVel v={self.target_velocity:g}, "
+            f"wind=({self.wind[0]:g},{self.wind[1]:g})"
+        )
+
+
+# Eight distinct tasks is enough to force several merges with the recommended
+# pool_size=5, while keeping a 2-pass continual benchmark computationally sane.
+_VELOCITIES = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 1.25, 2.25)
+_WIND_PAIRS = (
+    (-2.5, 0.0),
+    (2.5, 0.0),
+    (0.0, -5.0),
+    (0.0, 5.0),
+    (-1.25, -2.5),
+    (1.25, 2.5),
+    (-2.5, 5.0),
+    (2.5, -5.0),
 )
-_tasks_list = _benchmark.train_tasks  # length == NUM_TASKS, fixed order (seeded)
 
-tasks = [t.env_name for t in _tasks_list]
+TASK_SUITES: Dict[str, List[HalfCheetahTask]] = {
+    "halfcheetah_vel": [HalfCheetahTask(v) for v in _VELOCITIES],
+    "halfcheetah_wind_vel": [
+        HalfCheetahTask(v, wind=w) for v, w in zip(_VELOCITIES, _WIND_PAIRS)
+    ],
+}
 
-
-def get_task_name(task_id):
-    return tasks[task_id]
-
-
-def get_target_velocity(task_id):
-    """Not part of the original tasks.py interface -- convenience accessor
-    if you want to print/log which velocity a task_id actually corresponds
-    to, e.g. in TASK_SEQUENCE docstrings or plot titles."""
-    return _tasks_list[task_id].target_velocity
+# Paper-style second pass through the same tasks to expose retention/relearning.
+DEFAULT_CONTINUAL_SEQUENCE = tuple(range(8)) + tuple(range(8))
 
 
-def get_task(task_id, render=False):
-    task = _tasks_list[task_id]
-    render_kwargs = {"render_mode": "human"} if render else None
-    # Restricting `tasks` to just this one task means sample_new_task()
-    # (called internally by __init__ with no arguments) has only one
-    # possible choice -- deterministically this exact velocity, every time.
-    env = MujocoTaskSamplerEnv(
-        classes={task.env_name: None},
-        tasks=[task],
-        seed=int(np.random.randint(0, 1024)),
-        render_kwargs=render_kwargs,
-    )
-    return env
+def available_task_suites():
+    return tuple(TASK_SUITES.keys())
+
+
+def get_task_name(task_id: int, task_suite: str = "halfcheetah_vel") -> str:
+    task = TASK_SUITES[task_suite][task_id]
+    return task.label(task_suite)
+
+
+def get_task_spec(task_id: int, task_suite: str = "halfcheetah_vel") -> HalfCheetahTask:
+    return TASK_SUITES[task_suite][task_id]
+
+
+def get_task(task_id: int, task_suite: str = "halfcheetah_vel", render: bool = False):
+    import gymnasium as gym
+    from halfcheetah_envs import HalfCheetahVelEnv, HalfCheetahWindVelEnv
+
+    task = get_task_spec(task_id, task_suite)
+    env_cls = HalfCheetahVelEnv if task_suite == "halfcheetah_vel" else HalfCheetahWindVelEnv
+    kwargs = {
+        "target_velocity": task.target_velocity,
+        "render_mode": "human" if render else None,
+    }
+    if task_suite == "halfcheetah_wind_vel":
+        kwargs["wind"] = task.wind
+    env = env_cls(**kwargs)
+    # Directly instantiating a MuJoCo class bypasses gym.make's TimeLimit.
+    return gym.wrappers.TimeLimit(env, max_episode_steps=1000)
 
 
 if __name__ == "__main__":
-    env = get_task(0, render=True)
-
-    for _ in range(200):
-        obs, _ = env.reset()
-        a = env.action_space.sample()
-        obs, reward, terminated, truncated, info = env.step(a)
-        if terminated:
-            break
-
-# ==========================================================================
-# NOTE on "success": HalfCheetah-Vel has no discrete success signal --
-# MujocoTaskSamplerEnv's info dict always includes "success": False
-# (unconditionally, never True). This means run_sac.py/run_continual_
-# benchmark.py's success-rate logging (charts/success, charts/test_success)
-# will still run without crashing (the key exists), but will always read
-# exactly 0 -- not "no data", just a constant zero line. episodic_return is
-# the metric that actually reflects performance for this environment; treat
-# any "success" plots for this setup as meaningless, not as "0% success".
-# ==========================================================================
+    for suite in available_task_suites():
+        print(suite)
+        for idx, task in enumerate(TASK_SUITES[suite]):
+            print(f"  {idx}: {task.label(suite)}")

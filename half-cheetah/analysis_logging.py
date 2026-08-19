@@ -65,6 +65,8 @@ def _head_pool_snapshot(pool, include_effective: bool):
         }),
         "pool": [],
         "last_merge_info": pool.last_merge_info,
+        "last_distill_train_kl": pool.last_distill_train_kl,
+        "last_distill_test_kl": pool.last_distill_test_kl,
         "last_distill_train_mse": pool.last_distill_train_mse,
         "last_distill_test_mse": pool.last_distill_test_mse,
     }
@@ -75,9 +77,11 @@ def _head_pool_snapshot(pool, include_effective: bool):
         if buf is not None:
             buffer_meta = {
                 "rows": int(buf["obs"].shape[0]) if "obs" in buf else None,
-                "obs_shape": tuple(buf["obs"].shape) if "obs" in buf else None,
-                "shared_shape": tuple(buf["shared"].shape) if "shared" in buf else None,
-                "targets_shape": tuple(buf["targets"].shape) if "targets" in buf else None,
+                "arrays": {
+                    key: {"shape": tuple(value.shape), "dtype": str(value.dtype)}
+                    for key, value in buf.items()
+                    if hasattr(value, "shape")
+                },
             }
         result["pool"].append({
             **_tensor_dict_cpu({k: entry[k] for k in _HEAD_KEYS}),
@@ -144,11 +148,16 @@ def save_task_snapshot(
             "phase": phase,
             "global_step": int(global_step),
             "task_id": int(args.task_id),
+            "task_suite": str(args.task_suite),
             "seed": int(args.seed),
             "tag": str(args.tag),
             "fusion_mode": str(args.fusion_mode),
             "distillation": bool(args.distillation),
             "pool_size": int(args.pool_size),
+            "similarity_samples": int(args.similarity_samples),
+            "distill_extra_steps": int(args.distill_extra_steps),
+            "distill_max_samples": int(args.distill_max_samples),
+            "distill_epochs": int(args.distill_epochs),
         },
         "actor": {
             "encoder": _cpu_state_dict(actor_model.fc),
