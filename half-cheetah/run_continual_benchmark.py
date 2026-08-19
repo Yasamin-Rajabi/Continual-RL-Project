@@ -93,11 +93,13 @@ CONDITIONS = {
 }
 
 METRICS = {
-    "losses/actor_loss":       ("Actor Loss", "actor_loss"),
-    "losses/qf_loss":          ("Critic Loss", "critic_loss"),
-    "charts/episodic_return":  ("Episodic Return", "reward"),
-    "charts/success":          ("Success Rate", "success"),
-    "charts/test_success":     ("Evaluation Success", "eval_success"),
+    "losses/actor_loss":        ("Actor Loss", "actor_loss"),
+    "losses/qf_loss":           ("Critic Loss", "critic_loss"),
+    "charts/episodic_return":   ("Episodic Return", "reward"),
+    "charts/success":           ("Success Rate", "success"),
+    "charts/test_success":      ("Evaluation Success", "eval_success"),
+    "charts/velocity_error":       ("Velocity Tracking Error", "velocity_error"),
+    "charts/test_velocity_error":  ("Evaluation Velocity Error", "eval_velocity_error"),
 }
 ROLLING_WINDOW = 25
 

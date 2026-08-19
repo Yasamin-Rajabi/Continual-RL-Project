@@ -60,7 +60,7 @@ def plot_during_training(seq_idx, task_id, task_name, *,
                 print(f"  (no data for {cond_name} / {scalar_tag} / seq{seq_idx} task {task_id})")
                 continue
             plotted_anything = True
-            if "reward" in fname or "success" in fname:
+            if "reward" in fname or "success" in fname or "velocity_error" in fname:
                 smoothed = rolling_mean(values, rolling_window)
                 smoothed_steps = steps[: len(smoothed)] if len(smoothed) == len(steps) \
                     else steps[len(steps) - len(smoothed):]

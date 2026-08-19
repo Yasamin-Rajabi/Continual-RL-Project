@@ -202,6 +202,8 @@ def eval_agent(agent, test_env, num_evals, global_step, writer, device):
     obs, _ = test_env.reset()
     avg_ep_ret = 0
     avg_success = 0
+    avg_velocity_error = 0.0
+    velocity_error_steps = 0
     ep_ret = 0
     for _ in range(num_evals):
         while True:
@@ -216,9 +218,12 @@ def eval_agent(agent, test_env, num_evals, global_step, writer, device):
             )
 
             ep_ret += reward
+            if "x_velocity" in info and "target_velocity" in info:
+                avg_velocity_error += abs(info["x_velocity"] - info["target_velocity"])
+                velocity_error_steps += 1
 
             if termination or truncation:
-                avg_success += info["success"]
+                avg_success += info.get("success", 0)
                 avg_ep_ret += ep_ret
                 # resets
                 obs, _ = test_env.reset()
@@ -229,6 +234,10 @@ def eval_agent(agent, test_env, num_evals, global_step, writer, device):
     print(f"\nTEST: ep_ret={avg_ep_ret}, success={avg_success}\n")
     writer.add_scalar("charts/test_episodic_return", avg_ep_ret, global_step)
     writer.add_scalar("charts/test_success", avg_success, global_step)
+    if velocity_error_steps > 0:
+        avg_velocity_error /= velocity_error_steps
+        print(f"TEST: avg_velocity_error={avg_velocity_error}\n")
+        writer.add_scalar("charts/test_velocity_error", avg_velocity_error, global_step)
 
 
 if __name__ == "__main__":
@@ -376,6 +385,9 @@ if __name__ == "__main__":
                 )
                 if "success" in final_info:
                     writer.add_scalar("charts/success", final_info["success"][idx], global_step)
+                if "x_velocity" in final_info and "target_velocity" in final_info:
+                    velocity_error = abs(final_info["x_velocity"][idx] - final_info["target_velocity"][idx])
+                    writer.add_scalar("charts/velocity_error", velocity_error, global_step)
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_obs`
         real_next_obs = next_obs.copy()
