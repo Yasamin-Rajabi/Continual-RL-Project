@@ -65,6 +65,7 @@ class Args:
     distillation: bool = True
     use_alpha_mass: bool = False
     use_alpha_scale: bool = False
+    train_shared: bool = False
 
     # Every condition stores rollout states because behavioral KL needs a
     # reference state distribution even when distillation is disabled.
@@ -366,6 +367,7 @@ if __name__ == "__main__":
         distill_epochs=args.distill_epochs,
         distill_lr=args.distill_lr,
         distill_batch_size=args.distill_batch_size,
+        train_shared=args.train_shared,
     )
 
     actor = Actor(envs, model).to(device)

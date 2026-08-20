@@ -58,6 +58,7 @@ class CkaRlAgent(nn.Module):
         similarity_samples=2048,
         hidden_dim=128,
         shared_dim=256,
+        train_shared=False,
     ):
         super().__init__()
         self.obs_dim = int(obs_dim)
@@ -73,6 +74,7 @@ class CkaRlAgent(nn.Module):
         self.distill_batch_size = int(distill_batch_size)
         self.distill_max_samples = int(distill_max_samples)
         self.similarity_samples = int(similarity_samples)
+        self.train_shared = bool(train_shared)
         self.last_merge_info = None
         self.last_distill_metrics = {}
 
@@ -109,20 +111,32 @@ class CkaRlAgent(nn.Module):
         if use_alpha_mass:
             logger.info(f"shared alpha_mass: {self.alpha_mass}")
 
-        # The paper freezes theta_base while learning later tasks. The previous
-        # implementation accidentally kept training the shared encoder, which
-        # made every historical pool entry drift in function space.
+        # train_shared=False (default): the shared encoder is frozen after the
+        # root task, exactly like theta_base in the pool heads -- later tasks
+        # reuse the SAME encoder learned on task 1, never updating it further.
+        # train_shared=True: the encoder is never frozen. Every task keeps
+        # training it, starting from whatever the previous task left it at
+        # (loaded from latest_dir, NOT re-initialized from scratch) -- i.e.
+        # the encoder itself is carried forward and fine-tuned continually.
+        #
+        # NOTE: earlier in this project we tracked a `fuse_shared` flag that
+        # kept the shared encoder OUTSIDE the theta_base/knowledge-vector
+        # formula entirely (fuse_shared=False), implying it was meant to keep
+        # training continually, not freeze. So train_shared=True is closer to
+        # that original behavior; train_shared=False (current default) is a
+        # deliberate later change, not a literal reading of the paper.
         if encoder_from_base and base_dir is not None:
             logger.info(f"Loading encoder from base {base_dir}")
             self.fc = _torch_load(f"{base_dir}/fc.pt", map_location="cpu")
         elif latest_dir is not None:
-            logger.info(f"Loading frozen shared encoder from {latest_dir}")
+            logger.info(f"Loading shared encoder from {latest_dir}")
             self.fc = _torch_load(f"{latest_dir}/fc.pt", map_location="cpu")
         else:
             logger.info("Training root shared encoder from scratch")
             self.fc = shared(input_dim=obs_dim)
 
-        if latest_dir is not None:
+        if latest_dir is not None and not self.train_shared:
+            logger.info("Shared encoder frozen (train_shared=False)")
             self.fc.requires_grad_(False)
 
     def _assert_pool_alignment(self):
