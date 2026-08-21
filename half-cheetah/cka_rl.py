@@ -58,7 +58,7 @@ class CkaRlAgent(nn.Module):
         similarity_samples=2048,
         hidden_dim=128,
         shared_dim=256,
-        train_shared=False,
+        train_shared=True,
     ):
         super().__init__()
         self.obs_dim = int(obs_dim)

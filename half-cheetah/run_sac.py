@@ -65,7 +65,7 @@ class Args:
     distillation: bool = True
     use_alpha_mass: bool = False
     use_alpha_scale: bool = False
-    train_shared: bool = False
+    train_shared: bool = True
 
     # Every condition stores rollout states because behavioral KL needs a
     # reference state distribution even when distillation is disabled.

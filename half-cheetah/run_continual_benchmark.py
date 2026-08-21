@@ -109,6 +109,12 @@ def parse_args():
     )
     p.add_argument("--force-retrain", action="store_true")
     p.add_argument("--cpu", action="store_true")
+    p.add_argument(
+        "--condition-index", type=int, default=0, choices=[0, 1, 2, 3, 4],
+        help="0 = run all 4 CONDITIONS. 1-4 = run only that one condition, "
+             "by position in CONDITIONS' insertion order "
+             "(1=baseline, 2=distil_only, 3=weight_only, 4=combined).",
+    )
     p.add_argument("--quick-test", action="store_true")
     args = p.parse_args()
 
@@ -236,11 +242,17 @@ def main():
     print(f"Evaluation device: {device}")
     print(f"Sequence: {args.task_sequence}")
 
-    conditions = list(CONDITIONS.keys())
+    all_condition_names = list(CONDITIONS.keys())
+    if args.condition_index == 0:
+        conditions = all_condition_names
+    else:
+        conditions = [all_condition_names[args.condition_index - 1]]
+    selected_conditions = {name: CONDITIONS[name] for name in conditions}
+    print(f"Conditions: {conditions}")
 
     for suite in args.task_suites:
         print(f"\n================ {suite} ================")
-        for condition, cfg in CONDITIONS.items():
+        for condition, cfg in selected_conditions.items():
             for seed in args.seeds:
                 train_chain(args, suite, condition, cfg, seed)
 
