@@ -108,6 +108,7 @@ def parse_args():
         help="Must match the seeds scratch_baselines.py was run with.",
     )
     p.add_argument("--force-retrain", action="store_true")
+    p.add_argument("--train-shared", action="store_true")
     p.add_argument("--cpu", action="store_true")
     p.add_argument(
         "--condition-index", type=int, default=0, choices=[0, 1, 2, 3, 4],
@@ -206,6 +207,7 @@ def train_chain(args, suite, condition, cfg, seed):
             f"--fusion-mode={cfg['fusion_mode']}",
             "--no-use-alpha-scale",
             "--distillation" if cfg["distillation"] else "--no-distillation",
+            "--train-shared" if args.train_shared else "--no-train-shared",
             "--use-alpha-mass" if cfg["use_alpha_mass"] else "--no-use-alpha-mass",
         ]
         if args.cpu:
