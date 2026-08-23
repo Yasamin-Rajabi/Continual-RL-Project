@@ -92,6 +92,7 @@ def run_chain(fusion_mode, distillation, use_alpha_mass):
         distill_max_samples=128,
         distill_epochs=2,
         distill_batch_size=32,
+        train_shared=False,
     )
     assert pool_lens(m1) == (1, 1)
     assert m1.mean_pool.alpha is m1.logstd_pool.alpha
@@ -120,6 +121,7 @@ def run_chain(fusion_mode, distillation, use_alpha_mass):
         distill_epochs=2,
         distill_batch_size=32,
         distill_test_frac=0.25,
+        train_shared=False,
     )
     assert pool_lens(m2) == (2, 2)
     train_a_bit(m2)
@@ -142,7 +144,12 @@ def run_chain(fusion_mode, distillation, use_alpha_mass):
     assert info is not None
     assert 0 <= info["idx1"] < 3 and 0 <= info["idx2"] < 3
     assert info["idx1"] != info["idx2"]
-    assert np.isfinite(info["symmetric_kl"])
+    if distillation:
+        assert info["similarity_metric"] == "symmetric_kl"
+        assert np.isfinite(info["symmetric_kl"])
+    else:
+        assert info["similarity_metric"] == "cosine"
+        assert np.isfinite(info["cosine_similarity"])
     assert info["pool_size_before"] == 3 and info["pool_size_after"] == 2
     assert m2.mean_pool.last_merge_info["idx1"] == m2.logstd_pool.last_merge_info["idx1"]
     assert m2.mean_pool.last_merge_info["idx2"] == m2.logstd_pool.last_merge_info["idx2"]
@@ -153,10 +160,11 @@ def run_chain(fusion_mode, distillation, use_alpha_mass):
         assert np.isfinite(metrics["policy/distill_test_kl"])
     else:
         assert m2.get_distill_metrics() == {}
-    print(
-        f"  aligned behavioral merge OK: pair=({info['idx1']},{info['idx2']}), "
-        f"SKL={info['symmetric_kl']:.6g}"
-    )
+    if distillation:
+        detail = f"SKL={info['symmetric_kl']:.6g}"
+    else:
+        detail = f"cosine={info['cosine_similarity']:.6g}"
+    print(f"  aligned merge OK: pair=({info['idx1']},{info['idx2']}), {detail}")
 
     d2 = f"{root}/task2"
     m2.save(d2)
@@ -167,6 +175,7 @@ def run_chain(fusion_mode, distillation, use_alpha_mass):
         fusion_mode=fusion_mode,
         use_alpha_mass=use_alpha_mass,
         encoder_from_base=True,
+        train_shared=False,
     )
     assert pool_lens(m3) == (2, 2)
     assert m3.alpha.numel() == 2
@@ -183,7 +192,7 @@ def check_behavioral_pair_not_weight_cosine():
     m = CkaRlAgent(
         OBS_DIM, ACT_DIM, None, None,
         pool_size=3,
-        distillation=False,
+        distillation=True,
         fusion_mode="classic_cka",
         similarity_samples=96,
     )

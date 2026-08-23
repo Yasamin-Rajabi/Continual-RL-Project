@@ -7,11 +7,10 @@ The four experimental cases intentionally differ only along two method axes:
     weight_only   = weight-delta vectors + alpha-mass + arithmetic merge
     combined      = weight-delta vectors + alpha-mass + KL distillation merge
 
-All four cases use the SAME output-space merge-pair selector: the pair with the
-lowest symmetric KL between their full Gaussian policy outputs (mean + log-std)
-on a balanced subset of states stored in the knowledge pool. This keeps the
-pair-selection rule controlled while isolating what the four cases are meant to
-compare.
+Merge-pair selection follows the intended method for each condition:
+- baseline and weight_only select the highest-cosine pair in stored parameter space;
+- distil_only and combined select the lowest symmetric KL pair between full
+  Gaussian policy outputs on balanced stored states.
 
 This file only ORCHESTRATES: it defines the experiment config (CONDITIONS,
 argparse), runs training (train_chain, one subprocess call to run_sac.py per

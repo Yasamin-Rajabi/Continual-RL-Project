@@ -45,6 +45,9 @@ TRAIN_METRICS = {
 }
 
 SEQUENCE_METRICS = {
+    "analysis/merge/cosine_similarity": ("Selected merge-pair cosine similarity", "merge_selected_cosine"),
+    "analysis/merge/pairwise_cosine_mean": ("Mean pairwise cosine similarity in pool", "merge_pool_mean_cosine"),
+    "analysis/merge/pairwise_cosine_max": ("Maximum pairwise cosine similarity in pool", "merge_pool_max_cosine"),
     "analysis/merge/symmetric_kl": ("Selected merge-pair symmetric KL", "merge_selected_skl"),
     "analysis/merge/pairwise_kl_mean": ("Mean pairwise symmetric KL in pool", "merge_pool_mean_skl"),
     "analysis/merge/pairwise_kl_max": ("Maximum pairwise symmetric KL in pool", "merge_pool_max_skl"),

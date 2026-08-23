@@ -562,13 +562,22 @@ if __name__ == "__main__":
 
         merge_info = actor.model.get_merge_info()
         if merge_info is not None:
-            writer.add_scalar("analysis/merge/symmetric_kl", merge_info["symmetric_kl"], global_step)
-            writer.add_scalar("analysis/merge/pairwise_kl_min", merge_info["pairwise_kl_min"], global_step)
-            writer.add_scalar("analysis/merge/pairwise_kl_mean", merge_info["pairwise_kl_mean"], global_step)
-            writer.add_scalar("analysis/merge/pairwise_kl_max", merge_info["pairwise_kl_max"], global_step)
+            if merge_info["similarity_metric"] == "symmetric_kl":
+                writer.add_scalar("analysis/merge/symmetric_kl", merge_info["symmetric_kl"], global_step)
+                writer.add_scalar("analysis/merge/pairwise_kl_min", merge_info["pairwise_kl_min"], global_step)
+                writer.add_scalar("analysis/merge/pairwise_kl_mean", merge_info["pairwise_kl_mean"], global_step)
+                writer.add_scalar("analysis/merge/pairwise_kl_max", merge_info["pairwise_kl_max"], global_step)
+            elif merge_info["similarity_metric"] == "cosine":
+                writer.add_scalar("analysis/merge/cosine_similarity", merge_info["cosine_similarity"], global_step)
+                writer.add_scalar("analysis/merge/pairwise_cosine_min", merge_info["pairwise_cosine_min"], global_step)
+                writer.add_scalar("analysis/merge/pairwise_cosine_mean", merge_info["pairwise_cosine_mean"], global_step)
+                writer.add_scalar("analysis/merge/pairwise_cosine_max", merge_info["pairwise_cosine_max"], global_step)
+            else:
+                raise RuntimeError(f"unknown merge similarity metric: {merge_info['similarity_metric']}")
             writer.add_scalar("analysis/merge/idx1", merge_info["idx1"], global_step)
             writer.add_scalar("analysis/merge/idx2", merge_info["idx2"], global_step)
-            writer.add_scalar("analysis/merge/similarity_states", merge_info["similarity_states"], global_step)
+            if "similarity_states" in merge_info:
+                writer.add_scalar("analysis/merge/similarity_states", merge_info["similarity_states"], global_step)
             writer.add_scalar("analysis/merge/used_distillation", float(merge_info["used_distillation"]), global_step)
             writer.add_scalar("analysis/merge/pool_size_before", merge_info["pool_size_before"], global_step)
             writer.add_scalar("analysis/merge/pool_size_after", merge_info["pool_size_after"], global_step)

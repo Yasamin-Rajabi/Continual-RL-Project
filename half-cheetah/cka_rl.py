@@ -230,6 +230,62 @@ class CkaRlAgent(nn.Module):
         raw_logstd = self.logstd_pool.forward_entry(z, index)
         return mean, raw_logstd
 
+    def _select_cosine_pair(self):
+        """Select the most similar aligned pool pair in parameter space.
+
+        This is the CKA-style selector used by the non-distillation conditions.
+        A pool slot is a whole policy knowledge item, so mean and log-std
+        parameters are concatenated and one pair is selected jointly for both
+        heads.  We compare the STORED representation itself: classic_cka slots
+        are task increments v_k; weight_delta slots are the reconstructed weights
+        stored by that mode.
+        """
+        n = self.mean_pool.pool_length()
+        if n < 2:
+            raise RuntimeError("cannot select a merge pair from fewer than two pool entries")
+
+        vectors = []
+        for index in range(n):
+            chunks = []
+            for pool in (self.mean_pool, self.logstd_pool):
+                entry = pool.pool[index]
+                chunks.extend(entry[key].reshape(-1) for key in _HEAD_KEYS)
+            vectors.append(torch.cat(chunks, dim=0))
+
+        device = vectors[0].device
+        matrix = torch.full((n, n), -float("inf"), device=device)
+        finite_values = []
+        with torch.no_grad():
+            for i in range(n):
+                for j in range(i + 1, n):
+                    score = F.cosine_similarity(vectors[i], vectors[j], dim=0)
+                    score = torch.nan_to_num(score, nan=-float("inf"))
+                    matrix[i, j] = score
+                    matrix[j, i] = score
+                    if torch.isfinite(score):
+                        finite_values.append(float(score.item()))
+
+            flat_idx = int(torch.argmax(matrix).item())
+            idx1, idx2 = divmod(flat_idx, n)
+            if idx1 == idx2 or not torch.isfinite(matrix[idx1, idx2]):
+                raise RuntimeError("cosine pair selection failed: no finite pairwise similarity")
+            selected = float(matrix[idx1, idx2].item())
+
+        stats = {
+            "idx1": int(idx1),
+            "idx2": int(idx2),
+            "similarity_metric": "cosine",
+            "cosine_similarity": selected,
+            "pairwise_cosine_min": float(np.min(finite_values)),
+            "pairwise_cosine_mean": float(np.mean(finite_values)),
+            "pairwise_cosine_max": float(np.max(finite_values)),
+            "pairwise_cosine_similarity": matrix.detach().cpu().numpy().tolist(),
+        }
+        logger.info(
+            f"[cosine merge] pair=({idx1},{idx2}) cosine={selected:.6f}"
+        )
+        return idx1, idx2, stats
+
     def _select_behavioral_pair(self):
         n = self.mean_pool.pool_length()
         if n < 2:
@@ -278,6 +334,7 @@ class CkaRlAgent(nn.Module):
         stats = {
             "idx1": int(idx1),
             "idx2": int(idx2),
+            "similarity_metric": "symmetric_kl",
             "symmetric_kl": selected,
             "pairwise_kl_min": float(np.min(finite_values)),
             "pairwise_kl_mean": float(np.mean(finite_values)),
@@ -439,7 +496,11 @@ class CkaRlAgent(nn.Module):
         if not self.mean_pool.needs_merge():
             return
 
-        idx1, idx2, merge_info = self._select_behavioral_pair()
+        if self.distillation:
+            idx1, idx2, merge_info = self._select_behavioral_pair()
+        else:
+            idx1, idx2, merge_info = self._select_cosine_pair()
+
         if self.distillation:
             mean_params, log_params, distill_metrics = self._distill_pair(idx1, idx2)
             self.last_distill_metrics = distill_metrics
