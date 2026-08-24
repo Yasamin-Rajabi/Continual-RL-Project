@@ -65,19 +65,53 @@ _WIND_PAIRS = (
 )
 
 # --------------------------------------------------------------------------
-# ANT TARGETS -- PROVISIONAL. CALIBRATE BEFORE THE FIRST REAL RUN.
+# ANT TARGETS
 #
-# Ant is much slower than HalfCheetah (which reaches ~5-8 m/s under SAC).
-# Reusing the HalfCheetah targets would put the fast tasks out of reach, so
-# several of them would collapse onto one behaviour and stop being distinct
-# tasks at all. The numbers below assume v_max ~ 3.3 m/s; measure your own
-# (ant_envs.measure_reachable_velocity docstring) and rescale as
-# {0.15, 0.3, 0.45, 0.6, 0.75, 0.9, 0.375, 0.675} * v_max.
+# Ant is much slower than HalfCheetah (which reaches ~5-8 m/s under SAC), so
+# targets are defined as FRACTIONS of the velocity Ant can actually reach, not
+# as absolute numbers copied across robots. Copying HalfCheetah's absolute
+# targets would put the fast tasks out of reach, several of them would collapse
+# onto the single behaviour "run flat out", and they would stop being distinct
+# tasks at all.
+#
+# CALIBRATE _ANT_V_MAX BEFORE THE FIRST REAL RUN:
+#     bash run_kaggle.sh calibrate ant
+# (or: python3 calibrate_ant.py). It trains plain forward-reward SAC on Ant and
+# prints the value to paste here.
+#
+# WHY THE RANGE GOES UP TO 1.1x AND DOWN TO 0.1x
+# The spread across tasks is what makes methods distinguishable. Two of the
+# paper's claims -- weight_delta vs classic_cka, and a task-agnostic shared
+# encoder vs one fit to task 0 -- both predict effects that GROW with the shift
+# between consecutive tasks. A narrow band of similar velocities would show all
+# methods performing the same and measure nothing. So the band deliberately
+# spans from a near-crawl to slightly past the calibrated ceiling.
+#
+# The 1.1x task is intentionally at or just past what SAC reached during
+# calibration; that is where methods separate. But watch for the floor effect:
+# if EVERY method scores ~0 on task 5, it is measuring "impossible" rather than
+# "hard" -- drop the top fraction to 1.0 and re-run. Check this on the first
+# seed before spending the rest of the budget.
 # --------------------------------------------------------------------------
-_ANT_VELOCITIES = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 1.25, 2.25)
-_ANT_SUCCESS_TOLERANCE = 0.1          # HalfCheetah uses 0.2; scale with v_max
+_ANT_V_MAX = 3.3                      # PROVISIONAL -- replace with your calibration
+
+# Indices 0-5 are the continual sequence; 6-7 are intermediates that only enter
+# the pool, mirroring how _VELOCITIES is structured for HalfCheetah.
+_ANT_VELOCITY_FRACTIONS = (0.10, 0.30, 0.50, 0.70, 0.90, 1.10, 0.40, 0.80)
+_ANT_VELOCITIES = tuple(round(f * _ANT_V_MAX, 3) for f in _ANT_VELOCITY_FRACTIONS)
+
+# HalfCheetah uses a fixed 0.2 over a 0.5-3.0 target band, i.e. ~8% of the band.
+# Keeping the same relative tolerance means "success" is equally strict on both
+# robots, which is what makes the success-rate-based metrics comparable across
+# suites. An absolute 0.2 on Ant would be a much harsher criterion.
+_ANT_SUCCESS_TOLERANCE = round(0.08 * _ANT_V_MAX, 3)
+
 # Ant is lighter than HalfCheetah, so the same force is a much larger
-# perturbation. These are ~40% of the HalfCheetah magnitudes.
+# perturbation; these are ~40% of the HalfCheetah magnitudes. Wind is kept as a
+# SECONDARY axis: unlike target velocity, the wind vector is handed to the
+# policy through the observation and mainly induces a conditional correction
+# rather than a genuinely different gait. Widen the velocity band first if you
+# need more separation between methods; only then touch these.
 _ANT_WIND_PAIRS = (
     (-1.0, 0.0),
     (1.0, 0.0),
@@ -89,6 +123,12 @@ _ANT_WIND_PAIRS = (
     (1.0, -2.0),
 )
 
+# Single throwaway task used only by calibrate_ant.py. With a target this far
+# above anything Ant can do, reward = -|v - 1000| - ctrl_cost reduces to
+# v - 1000 - ctrl_cost, i.e. plain forward-reward SAC -- so calibration needs no
+# new training code, just this task and the existing run_sac.py.
+_ANT_CALIBRATION_VELOCITY = 1000.0
+
 TASK_SUITES: Dict[str, List[HalfCheetahTask]] = {
     "halfcheetah_vel": [HalfCheetahTask(v) for v in _VELOCITIES],
     "halfcheetah_wind_vel": [
@@ -98,6 +138,7 @@ TASK_SUITES: Dict[str, List[HalfCheetahTask]] = {
     "ant_wind_vel": [
         HalfCheetahTask(v, wind=w) for v, w in zip(_ANT_VELOCITIES, _ANT_WIND_PAIRS)
     ],
+    "ant_calibrate": [HalfCheetahTask(_ANT_CALIBRATION_VELOCITY)],
 }
 
 # Paper-style second pass through the same tasks to expose retention/relearning.

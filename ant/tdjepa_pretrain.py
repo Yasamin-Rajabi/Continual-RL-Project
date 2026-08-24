@@ -388,6 +388,30 @@ def main():
             f"pretrain and heldout velocities overlap: {sorted(overlap)} -- the "
             "held-out number would be meaningless."
         )
+
+    # Hard guard: a pretraining velocity that is also a benchmark task means the
+    # encoder saw an evaluation task during "unsupervised" pretraining. That
+    # silently invalidates the continual protocol AND inflates every downstream
+    # number, and nothing later in the pipeline would catch it. This is easy to
+    # trip when rescaling Ant velocities after calibration, since the benchmark
+    # targets move with _ANT_V_MAX.
+    from tasks import TASK_SUITES
+    if args.task_suite in TASK_SUITES:
+        benchmark_v = {t.target_velocity for t in TASK_SUITES[args.task_suite]}
+        leaked = sorted(set(args.pretrain_velocities) & benchmark_v)
+        if leaked:
+            raise SystemExit(
+                f"pretrain velocities {leaked} are BENCHMARK TASKS in suite "
+                f"'{args.task_suite}' ({sorted(benchmark_v)}). Pretraining must "
+                "only see held-out velocities -- pick values strictly between the "
+                "benchmark targets."
+            )
+        missing = sorted(set(args.heldout_velocities) - benchmark_v)
+        if missing:
+            print(f"NOTE: held-out velocities {missing} are not benchmark tasks. "
+                  "That is allowed, but the held-out TD error then measures "
+                  "generalisation to arbitrary velocities rather than to the "
+                  "tasks you actually evaluate on.")
     if args.relu_out:
         print("WARNING: --relu-out keeps non-negative features, on which the "
               "orthonormality regulariser cannot push inner products below zero. "
