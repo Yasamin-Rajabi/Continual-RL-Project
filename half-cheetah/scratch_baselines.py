@@ -19,15 +19,15 @@ by default (101, 102, 103 -- deliberately disjoint from the continual run's
 seeds 1/2/3, so nobody mistakes a baseline seed for a continual-run seed).
 
 Everything lands under --save-root (default scratch_models/) for
-checkpoints and under runs/scratch/... for TensorBoard logs (the "runs/"
-prefix is NOT configurable -- run_sac.py hardcodes it, see
-SummaryWriter(f"runs/{args.tag}/{run_name}") in run_sac.py).
+checkpoints and under --runs-root/scratch/... for TensorBoard logs.
 """
 from __future__ import annotations
 
 import argparse
 import pathlib
+import shutil
 import subprocess
+import sys
 
 from tasks import TASK_SUITES, get_task_name
 
@@ -60,6 +60,13 @@ def scratch_event_dir(runs_root, suite, task_id, total_timesteps, seed):
     )
 
 
+def scratch_analysis_dir(analysis_root, suite, task_id, total_timesteps, seed):
+    return (
+        pathlib.Path(analysis_root) / scratch_tag(suite, task_id, total_timesteps, seed)
+        / scratch_run_name(suite, task_id, seed)
+    )
+
+
 def checkpoint_complete(path):
     required = ["policy_snapshot.pt", "fc.pt", "mean_pool.pt", "logstd_pool.pt"]
     return path.exists() and all((path / name).exists() for name in required)
@@ -67,18 +74,29 @@ def checkpoint_complete(path):
 
 def train_one_baseline(suite, task_id, total_timesteps, seed, args):
     run_dir = scratch_checkpoint_dir(args.save_root, suite, task_id, total_timesteps, seed)
+    event_dir = scratch_event_dir(args.runs_root, suite, task_id, total_timesteps, seed)
+    analysis_dir = scratch_analysis_dir(args.analysis_root, suite, task_id, total_timesteps, seed)
     if checkpoint_complete(run_dir) and not args.force_retrain:
         print(f"[scratch] {suite}/task_{task_id}/seed_{seed} already complete: {run_dir}")
         return run_dir
 
+    # A forced retrain OR a retry after a partial checkpoint must start with
+    # clean TensorBoard/analysis directories. Otherwise EventAccumulator can
+    # silently combine scalars from multiple attempts and corrupt AUC/FWT.
+    for path in (run_dir, event_dir, analysis_dir):
+        if path.exists():
+            shutil.rmtree(path)
+
     cmd = [
-        "python3", "run_sac.py",
+        sys.executable, "run_sac.py",
         "--model-type=cka-rl",
         f"--task-suite={suite}",
         f"--task-id={task_id}",
+        "--seq-idx=0",
         f"--seed={seed}",
         f"--tag={scratch_tag(suite, task_id, total_timesteps, seed)}",
         f"--save-dir={run_dir.parent}",
+        f"--runs-root={args.runs_root}",
         f"--analysis-root={args.analysis_root}",
         f"--total-timesteps={total_timesteps}",
         f"--learning-starts={args.learning_starts}",
@@ -159,6 +177,7 @@ def parse_args():
     p.add_argument("--distill-test-frac", type=float, default=0.2)
     p.add_argument("--analysis-log-every", type=int, default=5_000)
     p.add_argument("--save-root", default=SCRATCH_SAVE_ROOT)
+    p.add_argument("--runs-root", default="runs")
     p.add_argument("--analysis-root", default="analysis_runs_scratch")
     p.add_argument("--force-retrain", action="store_true")
     p.add_argument("--cpu", action="store_true")

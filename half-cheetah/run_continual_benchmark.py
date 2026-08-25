@@ -35,6 +35,7 @@ import argparse
 import pathlib
 import shutil
 import subprocess
+import sys
 from collections import OrderedDict
 
 import torch
@@ -106,6 +107,10 @@ def parse_args():
         "--scratch-seeds", nargs="+", type=int, default=scratch_baselines.DEFAULT_SCRATCH_SEEDS,
         help="Must match the seeds scratch_baselines.py was run with.",
     )
+    p.add_argument(
+        "--scratch-save-root", default=scratch_baselines.SCRATCH_SAVE_ROOT,
+        help="Checkpoint root used by scratch_baselines.py.",
+    )
     p.add_argument("--force-retrain", action="store_true")
     p.add_argument("--train-shared", action="store_true")
     p.add_argument("--pretrained-encoder", default=None,
@@ -157,11 +162,13 @@ def train_chain(args, suite, condition, cfg, seed):
         save_parent = metrics.checkpoint_dir(args.save_root, suite, condition, seed, seq_idx, task_id).parent
         run_dir = metrics.checkpoint_dir(args.save_root, suite, condition, seed, seq_idx, task_id)
         tb_dir = metrics.event_dir(args.runs_root, suite, condition, seed, seq_idx, task_id)
+        analysis_dir = metrics.analysis_snapshot_path(
+            args.analysis_root, suite, condition, seed, seq_idx, task_id
+        ).parent
         if args.force_retrain:
-            if run_dir.exists():
-                shutil.rmtree(run_dir)
-            if tb_dir.exists():
-                shutil.rmtree(tb_dir)
+            for path in (run_dir, tb_dir, analysis_dir):
+                if path.exists():
+                    shutil.rmtree(path)
 
         if metrics.checkpoint_complete(run_dir):
             print(f"[{suite}/{condition}/seed={seed}] seq{seq_idx} already complete: {run_dir}")
@@ -173,20 +180,21 @@ def train_chain(args, suite, condition, cfg, seed):
 
         # Remove partial outputs before a retry, otherwise TensorBoard can mix
         # stale and fresh event files from two different attempts.
-        if run_dir.exists():
-            shutil.rmtree(run_dir)
-        if tb_dir.exists():
-            shutil.rmtree(tb_dir)
+        for path in (run_dir, tb_dir, analysis_dir):
+            if path.exists():
+                shutil.rmtree(path)
 
         tag = f"{suite}/{condition}/seed_{seed}/seq_{seq_idx}"
         cmd = [
-            "python3", "run_sac.py",
+            sys.executable, "run_sac.py",
             "--model-type=cka-rl",
             f"--task-suite={suite}",
             f"--task-id={task_id}",
+            f"--seq-idx={seq_idx}",
             f"--seed={seed}",
             f"--tag={tag}",
             f"--save-dir={save_parent}",
+            f"--runs-root={args.runs_root}",
             f"--analysis-root={args.analysis_root}",
             f"--total-timesteps={args.total_timesteps}",
             f"--learning-starts={args.learning_starts}",
@@ -281,12 +289,13 @@ def main():
             plots.write_summary_csv(args, suite, conditions, all_payloads)
 
         if not args.skip_survey_metrics:
+            used_task_ids = sorted(set(args.task_sequence))
             missing_baselines = [
-                task_id for task_id in range(len(TASK_SUITES[suite]))
+                task_id for task_id in used_task_ids
                 for seed in args.scratch_seeds
                 if not scratch_baselines.checkpoint_complete(
                     scratch_baselines.scratch_checkpoint_dir(
-                        scratch_baselines.SCRATCH_SAVE_ROOT, suite, task_id, args.total_timesteps, seed,
+                        args.scratch_save_root, suite, task_id, args.total_timesteps, seed,
                     )
                 )
             ]
@@ -294,8 +303,9 @@ def main():
                 print(
                     f"\n!!! Skipping survey metrics for {suite}: missing scratch baselines for "
                     f"task_id(s) {sorted(set(missing_baselines))}. Run:\n"
-                    f"    python3 scratch_baselines.py --task-suites {suite} "
-                    f"--total-timesteps {args.total_timesteps} --seeds {' '.join(map(str, args.scratch_seeds))}\n"
+                    f"    {sys.executable} scratch_baselines.py --task-suites {suite} "
+                    f"--total-timesteps {args.total_timesteps} --seeds {' '.join(map(str, args.scratch_seeds))} "
+                    f"--save-root {args.scratch_save_root} --runs-root {args.runs_root}\n"
                 )
             else:
                 survey_payloads = {condition: [] for condition in conditions}

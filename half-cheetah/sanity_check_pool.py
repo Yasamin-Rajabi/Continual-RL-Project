@@ -20,11 +20,14 @@ ACT_DIM = 3
 TMP_ROOT = "/tmp/cka_pool_sanity"
 
 
-def fake_buffer(n=128, task_id=0):
+def fake_buffer(n=128, task_id=0, source_id=None):
+    if source_id is None:
+        source_id = task_id
     return {
         "obs": np.random.randn(n, OBS_DIM).astype(np.float32),
         "actions": np.tanh(np.random.randn(n, ACT_DIM)).astype(np.float32),
         "task_ids": np.full(n, task_id, dtype=np.int32),
+        "source_ids": np.full(n, source_id, dtype=np.int32),
         "x_velocity": np.random.randn(n, 1).astype(np.float32),
         "velocity_error": np.abs(np.random.randn(n, 1)).astype(np.float32),
     }
@@ -92,7 +95,6 @@ def run_chain(fusion_mode, distillation, use_alpha_mass):
         distill_max_samples=128,
         distill_epochs=2,
         distill_batch_size=32,
-        train_shared=False,
     )
     assert pool_lens(m1) == (1, 1)
     assert m1.mean_pool.alpha is m1.logstd_pool.alpha
@@ -100,7 +102,7 @@ def run_chain(fusion_mode, distillation, use_alpha_mass):
     assert m1.alpha.numel() == 1
     assert not any(p.requires_grad for p in m1.fc.parameters()), "later-task encoder must be frozen"
     train_a_bit(m1)
-    m1.set_own_buffer(fake_buffer(task_id=1))
+    m1.set_own_buffer(fake_buffer(task_id=1, source_id=1))
     m1.finalize()
     assert pool_lens(m1) == (2, 2)
     assert m1.get_merge_info() is None
@@ -121,11 +123,10 @@ def run_chain(fusion_mode, distillation, use_alpha_mass):
         distill_epochs=2,
         distill_batch_size=32,
         distill_test_frac=0.25,
-        train_shared=False,
     )
     assert pool_lens(m2) == (2, 2)
     train_a_bit(m2)
-    m2.set_own_buffer(fake_buffer(task_id=2))
+    m2.set_own_buffer(fake_buffer(task_id=2, source_id=2))
     # Save exact pre-finalize policy and verify the compact inference snapshot.
     probe = torch.randn(8, OBS_DIM)
     with torch.no_grad():
@@ -151,6 +152,7 @@ def run_chain(fusion_mode, distillation, use_alpha_mass):
         assert info["similarity_metric"] == "cosine"
         assert np.isfinite(info["cosine_similarity"])
     assert info["pool_size_before"] == 3 and info["pool_size_after"] == 2
+    assert info["merged_source_lineage"], "source-occurrence lineage must be preserved"
     assert m2.mean_pool.last_merge_info["idx1"] == m2.logstd_pool.last_merge_info["idx1"]
     assert m2.mean_pool.last_merge_info["idx2"] == m2.logstd_pool.last_merge_info["idx2"]
     if distillation:
@@ -158,6 +160,10 @@ def run_chain(fusion_mode, distillation, use_alpha_mass):
         assert metrics["policy/distill_train_kl"] is not None
         assert metrics["policy/distill_test_kl"] is not None
         assert np.isfinite(metrics["policy/distill_test_kl"])
+        assert metrics["policy/distill_best_epoch"] >= 0
+        assert np.isfinite(metrics["policy/distill_best_val_kl"])
+        assert np.isfinite(metrics["policy/distill_train_kl_p95"])
+        assert np.isfinite(metrics["policy/distill_train_kl_max"])
     else:
         assert m2.get_distill_metrics() == {}
     if distillation:
@@ -175,7 +181,6 @@ def run_chain(fusion_mode, distillation, use_alpha_mass):
         fusion_mode=fusion_mode,
         use_alpha_mass=use_alpha_mass,
         encoder_from_base=True,
-        train_shared=False,
     )
     assert pool_lens(m3) == (2, 2)
     assert m3.alpha.numel() == 2
@@ -245,11 +250,48 @@ def check_alpha_mass_restriction():
         else:
             raise AssertionError("classic_cka must reject use_alpha_mass in both distillation settings")
     for distillation in (False, True):
-        CkaRlAgent(
+        model = CkaRlAgent(
             OBS_DIM, ACT_DIM, None, None,
             fusion_mode="weight_delta", distillation=distillation, use_alpha_mass=True,
         )
-    print("  alpha_mass cleanly restricted to weight_delta modes OK")
+        # The raw parameter is unconstrained, but the mass used by the policy
+        # must remain strictly positive even if optimization drives raw < 0.
+        if model.alpha_mass is not None:
+            with torch.no_grad():
+                model.alpha_mass.fill_(-10.0)
+            assert model.mean_pool.effective_alpha_mass().item() > 0.0
+    print("  alpha_mass restricted to weight_delta and effective mass stays positive OK")
+
+
+def check_trainable_encoder_loads_latest():
+    print("\n=== explicit trainable-encoder continuation check ===")
+    root = f"{TMP_ROOT}/encoder_latest_check"
+    shutil.rmtree(root, ignore_errors=True)
+    d0, d1 = f"{root}/task0", f"{root}/task1"
+    os.makedirs(root, exist_ok=True)
+
+    m0 = save_root(d0, "classic_cka", False, False)
+    m1 = CkaRlAgent(
+        OBS_DIM, ACT_DIM, d0, d0,
+        pool_size=2, distillation=False, fusion_mode="classic_cka",
+        encoder_from_base=True, train_shared=True,
+    )
+    with torch.no_grad():
+        first_param = next(m1.fc.parameters())
+        first_param.add_(0.12345)
+    m1.save(d1)
+
+    expected = next(m1.fc.parameters()).detach().clone()
+    m2 = CkaRlAgent(
+        OBS_DIM, ACT_DIM, d0, d1,
+        pool_size=2, distillation=False, fusion_mode="classic_cka",
+        encoder_from_base=True, train_shared=True,
+    )
+    got = next(m2.fc.parameters()).detach()
+    assert torch.allclose(got, expected), "train_shared=True must continue from latest encoder"
+    assert all(p.requires_grad for p in m2.fc.parameters())
+    shutil.rmtree(root, ignore_errors=True)
+    print("  train_shared=True loads latest encoder instead of resetting to root OK")
 
 
 def main():
@@ -263,6 +305,7 @@ def main():
     run_chain("weight_delta", True, True)    # combined
     check_behavioral_pair_not_weight_cosine()
     check_alpha_mass_restriction()
+    check_trainable_encoder_loads_latest()
 
     shutil.rmtree(TMP_ROOT, ignore_errors=True)
     print("\n*** ALL CHECKS PASSED ***")

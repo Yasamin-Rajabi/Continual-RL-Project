@@ -45,6 +45,10 @@ class Args:
     capture_video: bool = False
 
     task_id: int = 0
+    # Unique occurrence index within the continual sequence.  task_id can
+    # repeat; seq_idx is what lets buffer-lineage analysis distinguish those
+    # occurrences. Scratch/single-task runs can leave this at 0.
+    seq_idx: int = 0
     eval_every: int = 10_000
     num_evals: int = 5
     total_timesteps: int = 300_000
@@ -58,9 +62,13 @@ class Args:
     q_lr: float = 3e-4
     policy_frequency: int = 2
     target_network_frequency: int = 1
+    # Fixed SAC entropy coefficient when autotune=False.  With autotune=True
+    # the current code initializes log_alpha separately (see discussion in the
+    # project notes); this value is not used as the initial temperature.
     alpha: float = 0.2
     autotune: bool = True
     tag: str = "Debug"
+    runs_root: str = "runs"
 
     pool_size: int = 5
     encoder_from_base: bool = True
@@ -82,8 +90,9 @@ class Args:
     pretrained encoder was produced with, and changes the critic too, so baselines
     have to be re-run under the same value."""
 
-    # Every condition stores rollout states because behavioral KL needs a
-    # reference state distribution even when distillation is disabled.
+    # Every condition stores rollout states. Distillation-based modes require
+    # them for behavioral KL; keeping the same collection in cosine modes keeps
+    # the post-training interaction/logging budget aligned across conditions.
     distill_extra_steps: int = 10_000
     max_distill_buffer: int = 50_000
     similarity_samples: int = 2_048
@@ -271,7 +280,7 @@ def _replace_autoreset_observations(next_obs, terminations, truncations, infos):
     return real_next_obs
 
 
-def collect_merge_buffer(actor, envs, steps, task_id, device, seed):
+def collect_merge_buffer(actor, envs, steps, task_id, seq_idx, device, seed):
     """Collect raw on-policy states/actions for KL similarity and distillation."""
     obs_rows, action_rows, velocity_rows, error_rows = [], [], [], []
     obs, _ = envs.reset(seed=seed)
@@ -303,6 +312,10 @@ def collect_merge_buffer(actor, envs, steps, task_id, device, seed):
         "obs": np.concatenate(obs_rows, axis=0).astype(np.float32, copy=False),
         "actions": np.concatenate(action_rows, axis=0).astype(np.float32, copy=False),
         "task_ids": np.full(steps * envs.num_envs, int(task_id), dtype=np.int32),
+        # source_ids identify the UNIQUE occurrence that produced each row.
+        # This is deliberately separate from task_ids because the continual
+        # sequence revisits the same task IDs.
+        "source_ids": np.full(steps * envs.num_envs, int(seq_idx), dtype=np.int32),
         "x_velocity": np.concatenate(velocity_rows, axis=0),
         "velocity_error": np.concatenate(error_rows, axis=0),
     }
@@ -317,7 +330,7 @@ def _validate_args(args):
     if args.similarity_samples < 2:
         raise ValueError("similarity_samples must be >= 2")
     if args.distill_extra_steps < 1:
-        raise ValueError("distill_extra_steps must be >= 1 because behavioral KL needs stored states")
+        raise ValueError("distill_extra_steps must be >= 1 because merge buffers are collected in every condition")
     if args.max_distill_buffer < 2:
         raise ValueError("max_distill_buffer must be >= 2")
     if args.distill_max_samples < 2:
@@ -340,7 +353,7 @@ if __name__ == "__main__":
     task_name = get_task_name(args.task_id, args.task_suite)
     print(f"\n*** Run name: {run_name} | {task_name} ***\n")
 
-    writer = SummaryWriter(f"runs/{args.tag}/{run_name}")
+    writer = SummaryWriter(str(pathlib.Path(args.runs_root) / args.tag / run_name))
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n%s" % "\n".join(f"|{k}|{v}|" for k, v in vars(args).items()),
@@ -357,6 +370,10 @@ if __name__ == "__main__":
     # during evaluation was a real replay-buffer corruption bug in the old code.
     envs = make_vector_env(args.task_id, args.task_suite)
     eval_env = get_task(args.task_id, task_suite=args.task_suite)
+    # Box.sample() owns an RNG separate from NumPy's global RNG.  The first
+    # random_actions_end exploration actions come from this space, so seed it
+    # explicitly for reproducibility across identical seeds/modes.
+    envs.single_action_space.seed(args.seed)
     if not isinstance(envs.single_action_space, gym.spaces.Box):
         raise TypeError("SAC implementation supports continuous Box actions only")
 
@@ -564,11 +581,12 @@ if __name__ == "__main__":
         f"({args.total_timesteps / max(train_loop_seconds, 1e-9):.2f} steps/sec) ***"
     )
 
-    # Every four-way condition collects this buffer. It is needed for the new
-    # output-space KL selector even when merge distillation itself is disabled.
+    # Every four-way condition collects this buffer. Distillation-based modes
+    # need it for behavioral KL/distillation; cosine modes keep the same extra
+    # interaction budget for a fair wall-clock/data-collection comparison.
     print(f"*** Collecting {args.distill_extra_steps} post-training states for behavioral merging ***")
     merge_buffer, buffer_seconds = collect_merge_buffer(
-        actor, envs, args.distill_extra_steps, args.task_id, device,
+        actor, envs, args.distill_extra_steps, args.task_id, args.seq_idx, device,
         seed=args.seed + 123_456,
     )
     writer.add_scalar("timing/merge_buffer_seconds", buffer_seconds, global_step)
@@ -613,6 +631,8 @@ if __name__ == "__main__":
                 writer.add_scalar("analysis/merge/pairwise_kl_min", merge_info["pairwise_kl_min"], global_step)
                 writer.add_scalar("analysis/merge/pairwise_kl_mean", merge_info["pairwise_kl_mean"], global_step)
                 writer.add_scalar("analysis/merge/pairwise_kl_max", merge_info["pairwise_kl_max"], global_step)
+                writer.add_scalar("analysis/merge/selected_state_kl_p95", merge_info["selected_state_kl_p95"], global_step)
+                writer.add_scalar("analysis/merge/selected_state_kl_max", merge_info["selected_state_kl_max"], global_step)
             elif merge_info["similarity_metric"] == "cosine":
                 writer.add_scalar("analysis/merge/cosine_similarity", merge_info["cosine_similarity"], global_step)
                 writer.add_scalar("analysis/merge/pairwise_cosine_min", merge_info["pairwise_cosine_min"], global_step)
@@ -628,25 +648,35 @@ if __name__ == "__main__":
             writer.add_scalar("analysis/merge/pool_size_before", merge_info["pool_size_before"], global_step)
             writer.add_scalar("analysis/merge/pool_size_after", merge_info["pool_size_after"], global_step)
             lineage = {
-                "parent_1": merge_info.get("parent_1_lineage", {}),
-                "parent_2": merge_info.get("parent_2_lineage", {}),
-                "merged": merge_info.get("merged_lineage", {}),
+                "task_ids": {
+                    "parent_1": merge_info.get("parent_1_lineage", {}),
+                    "parent_2": merge_info.get("parent_2_lineage", {}),
+                    "merged": merge_info.get("merged_lineage", {}),
+                },
+                "source_ids": {
+                    "parent_1": merge_info.get("parent_1_source_lineage", {}),
+                    "parent_2": merge_info.get("parent_2_source_lineage", {}),
+                    "merged": merge_info.get("merged_source_lineage", {}),
+                },
             }
             writer.add_text("analysis/merge/lineage", json.dumps(lineage, sort_keys=True), global_step)
             print(f"*** MERGE_LINEAGE: {json.dumps(lineage, sort_keys=True)} ***")
         writer.add_scalar("analysis/pool/final_length", actor.model.mean_pool.pool_length(), global_step)
 
         # weight_delta stores V_k = own + hist, so ||V_k|| can grow along the
-        # sequence, and it is bounded only while alpha_mass stays <= 1 -- but
-        # alpha_mass is a free learnable scalar. Log both, every task.
+        # sequence. alpha_mass is parameterized through a positive transform;
+        # log both its raw optimization parameter and effective positive mass.
         with torch.no_grad():
             for _i, _entry in enumerate(actor.model.mean_pool.pool):
                 _v = torch.cat([_entry[_k].reshape(-1) for _k in
                                 ("l0_weight", "l0_bias", "l2_weight", "l2_bias")])
                 writer.add_scalar(f"analysis/pool/norm_slot_{_i}", float(_v.norm()), global_step)
             if actor.model.alpha_mass is not None:
-                writer.add_scalar("analysis/alpha_mass",
-                                  float(actor.model.alpha_mass.item()), global_step)
+                raw_mass = float(actor.model.alpha_mass.item())
+                effective_mass = float(actor.model.mean_pool.effective_alpha_mass().item())
+                writer.add_scalar("analysis/alpha_mass_raw", raw_mass, global_step)
+                writer.add_scalar("analysis/alpha_mass", effective_mass, global_step)
+                writer.add_scalar("analysis/alpha_mass_effective", effective_mass, global_step)
 
         for metric_name, value in actor.model.get_distill_metrics().items():
             if value is not None:

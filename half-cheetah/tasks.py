@@ -52,7 +52,7 @@ TASK_SUITES: Dict[str, List[HalfCheetahTask]] = {
 }
 
 # Paper-style second pass through the same tasks to expose retention/relearning.
-DEFAULT_CONTINUAL_SEQUENCE = tuple(range(6)) + tuple(range(6))
+DEFAULT_CONTINUAL_SEQUENCE = tuple(range(len(_VELOCITIES))) * 2
 
 
 def available_task_suites():

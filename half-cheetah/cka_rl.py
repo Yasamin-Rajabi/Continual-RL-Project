@@ -58,7 +58,7 @@ class CkaRlAgent(nn.Module):
         similarity_samples=2048,
         hidden_dim=128,
         shared_dim=256,
-        train_shared=True,
+        train_shared=False,
         pretrained_encoder=None,
         encoder_linear_out=False,
     ):
@@ -137,8 +137,16 @@ class CkaRlAgent(nn.Module):
         if pretrained_encoder is not None:
             logger.info(f"Loading TD-JEPA pretrained encoder from {pretrained_encoder}")
             self.fc = _torch_load(pretrained_encoder, map_location="cpu")
+        elif self.train_shared and latest_dir is not None:
+            # If shared training is explicitly enabled, continue from the most
+            # recently trained encoder.  encoder_from_base must not reset every
+            # new task back to task 0.
+            logger.info(f"Loading latest trainable encoder from {latest_dir}")
+            self.fc = _torch_load(f"{latest_dir}/fc.pt", map_location="cpu")
         elif encoder_from_base and base_dir is not None:
-            logger.info(f"Loading encoder from base {base_dir}")
+            # Frozen/default continual setting: every historical head is defined
+            # against the immutable root encoder.
+            logger.info(f"Loading frozen encoder from base {base_dir}")
             self.fc = _torch_load(f"{base_dir}/fc.pt", map_location="cpu")
         elif latest_dir is not None:
             logger.info(f"Loading shared encoder from {latest_dir}")
@@ -345,6 +353,22 @@ class CkaRlAgent(nn.Module):
             selected = float(matrix[idx1, idx2].item())
             selected_rows = int(pair_rows[idx1, idx2].item())
 
+            # The matrix stores one MEAN KL per candidate pair.  Keep tail
+            # statistics for the selected pair too: a moderate mean can hide a
+            # small set of states with extremely large KL.
+            selected_mean_i = torch.cat((outputs[idx1][idx1][0], outputs[idx1][idx2][0]), dim=0)
+            selected_log_i = torch.cat((outputs[idx1][idx1][1], outputs[idx1][idx2][1]), dim=0)
+            selected_mean_j = torch.cat((outputs[idx2][idx1][0], outputs[idx2][idx2][0]), dim=0)
+            selected_log_j = torch.cat((outputs[idx2][idx1][1], outputs[idx2][idx2][1]), dim=0)
+            selected_state_kl = symmetric_diagonal_gaussian_kl(
+                selected_mean_i, selected_log_i, selected_mean_j, selected_log_j
+            )
+            selected_state_kl = torch.nan_to_num(
+                selected_state_kl, nan=1e12, posinf=1e12, neginf=0.0
+            )
+            selected_state_kl_p95 = float(torch.quantile(selected_state_kl, 0.95).item())
+            selected_state_kl_max = float(selected_state_kl.max().item())
+
         stats = {
             "idx1": int(idx1),
             "idx2": int(idx2),
@@ -353,12 +377,15 @@ class CkaRlAgent(nn.Module):
             "pairwise_kl_min": float(np.min(finite_values)),
             "pairwise_kl_mean": float(np.mean(finite_values)),
             "pairwise_kl_max": float(np.max(finite_values)),
+            "selected_state_kl_p95": selected_state_kl_p95,
+            "selected_state_kl_max": selected_state_kl_max,
             "similarity_states": selected_rows,
             "reference_rows_per_slot": [int(len(x)) for x in obs_by_slot],
             "pairwise_symmetric_kl": matrix.detach().cpu().numpy().tolist(),
         }
         logger.info(
             f"[behavioral merge] pair=({idx1},{idx2}) symmetric_KL={selected:.6f} "
+            f"p95={selected_state_kl_p95:.6f} max={selected_state_kl_max:.6f} "
             f"over {selected_rows} parent-reference states"
         )
         return idx1, idx2, stats
@@ -379,11 +406,11 @@ class CkaRlAgent(nn.Module):
         return pool._forward_with_weights(z, CkaRlAgent._params_to_effective(pool, params))
 
     @staticmethod
-    def _buffer_lineage(buffer):
-        if buffer is None or "task_ids" not in buffer:
+    def _buffer_lineage(buffer, key="task_ids"):
+        if buffer is None or key not in buffer:
             return {}
-        ids, counts = np.unique(np.asarray(buffer["task_ids"]).reshape(-1), return_counts=True)
-        return {str(int(task_id)): int(count) for task_id, count in zip(ids, counts)}
+        ids, counts = np.unique(np.asarray(buffer[key]).reshape(-1), return_counts=True)
+        return {str(int(source_id)): int(count) for source_id, count in zip(ids, counts)}
 
     def _balanced_parent_data(self, idx1: int, idx2: int):
         buf1 = self.mean_pool.pool[idx1].get("buffer")
@@ -404,7 +431,14 @@ class CkaRlAgent(nn.Module):
         )
 
     def _distill_pair(self, idx1: int, idx2: int):
-        """KL-distill two aligned Gaussian policy entries into one student."""
+        """KL-distill two aligned Gaussian policy entries into one student.
+
+        The student starts from the arithmetic parent average.  A stratified
+        held-out split is used both for diagnostics and model selection: the
+        returned parameters are the epoch with the lowest held-out KL (or, if
+        no held-out rows exist, the lowest training KL), not blindly the last
+        optimization epoch.
+        """
         obs, teacher_ids_np = self._balanced_parent_data(idx1, idx2)
         z = self._encode_obs(obs)
         device = z.device
@@ -427,8 +461,11 @@ class CkaRlAgent(nn.Module):
         optimizer = torch.optim.Adam(trainables, lr=self.distill_lr)
 
         n = len(obs)
-        # Stratify the held-out split by parent so train/test diagnostics do not
-        # accidentally contain only one teacher when buffers are small.
+        # Stratify the held-out split by immediate parent so train/test
+        # diagnostics do not accidentally contain only one teacher.  NOTE: this
+        # does NOT lineage-balance original source tasks inside an already-merged
+        # parent; source_ids are retained separately so that effect can be
+        # measured before we change the algorithm.
         train_parts, test_parts = [], []
         for teacher_id in (0, 1):
             parent_idx = torch.nonzero(teacher_ids == teacher_id, as_tuple=False).flatten()
@@ -452,7 +489,38 @@ class CkaRlAgent(nn.Module):
             raw_logstd = self._head_forward_from_params(self.logstd_pool, batch_z, log_params)
             return mean, raw_logstd
 
-        for _ in range(self.distill_epochs):
+        @torch.no_grad()
+        def kl_summary(indices):
+            if indices.numel() == 0:
+                return None
+            sm, sl_raw = student_outputs(z[indices])
+            sl = bound_log_std(sl_raw)
+            values = diagonal_gaussian_kl(
+                teacher_mean[indices], teacher_logstd[indices], sm, sl
+            )
+            values = torch.nan_to_num(values, nan=1e12, posinf=1e12, neginf=0.0)
+            return {
+                "mean": float(values.mean().item()),
+                "p95": float(torch.quantile(values, 0.95).item()),
+                "max": float(values.max().item()),
+            }
+
+        def clone_student_params():
+            return (
+                {key: value.detach().clone() for key, value in mean_params.items()},
+                {key: value.detach().clone() for key, value in log_params.items()},
+            )
+
+        # Epoch 0 is the arithmetic-average initialization and is a legitimate
+        # candidate.  Distillation is allowed to keep it if every optimization
+        # epoch makes held-out behavior worse.
+        validation_idx = test_idx if test_idx.numel() > 0 else train_idx
+        initial_val = kl_summary(validation_idx)
+        best_val_kl = float("inf") if initial_val is None else initial_val["mean"]
+        best_epoch = 0
+        best_mean_params, best_log_params = clone_student_params()
+
+        for epoch in range(1, self.distill_epochs + 1):
             shuffled = train_idx[torch.randperm(train_idx.numel(), device=device)]
             for start in range(0, shuffled.numel(), self.distill_batch_size):
                 idx = shuffled[start:start + self.distill_batch_size]
@@ -466,36 +534,63 @@ class CkaRlAgent(nn.Module):
                 torch.nn.utils.clip_grad_norm_(trainables, max_norm=10.0)
                 optimizer.step()
 
+            val = kl_summary(validation_idx)
+            if val is not None and val["mean"] < best_val_kl:
+                best_val_kl = val["mean"]
+                best_epoch = epoch
+                best_mean_params, best_log_params = clone_student_params()
+
+        # Restore the validation-best student before computing final diagnostics.
+        with torch.no_grad():
+            for key in _HEAD_KEYS:
+                mean_params[key].copy_(best_mean_params[key])
+                log_params[key].copy_(best_log_params[key])
+
         with torch.no_grad():
             def metrics(indices):
                 if indices.numel() == 0:
-                    return None, None, None
+                    return None, None, None, None, None
                 sm, sl_raw = student_outputs(z[indices])
                 sl = bound_log_std(sl_raw)
-                kl = diagonal_gaussian_kl(
+                kl_values = diagonal_gaussian_kl(
                     teacher_mean[indices], teacher_logstd[indices], sm, sl
-                ).mean().item()
+                )
+                kl_values = torch.nan_to_num(
+                    kl_values, nan=1e12, posinf=1e12, neginf=0.0
+                )
+                kl_mean = kl_values.mean().item()
+                kl_p95 = torch.quantile(kl_values, 0.95).item()
+                kl_max = kl_values.max().item()
                 mean_mse = F.mse_loss(sm, teacher_mean[indices]).item()
                 logstd_mse = F.mse_loss(sl, teacher_logstd[indices]).item()
-                return kl, mean_mse, logstd_mse
+                return kl_mean, kl_p95, kl_max, mean_mse, logstd_mse
 
-            train_kl, train_mean_mse, train_logstd_mse = metrics(train_idx)
-            test_kl, test_mean_mse, test_logstd_mse = metrics(test_idx)
+            train_kl, train_kl_p95, train_kl_max, train_mean_mse, train_logstd_mse = metrics(train_idx)
+            test_kl, test_kl_p95, test_kl_max, test_mean_mse, test_logstd_mse = metrics(test_idx)
 
         out_mean = {key: value.detach().clone() for key, value in mean_params.items()}
         out_log = {key: value.detach().clone() for key, value in log_params.items()}
         metrics_out = {
             "policy/distill_train_kl": train_kl,
             "policy/distill_test_kl": test_kl,
+            "policy/distill_train_kl_p95": train_kl_p95,
+            "policy/distill_test_kl_p95": test_kl_p95,
+            "policy/distill_train_kl_max": train_kl_max,
+            "policy/distill_test_kl_max": test_kl_max,
             "policy/distill_train_mean_mse": train_mean_mse,
             "policy/distill_test_mean_mse": test_mean_mse,
             "policy/distill_train_logstd_mse": train_logstd_mse,
             "policy/distill_test_logstd_mse": test_logstd_mse,
+            "policy/distill_best_epoch": int(best_epoch),
+            "policy/distill_best_val_kl": float(best_val_kl),
+            "policy/distill_initial_val_kl": None if initial_val is None else float(initial_val["mean"]),
             "policy/distill_rows": int(n),
         }
         logger.info(
-            f"[policy distill] rows={n} train_KL={train_kl:.6f} "
-            f"test_KL={test_kl if test_kl is not None else 'n/a'}"
+            f"[policy distill] rows={n} best_epoch={best_epoch} "
+            f"train_KL={train_kl:.6f} test_KL={test_kl if test_kl is not None else 'n/a'} "
+            f"train_p95={train_kl_p95:.6f} "
+            f"test_p95={test_kl_p95 if test_kl_p95 is not None else 'n/a'}"
         )
         return out_mean, out_log, metrics_out
 
@@ -531,9 +626,15 @@ class CkaRlAgent(nn.Module):
             "used_distillation": used_distillation,
             "pool_size_before": int(self.mean_pool.pool_length()),
             "pool_size_after": int(self.mean_pool.pool_length() - 1),
-            "parent_1_lineage": self._buffer_lineage(buf1),
-            "parent_2_lineage": self._buffer_lineage(buf2),
-            "merged_lineage": self._buffer_lineage(merged_buffer),
+            # task-level lineage is useful for semantic task composition; source
+            # lineage uses unique sequence positions so repeated task IDs remain
+            # distinguishable in decay analyses.
+            "parent_1_lineage": self._buffer_lineage(buf1, "task_ids"),
+            "parent_2_lineage": self._buffer_lineage(buf2, "task_ids"),
+            "merged_lineage": self._buffer_lineage(merged_buffer, "task_ids"),
+            "parent_1_source_lineage": self._buffer_lineage(buf1, "source_ids"),
+            "parent_2_source_lineage": self._buffer_lineage(buf2, "source_ids"),
+            "merged_source_lineage": self._buffer_lineage(merged_buffer, "source_ids"),
         })
         self.mean_pool.replace_pair(idx1, idx2, mean_params, merged_buffer, merge_info)
         self.logstd_pool.replace_pair(idx1, idx2, log_params, None, merge_info)

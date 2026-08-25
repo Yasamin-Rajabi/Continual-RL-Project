@@ -104,7 +104,18 @@ class HeadPool(nn.Module):
     def set_alpha(self, alpha, alpha_scale, alpha_mass=None):
         self.alpha = alpha
         self.alpha_scale = alpha_scale
+        # alpha_mass is stored as an unconstrained RAW parameter.  Use
+        # effective_alpha_mass() whenever it participates in the policy so the
+        # semantic mass is strictly positive while still initializing at 1.0.
         self.alpha_mass = alpha_mass
+
+    def effective_alpha_mass(self):
+        if self.alpha_mass is None:
+            return None
+        # softplus(raw) is strictly positive.  Dividing by softplus(1) keeps
+        # raw=1 (the existing initialization) exactly equivalent to mass=1.
+        normalizer = F.softplus(torch.ones_like(self.alpha_mass))
+        return F.softplus(self.alpha_mass) / normalizer
 
     def _historical(self):
         if not self.pool:
@@ -117,7 +128,7 @@ class HeadPool(nn.Module):
         scale = 1.0 if self.alpha_scale is None else self.alpha_scale
         weights = F.softmax(self.alpha * scale, dim=0)
         if self.use_alpha_mass and self.alpha_mass is not None:
-            weights = self.alpha_mass * weights
+            weights = self.effective_alpha_mass() * weights
 
         out = {}
         for name, ndim in (("l0_weight", 2), ("l0_bias", 1), ("l2_weight", 2), ("l2_bias", 1)):

@@ -90,6 +90,44 @@ def checkpoint_complete(path):
     return path.exists() and all((path / name).exists() for name in required)
 
 
+CACHE_SCHEMA_VERSION = 2
+
+
+def _benchmark_cache_config(args):
+    """Training/evaluation knobs that materially determine cached metrics.
+
+    Code changes still require --force-retrain, but changing any of these
+    command-line settings automatically invalidates old JSON metric caches.
+    """
+    return {
+        "sequence": list(args.task_sequence),
+        "save_root": str(args.save_root),
+        "runs_root": str(args.runs_root),
+        "total_timesteps": int(args.total_timesteps),
+        "learning_starts": int(args.learning_starts),
+        "random_actions_end": int(args.random_actions_end),
+        "batch_size": int(args.batch_size),
+        "policy_lr": float(args.policy_lr),
+        "q_lr": float(args.q_lr),
+        "gamma": float(args.gamma),
+        "tau": float(args.tau),
+        "pool_size": int(args.pool_size),
+        "eval_every": int(args.eval_every),
+        "num_evals": int(args.num_evals),
+        "distill_extra_steps": int(args.distill_extra_steps),
+        "max_distill_buffer": int(args.max_distill_buffer),
+        "similarity_samples": int(args.similarity_samples),
+        "distill_max_samples": int(args.distill_max_samples),
+        "distill_epochs": int(args.distill_epochs),
+        "distill_lr": float(args.distill_lr),
+        "distill_batch_size": int(args.distill_batch_size),
+        "distill_test_frac": float(args.distill_test_frac),
+        "train_shared": bool(args.train_shared),
+        "pretrained_encoder": None if args.pretrained_encoder is None else str(args.pretrained_encoder),
+        "encoder_linear_out": bool(args.encoder_linear_out),
+    }
+
+
 def load_scalar(directory, scalar_tag):
     directory = pathlib.Path(directory)
     if not directory.exists():
@@ -182,17 +220,21 @@ def build_retention_matrix(args, suite, condition, seed, device):
     if cache.exists() and not args.force_retrain:
         with open(cache) as f:
             cached = json.load(f)
+        expected_config = _benchmark_cache_config(args)
         if (
-            cached.get("suite") == suite
+            cached.get("cache_schema_version") == CACHE_SCHEMA_VERSION
+            and cached.get("suite") == suite
             and cached.get("condition") == condition
             and int(cached.get("seed", -1)) == int(seed)
-            and cached.get("sequence") == list(args.task_sequence)
+            and cached.get("cache_config") == expected_config
             and cached.get("eval_task_ids") == eval_task_ids
             and int(cached.get("episodes", -1)) == int(args.retention_eval_episodes)
         ):
             return cached
 
     data = {
+        "cache_schema_version": CACHE_SCHEMA_VERSION,
+        "cache_config": _benchmark_cache_config(args),
         "suite": suite,
         "condition": condition,
         "seed": seed,
@@ -398,11 +440,19 @@ def compute_survey_metrics(args, suite, condition, seed, device, scratch_seeds, 
     if cache.exists() and not args.force_retrain:
         with open(cache) as f:
             cached = json.load(f)
+        expected_config = {
+            **_benchmark_cache_config(args),
+            "retention_eval_episodes": int(args.retention_eval_episodes),
+            "scratch_seeds": [int(x) for x in scratch_seeds],
+            "scratch_total_timesteps": int(scratch_total_timesteps),
+            "scratch_save_root": str(getattr(args, "scratch_save_root", scratch.SCRATCH_SAVE_ROOT)),
+        }
         if (
-            cached.get("suite") == suite
+            cached.get("cache_schema_version") == CACHE_SCHEMA_VERSION
+            and cached.get("suite") == suite
             and cached.get("condition") == condition
             and int(cached.get("seed", -1)) == int(seed)
-            and cached.get("sequence") == list(args.task_sequence)
+            and cached.get("cache_config") == expected_config
         ):
             return cached
 
@@ -413,6 +463,14 @@ def compute_survey_metrics(args, suite, condition, seed, device, scratch_seeds, 
     ft_return = compute_forward_transfer_return(args, suite, condition, seed, scratch_seeds, scratch_total_timesteps)
 
     result = {
+        "cache_schema_version": CACHE_SCHEMA_VERSION,
+        "cache_config": {
+            **_benchmark_cache_config(args),
+            "retention_eval_episodes": int(args.retention_eval_episodes),
+            "scratch_seeds": [int(x) for x in scratch_seeds],
+            "scratch_total_timesteps": int(scratch_total_timesteps),
+            "scratch_save_root": str(getattr(args, "scratch_save_root", scratch.SCRATCH_SAVE_ROOT)),
+        },
         "suite": suite,
         "condition": condition,
         "seed": seed,
