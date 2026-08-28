@@ -32,7 +32,7 @@ import sys
 from tasks import TASK_SUITES, get_task_name
 
 SCRATCH_SAVE_ROOT = "scratch_models"
-DEFAULT_SCRATCH_SEEDS = [101, 102, 103]
+DEFAULT_SCRATCH_SEEDS = [101]
 
 
 def scratch_run_name(suite, task_id, seed):

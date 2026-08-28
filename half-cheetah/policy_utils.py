@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import torch
 
-LOG_STD_MIN = -20.0
+LOG_STD_MIN = -5.0
 LOG_STD_MAX = 2.0
 
 

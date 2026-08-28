@@ -49,19 +49,19 @@ import scratch_baselines
 CONDITIONS = OrderedDict([
     (
         "baseline",
-        {"fusion_mode": "classic_cka", "distillation": False, "use_alpha_mass": False},
+        {"fusion_mode": "classic_cka", "distillation": False, "use_alpha_mass": False, "use_alpha_scale": True},
     ),
     (
         "distil_only",
-        {"fusion_mode": "classic_cka", "distillation": True, "use_alpha_mass": False},
+        {"fusion_mode": "classic_cka", "distillation": True, "use_alpha_mass": False, "use_alpha_scale": True},
     ),
     (
         "weight_only",
-        {"fusion_mode": "weight_delta", "distillation": False, "use_alpha_mass": True},
+        {"fusion_mode": "weight_delta", "distillation": False, "use_alpha_mass": True, "use_alpha_scale": False},
     ),
     (
         "combined",
-        {"fusion_mode": "weight_delta", "distillation": True, "use_alpha_mass": True},
+        {"fusion_mode": "weight_delta", "distillation": True, "use_alpha_mass": True, "use_alpha_scale": False},
     ),
 ])
 
@@ -80,6 +80,10 @@ def parse_args():
     p.add_argument("--random-actions-end", type=int, default=10_000)
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--policy-lr", type=float, default=3e-4)
+    p.add_argument("--alpha-lr", type=float, default=5e-3)
+    p.add_argument("--alpha-mass-reg", type=float, default=0.05)  
+    p.add_argument("--alpha-warmup-steps", type=int, default=5_000)
+    p.add_argument("--drift-reg", type=float, default=1.0)
     p.add_argument("--q-lr", type=float, default=3e-4)
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--tau", type=float, default=0.005)
@@ -91,8 +95,8 @@ def parse_args():
     p.add_argument("--max-distill-buffer", type=int, default=50_000)
     p.add_argument("--similarity-samples", type=int, default=2_048)
     p.add_argument("--distill-max-samples", type=int, default=20_000)
-    p.add_argument("--distill-epochs", type=int, default=8)
-    p.add_argument("--distill-lr", type=float, default=3e-4)
+    p.add_argument("--distill-epochs", type=int, default=16)
+    p.add_argument("--distill-lr", type=float, default=5e-4)
     p.add_argument("--distill-batch-size", type=int, default=256)
     p.add_argument("--distill-test-frac", type=float, default=0.2)
     p.add_argument("--analysis-log-every", type=int, default=5_000)
@@ -126,6 +130,8 @@ def parse_args():
              "(1=baseline, 2=distil_only, 3=weight_only, 4=combined).",
     )
     p.add_argument("--quick-test", action="store_true")
+    p.add_argument("--test-adapt-steps", type=int, default=5_000,
+                   help="Number of steps to adapt alpha logits during test-time evaluation")
     args = p.parse_args()
 
     if args.quick_test:
@@ -201,6 +207,10 @@ def train_chain(args, suite, condition, cfg, seed):
             f"--random-actions-end={args.random_actions_end}",
             f"--batch-size={args.batch_size}",
             f"--policy-lr={args.policy_lr}",
+            f"--alpha-lr={args.alpha_lr}",
+            f"--alpha-mass-reg={args.alpha_mass_reg}",
+            f"--alpha-warmup-steps={args.alpha_warmup_steps}",
+            f"--drift-reg={args.drift_reg}",
             f"--q-lr={args.q_lr}",
             f"--gamma={args.gamma}",
             f"--tau={args.tau}",
@@ -217,7 +227,7 @@ def train_chain(args, suite, condition, cfg, seed):
             f"--distill-test-frac={args.distill_test_frac}",
             f"--analysis-log-every={args.analysis_log_every}",
             f"--fusion-mode={cfg['fusion_mode']}",
-            "--no-use-alpha-scale",
+            "--use-alpha-scale" if cfg["use_alpha_scale"] else "--no-use-alpha-scale",
             "--distillation" if cfg["distillation"] else "--no-distillation",
             "--train-shared" if args.train_shared else "--no-train-shared",
             "--encoder-linear-out" if args.encoder_linear_out else "--no-encoder-linear-out",

@@ -60,6 +60,8 @@ class Args:
     random_actions_end: int = 10_000
     policy_lr: float = 3e-4
     q_lr: float = 3e-4
+    alpha_lr: float = 5e-3
+    alpha_warmup_steps: int = 5_000
     policy_frequency: int = 2
     target_network_frequency: int = 1
     # Fixed SAC entropy coefficient when autotune=False.  With autotune=True
@@ -74,7 +76,9 @@ class Args:
     encoder_from_base: bool = True
     distillation: bool = True
     use_alpha_mass: bool = False
+    alpha_mass_reg: float = 0.05
     use_alpha_scale: bool = False
+    drift_reg: float = 1.0
     # Was True, which contradicted both cka_rl.py's own docstring ("train_shared=False
     # (default)") and run_continual_benchmark.py, which always passes --no-train-shared.
     # Running run_sac.py directly (as the README examples do) therefore used a
@@ -97,8 +101,8 @@ class Args:
     max_distill_buffer: int = 50_000
     similarity_samples: int = 2_048
     distill_max_samples: int = 20_000
-    distill_epochs: int = 8
-    distill_lr: float = 3e-4
+    distill_epochs: int = 16
+    distill_lr: float = 5e-4
     distill_batch_size: int = 256
     distill_test_frac: float = 0.2
 
@@ -405,6 +409,24 @@ if __name__ == "__main__":
     )
 
     actor = Actor(envs, model).to(device)
+
+    
+    old_fc = None
+    past_obs_pool = None
+    if args.seq_idx > 0 and args.train_shared and args.distillation:
+        import copy
+        old_fc = copy.deepcopy(actor.model.fc).to(device)
+        old_fc.eval()
+        for p in old_fc.parameters():
+            p.requires_grad = False
+
+        past_obs_list = [
+            entry["buffer"]["obs"] for entry in actor.model.mean_pool.pool
+            if entry.get("buffer") is not None and "obs" in entry["buffer"]
+        ]
+        if past_obs_list:
+            past_obs_pool = np.concatenate(past_obs_list, axis=0)
+
     qf1 = SoftQNetwork(envs, linear_out=args.encoder_linear_out).to(device)
     qf2 = SoftQNetwork(envs, linear_out=args.encoder_linear_out).to(device)
     qf1_target = SoftQNetwork(envs, linear_out=args.encoder_linear_out).to(device)
@@ -413,10 +435,43 @@ if __name__ == "__main__":
     qf2_target.load_state_dict(qf2.state_dict())
 
     q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr)
+
+    
     actor_params = [p for p in actor.parameters() if p.requires_grad]
     if not actor_params:
         raise RuntimeError("No trainable actor parameters found")
-    actor_optimizer = optim.Adam(actor_params, lr=args.policy_lr)
+    fc_param_ids = {id(p) for p in actor.model.fc.parameters()}
+    fc_params = [p for p in actor.model.fc.parameters() if p.requires_grad]
+
+    alpha_param_objs = []
+    if actor.model.alpha is not None and actor.model.alpha.requires_grad:
+        alpha_param_objs.append(actor.model.alpha)
+    if actor.model.alpha_scale is not None and actor.model.alpha_scale.requires_grad:
+        alpha_param_objs.append(actor.model.alpha_scale)
+    if actor.model.alpha_mass is not None and actor.model.alpha_mass.requires_grad:
+        alpha_param_objs.append(actor.model.alpha_mass)
+
+    alpha_param_ids = {id(p) for p in alpha_param_objs}
+
+    own_params = [
+        p for p in actor_params 
+        if id(p) not in alpha_param_ids and id(p) not in fc_param_ids
+    ]
+
+    if args.distillation and args.seq_idx > 0:
+        encoder_lr = args.policy_lr * 0.1
+    else:
+        encoder_lr = args.policy_lr
+
+    param_groups = []
+    if own_params:
+        param_groups.append({"params": own_params, "lr": args.policy_lr})
+    if fc_params:
+        param_groups.append({"params": fc_params, "lr": encoder_lr})
+    if alpha_param_objs:
+        param_groups.append({"params": alpha_param_objs, "lr": args.alpha_lr})
+
+    actor_optimizer = optim.Adam(param_groups)
 
     # The whole knowledge-vector formulation assumes a FIXED basis: every stored
     # pool entry was learned relative to one particular encoder. If the encoder
@@ -518,10 +573,34 @@ if __name__ == "__main__":
             if global_step % args.policy_frequency == 0:
                 for _ in range(args.policy_frequency):
                     pi, log_pi, _ = actor.get_action(data.observations)
+
                     min_q_pi = torch.min(qf1(data.observations, pi), qf2(data.observations, pi))
                     actor_loss = (alpha * log_pi - min_q_pi).mean()
+
+                    if args.distillation and old_fc is not None and past_obs_pool is not None and args.drift_reg > 0:
+                        drift_idx = np.random.randint(0, len(past_obs_pool), size=args.batch_size)
+                        s_past = torch.as_tensor(past_obs_pool[drift_idx], dtype=torch.float32, device=device)
+                        with torch.no_grad():
+                            phi_old = old_fc(s_past)
+                        phi_curr = actor.model.fc(s_past)
+                        loss_drift = args.drift_reg * F.mse_loss(phi_curr, phi_old)
+                        actor_loss = actor_loss + loss_drift
+
+                    if actor.model.alpha_mass is not None and actor.model.alpha_mass.requires_grad and getattr(args, "alpha_mass_reg", 0) > 0:
+                        eff_mass = actor.model.mean_pool.effective_alpha_mass()
+                        mass_loss = args.alpha_mass_reg * (eff_mass ** 2) * ((eff_mass - 1.0) ** 2)
+                        actor_loss = actor_loss + mass_loss.mean()
+
                     actor_optimizer.zero_grad()
                     actor_loss.backward()
+
+                    
+                    in_warmup = global_step < (args.learning_starts + args.alpha_warmup_steps)
+                    if args.fusion_mode == "weight_delta" and in_warmup and actor.model.alpha is not None:
+                        for p in own_params:
+                            if p.grad is not None:
+                                p.grad.zero_()
+
                     actor_optimizer.step()
 
                     if args.autotune:

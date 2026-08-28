@@ -44,7 +44,7 @@ class CkaRlAgent(nn.Module):
         alpha_major=0.6,
         alpha_factor=1e-3,
         fix_alpha=False,
-        use_alpha_scale=False,
+        use_alpha_scale=True,
         use_alpha_mass=False,
         encoder_from_base=False,
         distillation=True,
@@ -81,14 +81,15 @@ class CkaRlAgent(nn.Module):
         self.last_merge_info = None
         self.last_distill_metrics = {}
 
+        head_in_dim = shared_dim + self.obs_dim if self.distillation else shared_dim
         self.mean_pool = HeadPool(
-            "mean", shared_dim, hidden_dim, act_dim,
+            "mean", head_in_dim, hidden_dim, act_dim,
             fusion_mode=fusion_mode, pool_size=pool_size,
             distillation=distillation, max_distill_buffer=max_distill_buffer,
             use_alpha_mass=use_alpha_mass, distill_test_frac=distill_test_frac,
         )
         self.logstd_pool = HeadPool(
-            "logstd", shared_dim, hidden_dim, act_dim,
+            "logstd", head_in_dim, hidden_dim, act_dim,
             fusion_mode=fusion_mode, pool_size=pool_size,
             distillation=distillation, max_distill_buffer=max_distill_buffer,
             use_alpha_mass=use_alpha_mass, distill_test_frac=distill_test_frac,
@@ -187,17 +188,24 @@ class CkaRlAgent(nn.Module):
             alpha = nn.Parameter(torch.tensor(vals, dtype=torch.float32), requires_grad=True)
         else:
             raise NotImplementedError(f"unknown alpha_init: {alpha_init}")
-        alpha_scale = nn.Parameter(torch.ones(1), requires_grad=(use_alpha_scale and not fix_alpha))
+
+        scale_init_val = 5.0 if use_alpha_scale else 1.0
+        alpha_scale = nn.Parameter(torch.tensor([scale_init_val], dtype=torch.float32), 
+                                   requires_grad=(use_alpha_scale and not fix_alpha))
+
         alpha_mass = (
             nn.Parameter(torch.ones(1), requires_grad=not fix_alpha)
             if use_alpha_mass else None
         )
         return alpha, alpha_scale, alpha_mass
 
+    
     def forward(self, x):
-        z = self.fc(x)
+        features = self.fc(x)
+        z = torch.cat([features, x], dim=-1) if self.distillation else features
         return self.mean_pool(z), self.logstd_pool(z)
 
+    
     def set_own_buffer(self, buffer):
         """Attach raw rollout states to the new policy slot.
 
@@ -241,10 +249,13 @@ class CkaRlAgent(nn.Module):
     def _encode_obs(self, obs: np.ndarray, batch_size: int = 4096) -> torch.Tensor:
         device = self.mean_pool.base_l0_weight.device
         chunks = []
+        
         with torch.no_grad():
             for start in range(0, len(obs), batch_size):
                 x = torch.as_tensor(obs[start:start + batch_size], dtype=torch.float32, device=device)
-                chunks.append(self.fc(x))
+                features = self.fc(x)
+                z_chunk = torch.cat([features, x], dim=-1) if self.distillation else features
+                chunks.append(z_chunk)
         return torch.cat(chunks, dim=0)
 
     def _entry_outputs(self, z: torch.Tensor, index: int):
@@ -667,6 +678,7 @@ class CkaRlAgent(nn.Module):
             return {
                 "obs_dim": self.obs_dim,
                 "act_dim": self.act_dim,
+                "distillation": self.distillation,
                 # FrozenCkaPolicy rebuilds the encoder with shared(...) and then
                 # load_state_dict's into it. shared(linear_out=True) has the SAME
                 # parameters as shared(linear_out=False) but a different forward,
@@ -725,6 +737,7 @@ class FrozenCkaPolicy(nn.Module):
         super().__init__()
         self.obs_dim = int(snapshot["obs_dim"])
         self.act_dim = int(snapshot["act_dim"])
+        self.distillation = bool(snapshot.get("distillation", False))
         # .get() so snapshots written before this flag existed still load, with
         # the original ReLU-terminated encoder.
         self.encoder_linear_out = bool(snapshot.get("encoder_linear_out", False))
@@ -743,9 +756,10 @@ class FrozenCkaPolicy(nn.Module):
         return F.linear(h, w2, b2)
 
     def forward(self, obs):
-        z = self.fc(obs)
+        features = self.fc(obs)
+        z = torch.cat([features, obs], dim=-1) if self.distillation else features
         return self._head(z, "mean"), self._head(z, "logstd")
-
+    
     @staticmethod
     def load(dirname, map_location=None):
         snapshot = _torch_load(f"{dirname}/policy_snapshot.pt", map_location=map_location)

@@ -125,6 +125,11 @@ def _benchmark_cache_config(args):
         "train_shared": bool(args.train_shared),
         "pretrained_encoder": None if args.pretrained_encoder is None else str(args.pretrained_encoder),
         "encoder_linear_out": bool(args.encoder_linear_out),
+        "alpha_lr": float(getattr(args, "alpha_lr", 5e-3)),
+        "alpha_mass_reg": float(getattr(args, "alpha_mass_reg", 0.05)),
+        "drift_reg": float(getattr(args, "drift_reg", 1.0)),
+        "alpha_warmup_steps": int(getattr(args, "alpha_warmup_steps", 5000)),
+        "test_adapt_steps": int(getattr(args, "test_adapt_steps", 5000)),
     }
 
 
@@ -204,6 +209,121 @@ def evaluate_checkpoint(run_dir, suite, task_id, episodes, seed, device):
         "velocity_error": float(np.nanmean(velocity_errors)),
     }
 
+def adapt_and_evaluate_checkpoint(
+    run_dir,
+    suite,
+    task_id,
+    episodes,
+    seed,
+    device,
+    adapt_steps=5000,
+    adapt_lr=1e-2,
+):
+    """Evaluates checkpoint on task_id with test-time alpha adaptation."""
+    env = get_task(task_id, task_suite=suite)
+    
+    # 1. بارگذاری کامل مدل به همراه استخر دانش برای دسترسی به آلفا
+    mean_pool_path = pathlib.Path(run_dir) / "mean_pool.pt"
+    logstd_pool_path = pathlib.Path(run_dir) / "logstd_pool.pt"
+    fc_path = pathlib.Path(run_dir) / "fc.pt"
+    snapshot_path = pathlib.Path(run_dir) / "policy_snapshot.pt"
+
+    has_pool = mean_pool_path.exists() and logstd_pool_path.exists() and fc_path.exists()
+
+    if has_pool:
+        # لود مدل کامل
+        snapshot = torch.load(snapshot_path, map_location=device, weights_only=False)
+        obs_dim = int(snapshot["obs_dim"])
+        act_dim = int(snapshot["act_dim"])
+        distillation = bool(snapshot.get("distillation", False))
+        
+        # ساخت Agent با لود کامل پارامترها
+        from cka_rl import CkaRlAgent
+        agent = CkaRlAgent(
+            obs_dim=obs_dim,
+            act_dim=act_dim,
+            base_dir=None,
+            latest_dir=str(run_dir),
+            distillation=distillation,
+        ).to(device)
+        
+        # فریز کامل کل شبکه (انکودر و تمامی وزن‌های هدها)
+        for p in agent.parameters():
+            p.requires_grad = False
+            
+        # فعال کردن گرادیان فقط و فقط برای آلفا
+        adapt_params = []
+        if agent.alpha is not None and agent.alpha.numel() > 1:
+            agent.alpha.requires_grad_(True)
+            adapt_params.append(agent.alpha)
+        if agent.alpha_scale is not None and agent.alpha_scale.requires_grad:
+            agent.alpha_scale.requires_grad_(True)
+            adapt_params.append(agent.alpha_scale)
+        if agent.alpha_mass is not None:
+            agent.alpha_mass.requires_grad_(True)
+            adapt_params.append(agent.alpha_mass)
+
+        # 2. فاز Test-Time Adaptation (جمع‌آوری رول‌اوت و بهینه‌سازی آلفا با گرادیان پاداش/رفتار)
+        if adapt_params and adapt_steps > 0:
+            optimizer = torch.optim.Adam(adapt_params, lr=adapt_lr)
+            obs, _ = env.reset(seed=seed)
+            for step in range(adapt_steps):
+                obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+                mean, log_std = agent(obs_t)
+                std = bound_log_std(log_std).exp()
+                action_dist = torch.distributions.Normal(mean, std)
+                action_t = action_dist.sample()
+                action = torch.tanh(action_t)[0].detach().cpu().numpy()
+                
+                next_obs, reward, terminated, truncated, _ = env.step(action)
+                
+                # بهینه‌سازی آلفا بر اساس لگاریتم احتمال اکشن و پاداش دریافتی (REINFORCE ساده روی آلفا)
+                log_prob = action_dist.log_prob(action_t).sum(dim=-1)
+                loss = -log_prob * float(reward)
+                
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                
+                if terminated or truncated:
+                    obs, _ = env.reset()
+                else:
+                    obs = next_obs
+
+        policy_fn = lambda x: agent(x)[0]  # استفاده از میانگین اکشن برای ارزیابی نهایی
+    else:
+        # فال‌بک به FrozenCkaPolicy ساده در صورتی که فایل‌های استخر وجود نداشتند
+        policy = FrozenCkaPolicy.load(str(run_dir), map_location=device).to(device)
+        policy.eval()
+        policy_fn = lambda x: policy(x)[0]
+
+    # 3. ارزیابی نهایی دترمینستیک روی اپیزودها
+    returns, success, velocity_errors = [], [], []
+    for ep in range(episodes):
+        obs, _ = env.reset(seed=seed + 10_000 * task_id + ep)
+        ep_return = 0.0
+        ep_success, ep_error = [], []
+        while True:
+            obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+            with torch.no_grad():
+                mean = policy_fn(obs_t)
+            action = torch.tanh(mean[0]).cpu().numpy()
+            obs, reward, terminated, truncated, info = env.step(action)
+            ep_return += float(reward)
+            ep_success.append(float(info.get("success", np.nan)))
+            ep_error.append(float(info.get("velocity_error", np.nan)))
+            if terminated or truncated:
+                break
+        returns.append(ep_return)
+        success.append(float(np.nanmean(ep_success)))
+        velocity_errors.append(float(np.nanmean(ep_error)))
+    env.close()
+    
+    return {
+        "return": float(np.mean(returns)),
+        "success": float(np.nanmean(success)),
+        "velocity_error": float(np.nanmean(velocity_errors)),
+    }
 
 # ==========================================================================
 # FULL retention matrix (unchanged logic from before -- kept for the
@@ -251,7 +371,7 @@ def build_retention_matrix(args, suite, condition, seed, device):
             raise FileNotFoundError(run_dir)
         rows = {metric: [] for metric in ("return", "success", "velocity_error")}
         for eval_task in eval_task_ids:
-            metrics = evaluate_checkpoint(
+            metrics = adapt_and_evaluate_checkpoint(
                 run_dir, suite, eval_task, args.retention_eval_episodes,
                 seed + seq_idx * 100_000, device,
             )
@@ -301,7 +421,7 @@ def compute_p_final_row(args, suite, condition, seed, device):
 
     row = {}
     for task_id in sorted(set(args.task_sequence)):
-        result = evaluate_checkpoint(
+        result = adapt_and_evaluate_checkpoint(
             final_run_dir, suite, task_id, args.retention_eval_episodes,
             seed + 500_000, device,
         )

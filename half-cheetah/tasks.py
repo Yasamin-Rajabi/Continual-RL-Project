@@ -32,16 +32,22 @@ class HalfCheetahTask:
 
 # Eight distinct tasks is enough to force several merges with the recommended
 # pool_size=5, while keeping a 2-pass continual benchmark computationally sane.
-_VELOCITIES = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 1.25, 2.25)
+_VELOCITIES = (
+    1.0, 
+    0.5,
+    1.5, 
+    2.0,
+    1.25,
+    0.75,
+)
+
 _WIND_PAIRS = (
-    (-2.5, 0.0),
-    (2.5, 0.0),
-    (0.0, -5.0),
-    (0.0, 5.0),
-    (-1.25, -2.5),
-    (1.25, 2.5),
-    (-2.5, 5.0),
-    (2.5, -5.0),
+    (2.5, 0.0),  
+    (-2.5, 0.0), 
+    (0.0, -5.0), 
+    (2.5, -5.0), 
+    (1.25, 0.0),
+    (-1.25, -2.5)
 )
 
 TASK_SUITES: Dict[str, List[HalfCheetahTask]] = {
