@@ -53,6 +53,7 @@ from tensorboard.backend.event_processing import event_accumulator
 from cka_rl import FrozenCkaPolicy
 from tasks import get_task
 import scratch_baselines as scratch
+from policy_utils import bound_log_std
 
 # NumPy 2.0 removed np.trapz in favor of np.trapezoid; NumPy <2.0 only has
 # np.trapz. Picking whichever exists at import time keeps this file working
@@ -236,14 +237,19 @@ def adapt_and_evaluate_checkpoint(
         obs_dim = int(snapshot["obs_dim"])
         act_dim = int(snapshot["act_dim"])
         distillation = bool(snapshot.get("distillation", False))
-        
-        # ساخت Agent با لود کامل پارامترها
+
+        mean_pool_data = torch.load(mean_pool_path, map_location="cpu", weights_only=False)
+        fusion_mode = mean_pool_data.fusion_mode
+        use_alpha_mass = mean_pool_data.use_alpha_mass
+
         from cka_rl import CkaRlAgent
         agent = CkaRlAgent(
             obs_dim=obs_dim,
             act_dim=act_dim,
-            base_dir=None,
+            base_dir=str(run_dir),
             latest_dir=str(run_dir),
+            fusion_mode=fusion_mode,
+            use_alpha_mass=use_alpha_mass,
             distillation=distillation,
         ).to(device)
         

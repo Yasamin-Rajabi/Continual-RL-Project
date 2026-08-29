@@ -586,7 +586,14 @@ if __name__ == "__main__":
                         loss_drift = args.drift_reg * F.mse_loss(phi_curr, phi_old)
                         actor_loss = actor_loss + loss_drift
 
-                    if actor.model.alpha_mass is not None and actor.model.alpha_mass.requires_grad and getattr(args, "alpha_mass_reg", 0) > 0:
+                    in_warmup = global_step < (args.learning_starts + args.alpha_warmup_steps)
+
+                    if in_warmup and actor.model.alpha is not None and actor.model.alpha.numel() > 1:
+                        probs = torch.softmax(actor.model.alpha, dim=-1)
+                        alpha_entropy = -(probs * torch.log(probs + 1e-8)).sum()
+                        actor_loss = actor_loss - 0.01 * alpha_entropy
+
+                    if not in_warmup and actor.model.alpha_mass is not None and actor.model.alpha_mass.requires_grad and getattr(args, "alpha_mass_reg", 0) > 0:
                         eff_mass = actor.model.mean_pool.effective_alpha_mass()
                         mass_loss = args.alpha_mass_reg * (eff_mass ** 2) * ((eff_mass - 1.0) ** 2)
                         actor_loss = actor_loss + mass_loss.mean()
@@ -594,13 +601,13 @@ if __name__ == "__main__":
                     actor_optimizer.zero_grad()
                     actor_loss.backward()
 
-                    
-                    in_warmup = global_step < (args.learning_starts + args.alpha_warmup_steps)
                     if args.fusion_mode == "weight_delta" and in_warmup and actor.model.alpha is not None:
                         for p in own_params:
                             if p.grad is not None:
                                 p.grad.zero_()
-
+                        if actor.model.alpha_mass is not None and actor.model.alpha_mass.grad is not None:
+                            actor.model.alpha_mass.grad.zero_()  # alpha_mass فریز می‌ماند و گرادیان نمی‌خورد
+                    
                     actor_optimizer.step()
 
                     if args.autotune:
