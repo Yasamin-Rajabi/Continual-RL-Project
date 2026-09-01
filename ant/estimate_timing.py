@@ -1,4 +1,4 @@
-"""Summarize timing scalars from completed HalfCheetah benchmark runs."""
+"""Summarize timing scalars from completed Ant benchmark runs."""
 from __future__ import annotations
 
 import argparse
@@ -11,7 +11,7 @@ from tensorboard.backend.event_processing import event_accumulator
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--plots-root", default="plots_halfcheetah_continual")
+    p.add_argument("--plots-root", default="plots_ant_continual")
     return p.parse_args()
 
 
@@ -60,9 +60,11 @@ def main():
     if train:
         ms = 1000.0 * np.asarray(train) / total_steps
         print(f"Training: median {np.median(ms):.4f} ms/env-step, mean {np.mean(ms):.4f}")
-    if buffer:
-        ms = 1000.0 * np.asarray(buffer) / buffer_steps
-        print(f"Merge-buffer rollout: median {np.median(ms):.4f} ms/env-step, mean {np.mean(ms):.4f}")
+    if buffer and buffer_steps > 0:
+        nonzero = np.asarray([x for x in buffer if x > 0.0], dtype=np.float64)
+        if nonzero.size:
+            ms = 1000.0 * nonzero / buffer_steps
+            print(f"Merge-buffer rollout: median {np.median(ms):.4f} ms/env-step, mean {np.mean(ms):.4f}")
     if finalize:
         print(
             f"Finalize/merge: median {np.median(finalize):.4f} s, "
@@ -70,9 +72,10 @@ def main():
         )
 
     if train:
+        n_conditions = 4 if int(config.get("condition_index", 0)) == 0 else 1
         task_runs = (
             len(config["task_suites"])
-            * 4
+            * n_conditions
             * len(config["seeds"])
             * len(config["task_sequence"])
         )

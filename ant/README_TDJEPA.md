@@ -78,7 +78,7 @@
 | `run_continual_benchmark.py` | ✏️ ویرایش | انتشار فلگ‌ها |
 | `scratch_baselines.py` | ✏️ ویرایش | انتشار فلگ‌ها (⚠️ بخش ۵ را ببینید) |
 
-بقیه‌ی فایل‌ها (`metrics.py`, `plots.py`, `knowledge_pools.py`, `policy_utils.py`, `halfcheetah_envs.py`, `analysis_logging.py`) **دست‌نخورده‌اند** — چون قالب تسک «ردیابی سرعت هدف» را نگه داشتیم، کلیدهای `success` و `velocity_error` برای Ant هم کار می‌کنند.
+بقیه‌ی فایل‌ها (`metrics.py`, `plots.py`, `knowledge_pools.py`, `policy_utils.py`, `locomotion_envs.py`, `analysis_logging.py`) **دست‌نخورده‌اند** — چون قالب تسک «ردیابی سرعت هدف» را نگه داشتیم، کلیدهای `success` و `velocity_error` برای Ant هم کار می‌کنند.
 
 ---
 

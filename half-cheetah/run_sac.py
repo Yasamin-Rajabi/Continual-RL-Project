@@ -20,6 +20,7 @@ from tqdm import tqdm
 
 from analysis_logging import effective_theta_vector, log_training_state, save_task_snapshot
 from cka_rl import CkaRlAgent
+from experiment_identity import write_manifest
 from policy_utils import bound_log_std
 from shared_arch import shared
 from tasks import get_task, get_task_name
@@ -67,6 +68,10 @@ class Args:
     # project notes); this value is not used as the initial temperature.
     alpha: float = 0.2
     autotune: bool = True
+    autotune_init_from_alpha: bool = False
+    """If True, entropy autotuning starts from --alpha. False preserves the
+    legacy CleanRL-style initialization alpha_SAC=1.0. This is an ablation
+    switch because changing the initial temperature changes early learning."""
     tag: str = "Debug"
     runs_root: str = "runs"
 
@@ -75,6 +80,9 @@ class Args:
     distillation: bool = True
     use_alpha_mass: bool = False
     use_alpha_scale: bool = False
+    constrain_alpha_mass: bool = True
+    """When alpha-mass is enabled, map its raw scalar through a positive
+    softplus transform. Disable only for the legacy/unconstrained ablation."""
     # Was True, which contradicted both cka_rl.py's own docstring ("train_shared=False
     # (default)") and run_continual_benchmark.py, which always passes --no-train-shared.
     # Running run_sac.py directly (as the README examples do) therefore used a
@@ -82,22 +90,31 @@ class Args:
     # task every task AND left trainable, so it drifted during each task and was then
     # discarded. Pool entries trained under one encoder were being fused under another.
     train_shared: bool = False
+    freeze_root_encoder: bool = False
+    """Random-frozen encoder ablation. With the normal no-pretraining baseline,
+    False lets task 0 learn the root encoder and freezes it on later tasks.
+    A pretrained encoder is frozen from task 0 whenever train_shared=False."""
     pretrained_encoder: Optional[str] = None
-    """Path to an fc.pt from tdjepa_pretrain.py. Overrides encoder_from_base and
-    latest_dir. Use together with --no-train-shared (the default)."""
+    """Path to an fc.pt from tdjepa_pretrain.py. It initializes task 0 and is
+    frozen by default. With --train-shared, later tasks continue from the latest
+    fine-tuned encoder rather than reloading this file each task."""
     encoder_linear_out: bool = False
     """Drop the shared encoder's trailing ReLU. Must MATCH the setting the
     pretrained encoder was produced with, and changes the critic too, so baselines
     have to be re-run under the same value."""
 
-    # Every condition stores rollout states. Distillation-based modes require
-    # them for behavioral KL; keeping the same collection in cosine modes keeps
-    # the post-training interaction/logging budget aligned across conditions.
+    # Distillation modes require rollout states for behavioral KL.
+    # Cosine modes do not; collect_cosine_buffers=True is available when an
+    # equal post-training interaction budget is desired for an ablation.
     distill_extra_steps: int = 10_000
+    collect_cosine_buffers: bool = False
     max_distill_buffer: int = 50_000
     similarity_samples: int = 2_048
     distill_max_samples: int = 20_000
     distill_epochs: int = 8
+    distill_select_best_val: bool = True
+    """Restore the epoch with lowest held-out KL. Disable to reproduce the
+    legacy behavior that always keeps the final distillation epoch."""
     distill_lr: float = 3e-4
     distill_batch_size: int = 256
     distill_test_frac: float = 0.2
@@ -175,12 +192,13 @@ class Actor(nn.Module):
 
 @torch.no_grad()
 def eval_agent(agent, test_env, num_evals, global_step, writer, device):
-    returns, success_rates, mean_velocity_errors = [], [], []
+    returns, success_rates, mean_velocity_errors, mean_x_velocities = [], [], [], []
     for ep in range(num_evals):
         obs, _ = test_env.reset(seed=10_000 + ep)
         ep_return = 0.0
         ep_success = []
         ep_velocity_error = []
+        ep_x_velocity = []
         while True:
             obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
             mean, _ = agent(obs_t)
@@ -191,24 +209,35 @@ def eval_agent(agent, test_env, num_evals, global_step, writer, device):
                 ep_success.append(float(info["success"]))
             if "velocity_error" in info:
                 ep_velocity_error.append(float(info["velocity_error"]))
+            if "x_velocity" in info:
+                ep_x_velocity.append(float(info["x_velocity"]))
             if terminated or truncated:
                 break
         returns.append(ep_return)
         success_rates.append(float(np.mean(ep_success)) if ep_success else np.nan)
         mean_velocity_errors.append(float(np.mean(ep_velocity_error)) if ep_velocity_error else np.nan)
+        mean_x_velocities.append(float(np.mean(ep_x_velocity)) if ep_x_velocity else np.nan)
+
+    def finite_mean(values):
+        arr = np.asarray(values, dtype=np.float64)
+        finite = arr[np.isfinite(arr)]
+        return float(finite.mean()) if finite.size else float("nan")
 
     metrics = {
         "return": float(np.mean(returns)),
-        "success": float(np.nanmean(success_rates)),
-        "velocity_error": float(np.nanmean(mean_velocity_errors)),
+        "success": finite_mean(success_rates),
+        "velocity_error": finite_mean(mean_velocity_errors),
+        "x_velocity": finite_mean(mean_x_velocities),
     }
     print(
         f"\nTEST: return={metrics['return']:.3f}, success={metrics['success']:.3f}, "
-        f"velocity_error={metrics['velocity_error']:.4f}\n"
+        f"velocity_error={metrics['velocity_error']:.4f}, "
+        f"x_velocity={metrics['x_velocity']:.4f}\n"
     )
     writer.add_scalar("charts/test_episodic_return", metrics["return"], global_step)
     writer.add_scalar("charts/test_success", metrics["success"], global_step)
     writer.add_scalar("charts/test_velocity_error", metrics["velocity_error"], global_step)
+    writer.add_scalar("charts/test_x_velocity", metrics["x_velocity"], global_step)
     return metrics
 
 
@@ -329,8 +358,10 @@ def _validate_args(args):
         raise ValueError("pool_size must be >= 2 for meaningful behavioral pair selection")
     if args.similarity_samples < 2:
         raise ValueError("similarity_samples must be >= 2")
-    if args.distill_extra_steps < 1:
-        raise ValueError("distill_extra_steps must be >= 1 because merge buffers are collected in every condition")
+    if (args.distillation or args.collect_cosine_buffers) and args.distill_extra_steps < 1:
+        raise ValueError("distill_extra_steps must be >= 1 when a merge buffer is collected")
+    if args.distill_extra_steps < 0:
+        raise ValueError("distill_extra_steps must be >= 0")
     if args.max_distill_buffer < 2:
         raise ValueError("max_distill_buffer must be >= 2")
     if args.distill_max_samples < 2:
@@ -343,6 +374,14 @@ def _validate_args(args):
         raise ValueError("total_timesteps and num_evals must be >= 1")
     if not 0.0 <= args.distill_test_frac < 1.0:
         raise ValueError("distill_test_frac must be in [0, 1)")
+    if args.train_shared and args.freeze_root_encoder:
+        raise ValueError("--train-shared and --freeze-root-encoder are contradictory")
+    if args.autotune_init_from_alpha and args.alpha <= 0:
+        raise ValueError("--alpha must be > 0 when --autotune-init-from-alpha is enabled")
+    if args.track:
+        raise NotImplementedError("--track is declared but W&B integration is not implemented")
+    if args.capture_video:
+        raise NotImplementedError("--capture-video is declared but video recording is not implemented")
 
 
 if __name__ == "__main__":
@@ -393,13 +432,16 @@ if __name__ == "__main__":
         fusion_mode=args.fusion_mode,
         use_alpha_mass=args.use_alpha_mass,
         use_alpha_scale=args.use_alpha_scale,
+        constrain_alpha_mass=args.constrain_alpha_mass,
         distill_test_frac=args.distill_test_frac,
         similarity_samples=args.similarity_samples,
         distill_max_samples=args.distill_max_samples,
         distill_epochs=args.distill_epochs,
+        distill_select_best_val=args.distill_select_best_val,
         distill_lr=args.distill_lr,
         distill_batch_size=args.distill_batch_size,
         train_shared=args.train_shared,
+        freeze_root_encoder=args.freeze_root_encoder,
         pretrained_encoder=args.pretrained_encoder,
         encoder_linear_out=args.encoder_linear_out,
     )
@@ -424,8 +466,8 @@ if __name__ == "__main__":
     # damage shows up as "forgetting" in the retention matrix and as corrupted
     # behavioural-KL merge decisions, neither of which points at the real cause.
     _encoder_frozen = (
-        (args.pretrained_encoder is not None or latest_dir is not None)
-        and not args.train_shared
+        not args.train_shared
+        and (args.pretrained_encoder is not None or latest_dir is not None or args.freeze_root_encoder)
     )
     _encoder_fingerprint = None
     if _encoder_frozen:
@@ -441,7 +483,10 @@ if __name__ == "__main__":
 
     if args.autotune:
         target_entropy = -float(np.prod(envs.single_action_space.shape))
-        log_alpha = torch.zeros(1, requires_grad=True, device=device)
+        initial_log_alpha = np.log(args.alpha) if args.autotune_init_from_alpha else 0.0
+        log_alpha = torch.tensor(
+            [initial_log_alpha], dtype=torch.float32, requires_grad=True, device=device
+        )
         alpha = float(log_alpha.exp().item())
         a_optimizer = optim.Adam([log_alpha], lr=args.q_lr)
     else:
@@ -581,17 +626,23 @@ if __name__ == "__main__":
         f"({args.total_timesteps / max(train_loop_seconds, 1e-9):.2f} steps/sec) ***"
     )
 
-    # Every four-way condition collects this buffer. Distillation-based modes
-    # need it for behavioral KL/distillation; cosine modes keep the same extra
-    # interaction budget for a fair wall-clock/data-collection comparison.
-    print(f"*** Collecting {args.distill_extra_steps} post-training states for behavioral merging ***")
-    merge_buffer, buffer_seconds = collect_merge_buffer(
-        actor, envs, args.distill_extra_steps, args.task_id, args.seq_idx, device,
-        seed=args.seed + 123_456,
-    )
-    writer.add_scalar("timing/merge_buffer_seconds", buffer_seconds, global_step)
-    writer.add_scalar("analysis/buffer/rows", len(merge_buffer["obs"]), global_step)
-    writer.add_scalar("analysis/buffer/mean_velocity_error", float(np.nanmean(merge_buffer["velocity_error"])), global_step)
+    needs_merge_buffer = bool(args.distillation or args.collect_cosine_buffers)
+    if needs_merge_buffer:
+        print(f"*** Collecting {args.distill_extra_steps} post-training states for merge diagnostics/distillation ***")
+        merge_buffer, buffer_seconds = collect_merge_buffer(
+            actor, envs, args.distill_extra_steps, args.task_id, args.seq_idx, device,
+            seed=args.seed + 123_456,
+        )
+        writer.add_scalar("timing/merge_buffer_seconds", buffer_seconds, global_step)
+        writer.add_scalar("analysis/buffer/rows", len(merge_buffer["obs"]), global_step)
+        finite_errors = np.asarray(merge_buffer["velocity_error"]).reshape(-1)
+        finite_errors = finite_errors[np.isfinite(finite_errors)]
+        if finite_errors.size:
+            writer.add_scalar("analysis/buffer/mean_velocity_error", float(finite_errors.mean()), global_step)
+    else:
+        merge_buffer = None
+        writer.add_scalar("timing/merge_buffer_seconds", 0.0, global_step)
+        print("*** Skipping merge-buffer collection (cosine mode; --no-collect-cosine-buffers) ***")
 
     final_eval = eval_agent(actor, eval_env, args.num_evals, global_step, writer, device)
     actor.model.set_own_buffer(merge_buffer)
@@ -686,7 +737,13 @@ if __name__ == "__main__":
         writer.add_scalar("charts/final_return", final_eval["return"], global_step)
         writer.add_scalar("charts/final_success", final_eval["success"], global_step)
         writer.add_scalar("charts/final_velocity_error", final_eval["velocity_error"], global_step)
+        writer.add_scalar("charts/final_x_velocity", final_eval["x_velocity"], global_step)
         actor.model.save(dirname=run_dir)
+        manifest = write_manifest(
+            run_dir, vars(args), parent_dirs=args.prev_units,
+            pretrained_encoder=args.pretrained_encoder,
+        )
+        print(f"*** RUN_SIGNATURE: {manifest['run_signature']} ***")
 
     envs.close()
     eval_env.close()

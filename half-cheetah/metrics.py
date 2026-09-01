@@ -22,9 +22,9 @@ begin with):
                     relative to itself at the final step is trivially 0).
 - BWT (backward)  : mean over the same range of (p_N,i - p_i,i), signed,
                     no floor (survey Eq. 10).
-- FT  (forward)   : two variants, both averaged over occurrences i=1..N-1
-                    (survey Eq. 9 -- FIRST position excluded, since it has
-                    no continual history to transfer from):
+- FT  (forward)   : two variants, averaged only over FIRST encounters of
+                    previously unseen tasks after the initial stream task. A
+                    repeated task is relearning/savings, not forward transfer.
       FT_success  : the literal survey formula, AUC over test_success in
                     [0,1] vs. a from-scratch baseline's AUC.
       FT_return   : algebraic reduction of the same formula assuming
@@ -53,6 +53,12 @@ from tensorboard.backend.event_processing import event_accumulator
 from cka_rl import FrozenCkaPolicy
 from tasks import get_task
 import scratch_baselines as scratch
+from experiment_identity import (
+    MANIFEST_NAME,
+    checkpoint_matches as _identity_checkpoint_matches,
+    checkpoint_signature,
+    load_manifest,
+)
 
 # NumPy 2.0 removed np.trapz in favor of np.trapezoid; NumPy <2.0 only has
 # np.trapz. Picking whichever exists at import time keeps this file working
@@ -86,46 +92,100 @@ def analysis_snapshot_path(analysis_root, suite, condition, seed, seq_idx, task_
 
 
 def checkpoint_complete(path):
-    required = ["policy_snapshot.pt", "fc.pt", "mean_pool.pt", "logstd_pool.pt"]
-    return path.exists() and all((path / name).exists() for name in required)
+    path = pathlib.Path(path)
+    required = ["policy_snapshot.pt", "fc.pt", "mean_pool.pt", "logstd_pool.pt", MANIFEST_NAME]
+    return path.exists() and all((path / name).exists() for name in required) and load_manifest(path) is not None
 
 
-CACHE_SCHEMA_VERSION = 2
+def checkpoint_matches(path, expected_mapping, *, parent_dirs=(), pretrained_encoder=None):
+    """Validate the complete training identity of a resumable checkpoint."""
+    if not checkpoint_complete(path):
+        return False, "checkpoint files or valid run_manifest.json are missing"
+    return _identity_checkpoint_matches(
+        path, expected_mapping, parent_dirs=parent_dirs,
+        pretrained_encoder=pretrained_encoder,
+    )
+
+
+CACHE_SCHEMA_VERSION = 3
 
 
 def _benchmark_cache_config(args):
-    """Training/evaluation knobs that materially determine cached metrics.
+    """Configuration knobs that materially determine cached metrics."""
+    keys = (
+        "task_sequence", "save_root", "runs_root", "analysis_root",
+        "total_timesteps", "learning_starts", "random_actions_end",
+        "batch_size", "policy_lr", "q_lr", "gamma", "tau", "alpha",
+        "autotune", "autotune_init_from_alpha", "pool_size", "eval_every",
+        "num_evals", "distill_extra_steps", "collect_cosine_buffers",
+        "max_distill_buffer", "similarity_samples", "distill_max_samples",
+        "distill_epochs", "distill_lr", "distill_batch_size",
+        "distill_test_frac", "distill_select_best_val", "train_shared",
+        "freeze_root_encoder", "encoder_from_base", "pretrained_encoder",
+        "encoder_linear_out", "use_alpha_scale", "weight_use_alpha_mass",
+        "constrain_alpha_mass",
+    )
+    config = {}
+    for key in keys:
+        if not hasattr(args, key):
+            continue
+        value = getattr(args, key)
+        if key == "task_sequence":
+            config["sequence"] = list(value)
+        elif isinstance(value, pathlib.Path):
+            config[key] = str(value)
+        else:
+            config[key] = value
+    return config
 
-    Code changes still require --force-retrain, but changing any of these
-    command-line settings automatically invalidates old JSON metric caches.
+
+def _continual_checkpoint_signatures(args, suite, condition, seed):
+    signatures = []
+    for seq_idx, task_id in enumerate(args.task_sequence):
+        run_dir = checkpoint_dir(args.save_root, suite, condition, seed, seq_idx, task_id)
+        signatures.append(checkpoint_signature(run_dir))
+    return signatures
+
+
+def _scratch_checkpoint_signatures(args, suite, scratch_seeds, scratch_total_timesteps):
+    save_root = getattr(args, "scratch_save_root", scratch.SCRATCH_SAVE_ROOT)
+    result = {}
+    for task_id in sorted(set(args.task_sequence)):
+        for seed in scratch_seeds:
+            run_dir = scratch.scratch_checkpoint_dir(
+                save_root, suite, task_id, scratch_total_timesteps, seed
+            )
+            result[f"task_{task_id}/seed_{seed}"] = checkpoint_signature(run_dir)
+    return result
+
+
+def _validate_scratch_checkpoints(args, suite, scratch_seeds, scratch_total_timesteps):
+    """Fail fast if FT would use missing or configuration-mismatched baselines.
+
+    Cache signatures alone prevent stale JSON reuse, but direct metric calls must
+    also reject a baseline trained with different encoder/SAC settings.
     """
-    return {
-        "sequence": list(args.task_sequence),
-        "save_root": str(args.save_root),
-        "runs_root": str(args.runs_root),
-        "total_timesteps": int(args.total_timesteps),
-        "learning_starts": int(args.learning_starts),
-        "random_actions_end": int(args.random_actions_end),
-        "batch_size": int(args.batch_size),
-        "policy_lr": float(args.policy_lr),
-        "q_lr": float(args.q_lr),
-        "gamma": float(args.gamma),
-        "tau": float(args.tau),
-        "pool_size": int(args.pool_size),
-        "eval_every": int(args.eval_every),
-        "num_evals": int(args.num_evals),
-        "distill_extra_steps": int(args.distill_extra_steps),
-        "max_distill_buffer": int(args.max_distill_buffer),
-        "similarity_samples": int(args.similarity_samples),
-        "distill_max_samples": int(args.distill_max_samples),
-        "distill_epochs": int(args.distill_epochs),
-        "distill_lr": float(args.distill_lr),
-        "distill_batch_size": int(args.distill_batch_size),
-        "distill_test_frac": float(args.distill_test_frac),
-        "train_shared": bool(args.train_shared),
-        "pretrained_encoder": None if args.pretrained_encoder is None else str(args.pretrained_encoder),
-        "encoder_linear_out": bool(args.encoder_linear_out),
-    }
+    save_root = getattr(args, "scratch_save_root", scratch.SCRATCH_SAVE_ROOT)
+    problems = []
+    for task_id in sorted(set(args.task_sequence)):
+        for seed in scratch_seeds:
+            run_dir = scratch.scratch_checkpoint_dir(
+                save_root, suite, task_id, scratch_total_timesteps, seed
+            )
+            matches, reason = scratch.checkpoint_matches(
+                run_dir, suite, task_id, scratch_total_timesteps, seed, args
+            )
+            if not matches:
+                problems.append(
+                    f"task {task_id}, seed {seed}: {reason} ({run_dir})"
+                )
+    if problems:
+        joined = "\n  - ".join(problems)
+        raise RuntimeError(
+            "Forward-transfer scratch baselines are missing or incompatible. "
+            "Retrain them with scratch_baselines.py using the same training/encoder "
+            f"settings as the continual run:\n  - {joined}"
+        )
 
 
 def load_scalar(directory, scalar_tag):
@@ -221,12 +281,14 @@ def build_retention_matrix(args, suite, condition, seed, device):
         with open(cache) as f:
             cached = json.load(f)
         expected_config = _benchmark_cache_config(args)
+        expected_signatures = _continual_checkpoint_signatures(args, suite, condition, seed)
         if (
             cached.get("cache_schema_version") == CACHE_SCHEMA_VERSION
             and cached.get("suite") == suite
             and cached.get("condition") == condition
             and int(cached.get("seed", -1)) == int(seed)
             and cached.get("cache_config") == expected_config
+            and cached.get("checkpoint_signatures") == expected_signatures
             and cached.get("eval_task_ids") == eval_task_ids
             and int(cached.get("episodes", -1)) == int(args.retention_eval_episodes)
         ):
@@ -235,6 +297,7 @@ def build_retention_matrix(args, suite, condition, seed, device):
     data = {
         "cache_schema_version": CACHE_SCHEMA_VERSION,
         "cache_config": _benchmark_cache_config(args),
+        "checkpoint_signatures": _continual_checkpoint_signatures(args, suite, condition, seed),
         "suite": suite,
         "condition": condition,
         "seed": seed,
@@ -356,14 +419,28 @@ def _auc(steps, values):
     return float(_trapz(values, steps) / span)
 
 
+def _first_unseen_positions(task_sequence):
+    """Positions eligible for forward transfer: first encounter of each new task.
+
+    Position 0 is excluded because there is no prior continual experience. Later
+    repetitions are relearning/savings and must not be mislabeled as FT.
+    """
+    seen = set()
+    result = []
+    for seq_idx, task_id in enumerate(task_sequence):
+        if task_id not in seen and seq_idx > 0:
+            result.append((seq_idx, task_id))
+        seen.add(task_id)
+    return result
+
+
 def compute_forward_transfer_success(args, suite, condition, seed, scratch_seeds, scratch_total_timesteps):
     """Survey Eq. 9, literal: p_i(t) = charts/test_success, already in
-    [0,1]. Averaged over occurrences i=1..N-1 (0-indexed: seq_idx=1..end),
-    the FIRST occurrence excluded (no continual history to transfer from
-    yet, so FT_0 is not meaningful)."""
+    [0,1]. Averaged only over first encounters of previously unseen tasks
+    after sequence position 0. Repeated tasks measure relearning/savings, not FT."""
     per_position = []
-    for seq_idx in range(1, len(args.task_sequence)):
-        task_id = args.task_sequence[seq_idx]
+    per_position_index = []
+    for seq_idx, task_id in _first_unseen_positions(args.task_sequence):
         run_steps, run_values = load_scalar(
             event_dir(args.runs_root, suite, condition, seed, seq_idx, task_id),
             "charts/test_success",
@@ -385,21 +462,23 @@ def compute_forward_transfer_success(args, suite, condition, seed, scratch_seeds
         if auc_b >= 1.0:
             continue  # a perfect baseline leaves no headroom -- 1-AUC_b would divide by zero
         per_position.append((auc - auc_b) / (1.0 - auc_b))
+        per_position_index.append({"seq_idx": int(seq_idx), "task_id": int(task_id)})
 
     return {
         "FT_success": float(np.mean(per_position)) if per_position else float("nan"),
         "FT_success_per_position": per_position,
+        "FT_success_positions": per_position_index,
     }
 
 
 def compute_forward_transfer_return(args, suite, condition, seed, scratch_seeds, scratch_total_timesteps):
     """Algebraic reduction FT_i = 1 - R_i/R_i^b (see module docstring for
     the derivation), using RAW charts/test_episodic_return integrals -- no
-    [0,1] normalization needed since r_min cancels out of the ratio. Same
-    i=1..N-1 range as compute_forward_transfer_success."""
+    [0,1] normalization needed since r_min cancels out of the ratio. Uses the
+    same first-unseen-task positions as compute_forward_transfer_success."""
     per_position = []
-    for seq_idx in range(1, len(args.task_sequence)):
-        task_id = args.task_sequence[seq_idx]
+    per_position_index = []
+    for seq_idx, task_id in _first_unseen_positions(args.task_sequence):
         run_steps, run_values = load_scalar(
             event_dir(args.runs_root, suite, condition, seed, seq_idx, task_id),
             "charts/test_episodic_return",
@@ -420,10 +499,12 @@ def compute_forward_transfer_return(args, suite, condition, seed, scratch_seeds,
         if r_i_b == 0.0:
             continue
         per_position.append(1.0 - (r_i / r_i_b))
+        per_position_index.append({"seq_idx": int(seq_idx), "task_id": int(task_id)})
 
     return {
         "FT_return": float(np.mean(per_position)) if per_position else float("nan"),
         "FT_return_per_position": per_position,
+        "FT_return_positions": per_position_index,
     }
 
 
@@ -436,6 +517,14 @@ def survey_metrics_cache_path(args, suite, condition, seed):
 
 
 def compute_survey_metrics(args, suite, condition, seed, device, scratch_seeds, scratch_total_timesteps):
+    # Forward transfer is undefined unless its from-scratch denominator was
+    # trained under the same SAC/encoder configuration. Validate before even
+    # considering a cached metric file so direct callers cannot silently mix
+    # incompatible experiments.
+    _validate_scratch_checkpoints(
+        args, suite, scratch_seeds, scratch_total_timesteps
+    )
+
     cache = survey_metrics_cache_path(args, suite, condition, seed)
     if cache.exists() and not args.force_retrain:
         with open(cache) as f:
@@ -447,12 +536,18 @@ def compute_survey_metrics(args, suite, condition, seed, device, scratch_seeds, 
             "scratch_total_timesteps": int(scratch_total_timesteps),
             "scratch_save_root": str(getattr(args, "scratch_save_root", scratch.SCRATCH_SAVE_ROOT)),
         }
+        expected_checkpoint_signatures = _continual_checkpoint_signatures(args, suite, condition, seed)
+        expected_scratch_signatures = _scratch_checkpoint_signatures(
+            args, suite, scratch_seeds, scratch_total_timesteps
+        )
         if (
             cached.get("cache_schema_version") == CACHE_SCHEMA_VERSION
             and cached.get("suite") == suite
             and cached.get("condition") == condition
             and int(cached.get("seed", -1)) == int(seed)
             and cached.get("cache_config") == expected_config
+            and cached.get("checkpoint_signatures") == expected_checkpoint_signatures
+            and cached.get("scratch_checkpoint_signatures") == expected_scratch_signatures
         ):
             return cached
 
@@ -471,6 +566,10 @@ def compute_survey_metrics(args, suite, condition, seed, device, scratch_seeds, 
             "scratch_total_timesteps": int(scratch_total_timesteps),
             "scratch_save_root": str(getattr(args, "scratch_save_root", scratch.SCRATCH_SAVE_ROOT)),
         },
+        "checkpoint_signatures": _continual_checkpoint_signatures(args, suite, condition, seed),
+        "scratch_checkpoint_signatures": _scratch_checkpoint_signatures(
+            args, suite, scratch_seeds, scratch_total_timesteps
+        ),
         "suite": suite,
         "condition": condition,
         "seed": seed,

@@ -170,8 +170,7 @@ python -u sanity_check_pool.py
 # ------------------------------------------------------------
 echo
 echo "============================================================"
-echo "[train] suites:"
-echo "        halfcheetah_vel"
+echo "[train] suite:"
 echo "        halfcheetah_wind_vel"
 echo "[train]"
 echo "[train] variants:"
@@ -180,7 +179,7 @@ echo "        distil_only"
 echo "        weight_only"
 echo "        combined"
 echo "[train]"
-echo "[train] seeds: 1 2 3"
+echo "[train] seeds: 1 2"
 echo "[train] timesteps/task: 50000"
 echo "[train] pool-size: 5"
 echo "============================================================"
@@ -207,9 +206,8 @@ srun python -u run_continual_benchmark.py \
     --distill-batch-size 256 \
     --distill-test-frac 0.2 \
     --save-root "$RUN_ROOT/agents" \
-    --runs-root runs \
+    --runs-root "$RUN_ROOT/runs" \
     --plots-root "$RUN_ROOT/plots" \
-    --skip-training \
     --analysis-root "$RUN_ROOT/analysis"
 
 echo

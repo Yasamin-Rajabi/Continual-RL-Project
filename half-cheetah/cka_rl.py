@@ -19,7 +19,7 @@ from loguru import logger
 
 from knowledge_pools import BASE_FUSION_MODE, HeadPool
 from policy_utils import bound_log_std, diagonal_gaussian_kl, symmetric_diagonal_gaussian_kl
-from shared_arch import shared
+from shared_arch import shared, validate_shared_encoder
 
 _HEAD_KEYS = ("l0_weight", "l0_bias", "l2_weight", "l2_bias")
 
@@ -46,11 +46,13 @@ class CkaRlAgent(nn.Module):
         fix_alpha=False,
         use_alpha_scale=False,
         use_alpha_mass=False,
+        constrain_alpha_mass=True,
         encoder_from_base=False,
         distillation=True,
         fusion_mode=BASE_FUSION_MODE,
         max_distill_buffer=50_000,
         distill_test_frac=0.2,
+        distill_select_best_val=True,
         distill_epochs=8,
         distill_lr=3e-4,
         distill_batch_size=256,
@@ -59,6 +61,7 @@ class CkaRlAgent(nn.Module):
         hidden_dim=128,
         shared_dim=256,
         train_shared=False,
+        freeze_root_encoder=False,
         pretrained_encoder=None,
         encoder_linear_out=False,
     ):
@@ -71,13 +74,18 @@ class CkaRlAgent(nn.Module):
         self.fusion_mode = fusion_mode
         self.max_distill_buffer = int(max_distill_buffer)
         self.use_alpha_mass = bool(use_alpha_mass)
+        self.constrain_alpha_mass = bool(constrain_alpha_mass)
         self.distill_test_frac = float(distill_test_frac)
+        self.distill_select_best_val = bool(distill_select_best_val)
         self.distill_epochs = int(distill_epochs)
         self.distill_lr = float(distill_lr)
         self.distill_batch_size = int(distill_batch_size)
         self.distill_max_samples = int(distill_max_samples)
         self.similarity_samples = int(similarity_samples)
         self.train_shared = bool(train_shared)
+        self.freeze_root_encoder = bool(freeze_root_encoder)
+        if self.train_shared and self.freeze_root_encoder:
+            raise ValueError("train_shared=True and freeze_root_encoder=True are contradictory")
         self.last_merge_info = None
         self.last_distill_metrics = {}
 
@@ -85,13 +93,15 @@ class CkaRlAgent(nn.Module):
             "mean", shared_dim, hidden_dim, act_dim,
             fusion_mode=fusion_mode, pool_size=pool_size,
             distillation=distillation, max_distill_buffer=max_distill_buffer,
-            use_alpha_mass=use_alpha_mass, distill_test_frac=distill_test_frac,
+            use_alpha_mass=use_alpha_mass, constrain_alpha_mass=constrain_alpha_mass,
+            distill_test_frac=distill_test_frac,
         )
         self.logstd_pool = HeadPool(
             "logstd", shared_dim, hidden_dim, act_dim,
             fusion_mode=fusion_mode, pool_size=pool_size,
             distillation=distillation, max_distill_buffer=max_distill_buffer,
-            use_alpha_mass=use_alpha_mass, distill_test_frac=distill_test_frac,
+            use_alpha_mass=use_alpha_mass, constrain_alpha_mass=constrain_alpha_mass,
+            distill_test_frac=distill_test_frac,
         )
 
         if latest_dir is not None:
@@ -134,31 +144,48 @@ class CkaRlAgent(nn.Module):
         # the slowest task in the suite, so the default base encoder has never
         # seen fast-gait dynamics -- yet it holds 51% of the actor's parameters
         # and is the fixed basis every knowledge vector is defined against.
-        if pretrained_encoder is not None:
-            logger.info(f"Loading TD-JEPA pretrained encoder from {pretrained_encoder}")
-            self.fc = _torch_load(pretrained_encoder, map_location="cpu")
-        elif self.train_shared and latest_dir is not None:
-            # If shared training is explicitly enabled, continue from the most
-            # recently trained encoder.  encoder_from_base must not reset every
-            # new task back to task 0.
+        # Encoder policy is explicit and ablatable:
+        #   * pretrained + frozen (TD-JEPA default): use the same pretrained basis
+        #     on every task;
+        #   * train_shared=True: task 0 starts from pretrained/scratch, then later
+        #     tasks continue from latest_dir rather than resetting to the root;
+        #   * no pretrained + train_shared=False: task 0 learns the root encoder,
+        #     then later tasks freeze/reuse that basis;
+        #   * freeze_root_encoder=True is an explicit random-frozen ablation.
+        if latest_dir is not None and self.train_shared:
             logger.info(f"Loading latest trainable encoder from {latest_dir}")
             self.fc = _torch_load(f"{latest_dir}/fc.pt", map_location="cpu")
+            source = f"latest encoder {latest_dir}/fc.pt"
+        elif pretrained_encoder is not None:
+            logger.info(f"Loading pretrained encoder from {pretrained_encoder}")
+            self.fc = _torch_load(pretrained_encoder, map_location="cpu")
+            source = f"pretrained encoder {pretrained_encoder}"
         elif encoder_from_base and base_dir is not None:
-            # Frozen/default continual setting: every historical head is defined
-            # against the immutable root encoder.
             logger.info(f"Loading frozen encoder from base {base_dir}")
             self.fc = _torch_load(f"{base_dir}/fc.pt", map_location="cpu")
+            source = f"base encoder {base_dir}/fc.pt"
         elif latest_dir is not None:
             logger.info(f"Loading shared encoder from {latest_dir}")
             self.fc = _torch_load(f"{latest_dir}/fc.pt", map_location="cpu")
+            source = f"latest encoder {latest_dir}/fc.pt"
         else:
-            logger.info("Training root shared encoder from scratch")
+            logger.info("Initializing root shared encoder from scratch")
             self.fc = shared(input_dim=obs_dim, linear_out=self.encoder_linear_out)
+            source = "new root encoder"
 
-        # A pretrained encoder is frozen from task 0 onward, not from task 1: the
-        # entire point is that no single task ever gets to define the basis.
-        if (pretrained_encoder is not None or latest_dir is not None) and not self.train_shared:
-            logger.info("Shared encoder frozen (train_shared=False)")
+        validate_shared_encoder(
+            self.fc, input_dim=obs_dim, linear_out=self.encoder_linear_out, source=source
+        )
+
+        # Frozen TD-JEPA encoders are frozen from task 0.  Without pretraining,
+        # the default lets task 0 learn a root basis and freezes it only on later
+        # tasks. freeze_root_encoder=True exposes the random-frozen ablation.
+        should_freeze = (
+            not self.train_shared
+            and (pretrained_encoder is not None or latest_dir is not None or self.freeze_root_encoder)
+        )
+        if should_freeze:
+            logger.info("Shared encoder frozen")
             self.fc.requires_grad_(False)
 
     def _assert_pool_alignment(self):
@@ -540,11 +567,20 @@ class CkaRlAgent(nn.Module):
                 best_epoch = epoch
                 best_mean_params, best_log_params = clone_student_params()
 
-        # Restore the validation-best student before computing final diagnostics.
-        with torch.no_grad():
-            for key in _HEAD_KEYS:
-                mean_params[key].copy_(best_mean_params[key])
-                log_params[key].copy_(best_log_params[key])
+        # Validation-best selection is an optimization, not part of the core
+        # distillation definition. Keep the legacy "last epoch" behaviour behind
+        # a flag for controlled ablations.
+        if self.distill_select_best_val:
+            with torch.no_grad():
+                for key in _HEAD_KEYS:
+                    mean_params[key].copy_(best_mean_params[key])
+                    log_params[key].copy_(best_log_params[key])
+            selected_epoch = int(best_epoch)
+            selected_val_kl = float(best_val_kl)
+        else:
+            selected_epoch = int(self.distill_epochs)
+            final_val = kl_summary(validation_idx)
+            selected_val_kl = float("nan") if final_val is None else float(final_val["mean"])
 
         with torch.no_grad():
             def metrics(indices):
@@ -583,11 +619,14 @@ class CkaRlAgent(nn.Module):
             "policy/distill_test_logstd_mse": test_logstd_mse,
             "policy/distill_best_epoch": int(best_epoch),
             "policy/distill_best_val_kl": float(best_val_kl),
+            "policy/distill_selected_epoch": selected_epoch,
+            "policy/distill_selected_val_kl": selected_val_kl,
+            "policy/distill_select_best_val": float(self.distill_select_best_val),
             "policy/distill_initial_val_kl": None if initial_val is None else float(initial_val["mean"]),
             "policy/distill_rows": int(n),
         }
         logger.info(
-            f"[policy distill] rows={n} best_epoch={best_epoch} "
+            f"[policy distill] rows={n} best_epoch={best_epoch} selected_epoch={selected_epoch} "
             f"train_KL={train_kl:.6f} test_KL={test_kl if test_kl is not None else 'n/a'} "
             f"train_p95={train_kl_p95:.6f} "
             f"test_p95={test_kl_p95 if test_kl_p95 is not None else 'n/a'}"

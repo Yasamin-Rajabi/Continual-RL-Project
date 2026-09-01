@@ -24,10 +24,7 @@ import numpy as np
 try:
     import gymnasium as gym
     import mujoco
-    try:
-        from gymnasium.envs.mujoco.half_cheetah_v5 import HalfCheetahEnv
-    except ImportError:
-        from gymnasium.envs.mujoco.half_cheetah_v4 import HalfCheetahEnv
+    from gymnasium.envs.mujoco.half_cheetah_v5 import HalfCheetahEnv
 except ImportError as exc:  # Make import errors actionable on non-MuJoCo machines.
     gym = None
     mujoco = None
@@ -136,7 +133,7 @@ class HalfCheetahVelEnv(HalfCheetahVelocityEnv):
 
 
 class HalfCheetahWindVelEnv(HalfCheetahVelocityEnv):
-    """Named convenience wrapper for joint target-velocity + hidden-wind tasks."""
+    """Named convenience wrapper for joint target-velocity + task-conditioned fixed-wind tasks."""
 
     def __init__(self, target_velocity: float, wind: Tuple[float, float], **kwargs):
         super().__init__(target_velocity=target_velocity, wind=wind, **kwargs)

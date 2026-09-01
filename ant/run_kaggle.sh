@@ -1,165 +1,149 @@
 #!/usr/bin/env bash
-# run_kaggle.sh — one entrypoint for the whole pipeline, meant to be called
-# from Kaggle notebook cells.
-#
-# Why a single script: Kaggle's weekly GPU quota is limited (30 hrs) and
-# sessions get interrupted. Both run_continual_benchmark.py and
-# scratch_baselines.py already check checkpoint_complete() and skip finished
-# work, so re-running this script just resumes whatever wasn't finished.
-#
-# Usage from a notebook cell:
-#   !bash run_kaggle.sh setup
-#   !bash run_kaggle.sh sanity
-#   !bash run_kaggle.sh pretrain hc
-#   !bash run_kaggle.sh baselines hc
-#   !bash run_kaggle.sh continual hc
-#   !bash run_kaggle.sh all hc          # the four steps above, back to back
-#
-# For Ant, calibrate the velocity band FIRST -- absolute HalfCheetah targets
-# are unreachable on Ant and collapse several tasks into one:
-#   !bash run_kaggle.sh calibrate ant     # then paste the result into tasks.py
-#   !bash run_kaggle.sh all ant
-#
-# If a session drops mid-step, just re-run the same command.
-
+# Kaggle entrypoint for the FINAL Ant pipeline.
+# Calibration is automatic and machine-readable; no manual source edit is used.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 OUT="${KAGGLE_WORKING:-/kaggle/working}"
-mkdir -p "$OUT/pretrained_encoders" "$OUT/agents" "$OUT/plots" "$OUT/logs"
+SEEDS="${SEEDS:-1 2 3}"
+TOTAL_TIMESTEPS="${TOTAL_TIMESTEPS:-300000}"
+PRETRAIN_STEPS_PER_TASK="${PRETRAIN_STEPS_PER_TASK:-100000}"
+PRETRAIN_EPOCHS="${PRETRAIN_EPOCHS:-30}"
+CALIBRATION_STEPS="${CALIBRATION_STEPS:-150000}"
+SUITE="ant_vel"
+CALIBRATION_FILE="$PWD/ant_calibration.json"
+ENC_DIR="$OUT/pretrained_encoders/ant_tdjepa"
+mkdir -p "$OUT"/{pretrained_encoders,agents,plots,logs,runs,analysis,scratch_models}
 
-# --------------------------------------------------------------------------
-# Configuration — edit values here, not on the command line
-# --------------------------------------------------------------------------
-SEEDS="1 2 3"
-TOTAL_TIMESTEPS=50000          # vs. the 300000 default; see README section 6
-PRETRAIN_STEPS_PER_TASK=100000
-PRETRAIN_EPOCHS=30
-
-HC_SUITE="halfcheetah_vel"
-ANT_SUITE="ant_vel"
-
-# --------------------------------------------------------------------------
-suite_of() { [ "$1" = "ant" ] && echo "$ANT_SUITE" || echo "$HC_SUITE"; }
-enc_dir()  { echo "$OUT/pretrained_encoders/$1"; }
-
-step_setup() {
-    echo ">>> setup: installing dependencies"
-    pip install -q -r requirements.txt --break-system-packages 2>/dev/null || \
-    pip install -q -r requirements.txt
-    echo "OK"
+cuda_check() {
+python3 - <<'PY'
+import torch
+print("torch:", torch.__version__)
+print("cuda available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("gpu:", torch.cuda.get_device_name(0))
+    print("compiled architectures:", torch.cuda.get_arch_list())
+    x = torch.randn(256, 256, device="cuda")
+    y = x @ x
+    torch.cuda.synchronize()
+    print("real CUDA kernel test: OK", float(y.mean()))
+PY
 }
 
-step_sanity() {
-    echo ">>> sanity: structural checks for pool and tasks (no GPU needed)"
-    python3 sanity_check_pool.py
-    python3 tasks.py
-    python3 tasks.py --check
-    echo "OK"
+step_setup() {
+    python3 -m pip install -q -r requirements.txt --break-system-packages 2>/dev/null || \
+    python3 -m pip install -q -r requirements.txt
+    python3 -m pip check
+    cuda_check
 }
 
 step_calibrate() {
-    local fam="$1"
-    if [ "$fam" != "ant" ]; then
-        echo "calibrate only applies to ant (HalfCheetah targets are already set)"
-        return 0
+    if [ -f "$CALIBRATION_FILE" ] && [ "${FORCE_CALIBRATION:-0}" != "1" ]; then
+        echo ">>> Ant calibration already exists: $CALIBRATION_FILE"
+        python3 - <<'PY'
+import json
+print(json.load(open("ant_calibration.json")))
+PY
+        return
     fi
-    echo ">>> calibrate[ant]: measuring reachable forward velocity"
-    echo "    After this finishes, paste the printed _ANT_V_MAX into tasks.py"
-    echo "    and re-run 'sanity' before continuing."
     python3 calibrate_ant.py \
-        --total-timesteps 150000 \
-        --save-dir "$OUT/agents/ant_calibrate" \
-        --analysis-root "$OUT/logs/ant_calibrate" \
-        2>&1 | tee "$OUT/logs/calibrate_ant.log"
+        --total-timesteps "$CALIBRATION_STEPS" --seeds 1 2 3 \
+        --save-root "$OUT/agents/ant_calibration" \
+        --runs-root "$OUT/runs/ant_calibration" \
+        --analysis-root "$OUT/analysis/ant_calibration" \
+        --output "$CALIBRATION_FILE" 2>&1 | tee "$OUT/logs/ant_calibration.log"
+}
+
+step_sanity() {
+    python3 sanity_check_pool.py
+    python3 tasks.py --check
+}
+
+pretrain_matches_calibration() {
+    [ -f "$ENC_DIR/fc.pt" ] && [ -f "$ENC_DIR/report.json" ] || return 1
+    python3 - "$ENC_DIR/report.json" "$CALIBRATION_FILE" <<'PY'
+import json, math, sys
+report=json.load(open(sys.argv[1])); cal=json.load(open(sys.argv[2]))
+saved=(report.get("ant_calibration") or {}).get("v_max")
+raise SystemExit(0 if saved is not None and math.isclose(float(saved), float(cal["v_max"]), rel_tol=0, abs_tol=1e-12) else 1)
+PY
 }
 
 step_pretrain() {
-    local fam="$1" suite; suite="$(suite_of "$fam")"
-    local out; out="$(enc_dir "$fam")"
-    if [ -f "$out/fc.pt" ]; then
-        echo ">>> pretrain[$fam]: fc.pt already exists, skipping ($out)"
-        return 0
+    [ -f "$CALIBRATION_FILE" ] || { echo "Missing calibration; run calibrate first"; exit 1; }
+    if pretrain_matches_calibration && [ "${FORCE_PRETRAIN:-0}" != "1" ]; then
+        echo ">>> TD-JEPA encoder matches current calibration: $ENC_DIR/fc.pt"
+        return
     fi
-    echo ">>> pretrain[$fam]: TD-JEPA on $suite"
-    if [ "$fam" = "ant" ]; then
-        # These assume the DEFAULT _ANT_V_MAX = 3.3. If you calibrated a
-        # different v_max, rescale them: pretrain velocities must fall BETWEEN
-        # the benchmark targets (never equal to one), held-out ones must BE
-        # benchmark targets.
-        python3 tdjepa_pretrain.py \
-            --task-suite "$suite" \
-            --pretrain-velocities 0.66 1.98 3.30 \
-            --heldout-velocities 0.33 1.65 2.97 \
-            --steps-per-task "$PRETRAIN_STEPS_PER_TASK" --epochs "$PRETRAIN_EPOCHS" \
-            --out "$out" 2>&1 | tee "$OUT/logs/pretrain_${fam}.log"
-    else
-        python3 tdjepa_pretrain.py \
-            --task-suite "$suite" \
-            --pretrain-velocities 0.75 1.75 2.75 \
-            --heldout-velocities 0.5 2.0 3.0 \
-            --steps-per-task "$PRETRAIN_STEPS_PER_TASK" --epochs "$PRETRAIN_EPOCHS" \
-            --out "$out" 2>&1 | tee "$OUT/logs/pretrain_${fam}.log"
-    fi
-    echo "OK -> $out/fc.pt"
+    rm -rf "$ENC_DIR"
+    # Velocities are derived automatically from ant_calibration.json by tasks.py.
+    python3 tdjepa_pretrain.py \
+        --task-suite "$SUITE" \
+        --steps-per-task "$PRETRAIN_STEPS_PER_TASK" --epochs "$PRETRAIN_EPOCHS" \
+        --out "$ENC_DIR" 2>&1 | tee "$OUT/logs/ant_pretrain.log"
+}
+
+roots_for() {
+    local stage="$1"
+    echo "$OUT/agents/ant_${stage}|$OUT/runs/ant_${stage}|$OUT/analysis/ant_${stage}|$OUT/scratch_models/ant_${stage}|$OUT/analysis_scratch/ant_${stage}|$OUT/plots/ant_${stage}"
 }
 
 step_baselines() {
-    local fam="$1" suite; suite="$(suite_of "$fam")"
-    local enc; enc="$(enc_dir "$fam")/fc.pt"
-    [ -f "$enc" ] || { echo "ERROR: run 'pretrain $fam' first"; exit 1; }
-    echo ">>> baselines[$fam]: scratch baselines (same encoder as the continual runs)"
+    local stage="${1:-s0}" values agents runs analysis scratch scratch_analysis plots
+    [ -f "$CALIBRATION_FILE" ] || { echo "Missing calibration; run calibrate first"; exit 1; }
+    values="$(roots_for "$stage")"; IFS='|' read -r agents runs analysis scratch scratch_analysis plots <<< "$values"
+    # Match the TD-JEPA linear-output architecture in BOTH S0 and S4. S0 thus
+    # isolates pretraining rather than confounding it with a final-ReLU change.
+    local extra=(--encoder-linear-out --no-train-shared --no-freeze-root-encoder)
+    if [ "$stage" = "s4" ]; then
+        pretrain_matches_calibration || { echo "Pretrained encoder is missing/stale; run pretrain"; exit 1; }
+        extra+=(--pretrained-encoder "$ENC_DIR/fc.pt")
+    elif [ "$stage" != "s0" ]; then
+        echo "stage must be s0 or s4"; exit 2
+    fi
     python3 scratch_baselines.py \
-        --task-suites "$suite" \
+        --task-suites "$SUITE" --seeds 101 102 103 \
         --total-timesteps "$TOTAL_TIMESTEPS" \
-        --pretrained-encoder "$enc" --encoder-linear-out \
-        --analysis-root "$OUT/logs/scratch_${fam}" \
-        2>&1 | tee -a "$OUT/logs/baselines_${fam}.log"
-    echo "OK"
+        --save-root "$scratch" --runs-root "$runs" --analysis-root "$scratch_analysis" \
+        "${extra[@]}" 2>&1 | tee -a "$OUT/logs/ant_${stage}_baselines.log"
 }
 
 step_continual() {
-    local fam="$1" suite; suite="$(suite_of "$fam")"
-    local enc; enc="$(enc_dir "$fam")/fc.pt"
-    [ -f "$enc" ] || { echo "ERROR: run 'pretrain $fam' first"; exit 1; }
-    echo ">>> continual[$fam]: full benchmark run (S0 baseline + S4 TD-JEPA)"
-
-    # S0 -- baseline, no pretrained encoder
+    local stage="${1:-s0}" values agents runs analysis scratch scratch_analysis plots
+    [ -f "$CALIBRATION_FILE" ] || { echo "Missing calibration; run calibrate first"; exit 1; }
+    values="$(roots_for "$stage")"; IFS='|' read -r agents runs analysis scratch scratch_analysis plots <<< "$values"
+    local extra=(--encoder-linear-out --no-train-shared --no-freeze-root-encoder)
+    if [ "$stage" = "s4" ]; then
+        pretrain_matches_calibration || { echo "Pretrained encoder is missing/stale; run pretrain"; exit 1; }
+        extra+=(--pretrained-encoder "$ENC_DIR/fc.pt")
+    elif [ "$stage" != "s0" ]; then
+        echo "stage must be s0 or s4"; exit 2
+    fi
     python3 run_continual_benchmark.py \
-        --task-suites "$suite" --seeds $SEEDS \
+        --task-suites "$SUITE" --seeds $SEEDS \
         --total-timesteps "$TOTAL_TIMESTEPS" \
-        --save-root "$OUT/agents/${fam}_S0" \
-        --plots-root "$OUT/plots/${fam}_S0" \
-        2>&1 | tee -a "$OUT/logs/continual_${fam}_S0.log"
-
-    # S4 -- TD-JEPA
-    python3 run_continual_benchmark.py \
-        --task-suites "$suite" --seeds $SEEDS \
-        --total-timesteps "$TOTAL_TIMESTEPS" \
-        --pretrained-encoder "$enc" --encoder-linear-out \
-        --save-root "$OUT/agents/${fam}_S4" \
-        --plots-root "$OUT/plots/${fam}_S4" \
-        2>&1 | tee -a "$OUT/logs/continual_${fam}_S4.log"
-    echo "OK"
+        --save-root "$agents" --runs-root "$runs" --analysis-root "$analysis" \
+        --scratch-save-root "$scratch" --plots-root "$plots" \
+        "${extra[@]}" 2>&1 | tee -a "$OUT/logs/ant_${stage}_continual.log"
 }
 
 step_all() {
-    local fam="$1"
-    step_pretrain "$fam"
-    step_baselines "$fam"
-    step_continual "$fam"
+    step_calibrate
+    step_sanity
+    step_pretrain
+    step_baselines s0
+    step_baselines s4
+    step_continual s0
+    step_continual s4
 }
 
 case "${1:-}" in
-    setup)      step_setup ;;
-    sanity)     step_sanity ;;
-    calibrate)  step_calibrate "${2:?need hc or ant}" ;;
-    pretrain)   step_pretrain "${2:?need hc or ant}" ;;
-    baselines)  step_baselines "${2:?need hc or ant}" ;;
-    continual)  step_continual "${2:?need hc or ant}" ;;
-    all)        step_all "${2:?need hc or ant}" ;;
-    *)
-        echo "Usage: bash run_kaggle.sh {setup|sanity|calibrate|pretrain|baselines|continual|all} [hc|ant]"
-        exit 1
-        ;;
+    setup) step_setup ;;
+    calibrate) step_calibrate ;;
+    sanity) step_sanity ;;
+    pretrain) step_pretrain ;;
+    baselines) step_baselines "${2:-s0}" ;;
+    continual) step_continual "${2:-s0}" ;;
+    all) step_all ;;
+    *) echo "Usage: bash run_kaggle.sh {setup|calibrate|sanity|pretrain|baselines [s0|s4]|continual [s0|s4]|all}"; exit 2 ;;
 esac

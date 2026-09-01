@@ -14,17 +14,21 @@ import numpy as np
 import torch
 
 from cka_rl import CkaRlAgent, FrozenCkaPolicy
+from shared_arch import shared
 
 OBS_DIM = 6
 ACT_DIM = 3
 TMP_ROOT = "/tmp/cka_pool_sanity"
 
 
-def fake_buffer(n=128, task_id=0):
+def fake_buffer(n=128, task_id=0, source_id=None):
+    if source_id is None:
+        source_id = task_id
     return {
         "obs": np.random.randn(n, OBS_DIM).astype(np.float32),
         "actions": np.tanh(np.random.randn(n, ACT_DIM)).astype(np.float32),
         "task_ids": np.full(n, task_id, dtype=np.int32),
+        "source_ids": np.full(n, source_id, dtype=np.int32),
         "x_velocity": np.random.randn(n, 1).astype(np.float32),
         "velocity_error": np.abs(np.random.randn(n, 1)).astype(np.float32),
     }
@@ -92,7 +96,6 @@ def run_chain(fusion_mode, distillation, use_alpha_mass):
         distill_max_samples=128,
         distill_epochs=2,
         distill_batch_size=32,
-        train_shared=False,
     )
     assert pool_lens(m1) == (1, 1)
     assert m1.mean_pool.alpha is m1.logstd_pool.alpha
@@ -100,7 +103,7 @@ def run_chain(fusion_mode, distillation, use_alpha_mass):
     assert m1.alpha.numel() == 1
     assert not any(p.requires_grad for p in m1.fc.parameters()), "later-task encoder must be frozen"
     train_a_bit(m1)
-    m1.set_own_buffer(fake_buffer(task_id=1))
+    m1.set_own_buffer(fake_buffer(task_id=1, source_id=1))
     m1.finalize()
     assert pool_lens(m1) == (2, 2)
     assert m1.get_merge_info() is None
@@ -121,11 +124,10 @@ def run_chain(fusion_mode, distillation, use_alpha_mass):
         distill_epochs=2,
         distill_batch_size=32,
         distill_test_frac=0.25,
-        train_shared=False,
     )
     assert pool_lens(m2) == (2, 2)
     train_a_bit(m2)
-    m2.set_own_buffer(fake_buffer(task_id=2))
+    m2.set_own_buffer(fake_buffer(task_id=2, source_id=2))
     # Save exact pre-finalize policy and verify the compact inference snapshot.
     probe = torch.randn(8, OBS_DIM)
     with torch.no_grad():
@@ -151,6 +153,7 @@ def run_chain(fusion_mode, distillation, use_alpha_mass):
         assert info["similarity_metric"] == "cosine"
         assert np.isfinite(info["cosine_similarity"])
     assert info["pool_size_before"] == 3 and info["pool_size_after"] == 2
+    assert info["merged_source_lineage"], "source-occurrence lineage must be preserved"
     assert m2.mean_pool.last_merge_info["idx1"] == m2.logstd_pool.last_merge_info["idx1"]
     assert m2.mean_pool.last_merge_info["idx2"] == m2.logstd_pool.last_merge_info["idx2"]
     if distillation:
@@ -158,6 +161,10 @@ def run_chain(fusion_mode, distillation, use_alpha_mass):
         assert metrics["policy/distill_train_kl"] is not None
         assert metrics["policy/distill_test_kl"] is not None
         assert np.isfinite(metrics["policy/distill_test_kl"])
+        assert metrics["policy/distill_best_epoch"] >= 0
+        assert np.isfinite(metrics["policy/distill_best_val_kl"])
+        assert np.isfinite(metrics["policy/distill_train_kl_p95"])
+        assert np.isfinite(metrics["policy/distill_train_kl_max"])
     else:
         assert m2.get_distill_metrics() == {}
     if distillation:
@@ -175,7 +182,6 @@ def run_chain(fusion_mode, distillation, use_alpha_mass):
         fusion_mode=fusion_mode,
         use_alpha_mass=use_alpha_mass,
         encoder_from_base=True,
-        train_shared=False,
     )
     assert pool_lens(m3) == (2, 2)
     assert m3.alpha.numel() == 2
@@ -244,12 +250,136 @@ def check_alpha_mass_restriction():
             pass
         else:
             raise AssertionError("classic_cka must reject use_alpha_mass in both distillation settings")
+
+    # alpha_mass exists only when there is historical knowledge to weight. Build
+    # a one-entry root checkpoint, then inspect the next-task agents.
     for distillation in (False, True):
-        CkaRlAgent(
-            OBS_DIM, ACT_DIM, None, None,
+        case_root = f"{TMP_ROOT}/alpha_mass_{distillation}"
+        shutil.rmtree(case_root, ignore_errors=True)
+        base_dir = f"{case_root}/task0"
+        save_root(base_dir, "weight_delta", distillation, use_alpha_mass=True)
+
+        model = CkaRlAgent(
+            OBS_DIM, ACT_DIM, base_dir, base_dir,
             fusion_mode="weight_delta", distillation=distillation, use_alpha_mass=True,
+            constrain_alpha_mass=True,
         )
-    print("  alpha_mass cleanly restricted to weight_delta modes OK")
+        assert model.alpha_mass is not None
+        # Raw is unconstrained; the default effective mass must stay positive.
+        with torch.no_grad():
+            model.alpha_mass.fill_(-10.0)
+        assert model.mean_pool.effective_alpha_mass().item() > 0.0
+
+        legacy = CkaRlAgent(
+            OBS_DIM, ACT_DIM, base_dir, base_dir,
+            fusion_mode="weight_delta", distillation=distillation, use_alpha_mass=True,
+            constrain_alpha_mass=False,
+        )
+        assert legacy.alpha_mass is not None
+        with torch.no_grad():
+            legacy.alpha_mass.fill_(-2.0)
+        assert legacy.mean_pool.effective_alpha_mass().item() == -2.0
+    print("  alpha_mass restriction + positive/default and legacy/unconstrained ablations OK")
+
+
+def check_trainable_encoder_loads_latest():
+    print("\n=== explicit trainable-encoder continuation check ===")
+    root = f"{TMP_ROOT}/encoder_latest_check"
+    shutil.rmtree(root, ignore_errors=True)
+    d0, d1 = f"{root}/task0", f"{root}/task1"
+    os.makedirs(root, exist_ok=True)
+
+    m0 = save_root(d0, "classic_cka", False, False)
+    m1 = CkaRlAgent(
+        OBS_DIM, ACT_DIM, d0, d0,
+        pool_size=2, distillation=False, fusion_mode="classic_cka",
+        encoder_from_base=True, train_shared=True,
+    )
+    with torch.no_grad():
+        first_param = next(m1.fc.parameters())
+        first_param.add_(0.12345)
+    m1.save(d1)
+
+    expected = next(m1.fc.parameters()).detach().clone()
+    m2 = CkaRlAgent(
+        OBS_DIM, ACT_DIM, d0, d1,
+        pool_size=2, distillation=False, fusion_mode="classic_cka",
+        encoder_from_base=True, train_shared=True,
+    )
+    got = next(m2.fc.parameters()).detach()
+    assert torch.allclose(got, expected), "train_shared=True must continue from latest encoder"
+    assert all(p.requires_grad for p in m2.fc.parameters())
+    shutil.rmtree(root, ignore_errors=True)
+    print("  train_shared=True loads latest encoder instead of resetting to root OK")
+
+
+def check_encoder_policy_flags():
+    print("\n=== shared-encoder policy/architecture checks ===")
+    root = f"{TMP_ROOT}/encoder_flags"
+    shutil.rmtree(root, ignore_errors=True)
+    os.makedirs(root, exist_ok=True)
+
+    # Normal scratch root learns; explicit random-frozen ablation does not.
+    learned_root = CkaRlAgent(OBS_DIM, ACT_DIM, None, None, distillation=False)
+    assert all(p.requires_grad for p in learned_root.fc.parameters())
+    frozen_root = CkaRlAgent(
+        OBS_DIM, ACT_DIM, None, None, distillation=False, freeze_root_encoder=True
+    )
+    assert not any(p.requires_grad for p in frozen_root.fc.parameters())
+
+    # Serialized architecture is validated even though ReLU-vs-linear has the
+    # same state_dict shapes and would otherwise fail silently.
+    pretrained = f"{root}/linear_fc.pt"
+    torch.save(shared(OBS_DIM, linear_out=True), pretrained)
+    frozen_pre = CkaRlAgent(
+        OBS_DIM, ACT_DIM, None, None, distillation=False,
+        pretrained_encoder=pretrained, encoder_linear_out=True, train_shared=False,
+    )
+    assert not any(p.requires_grad for p in frozen_pre.fc.parameters())
+    try:
+        CkaRlAgent(
+            OBS_DIM, ACT_DIM, None, None, distillation=False,
+            pretrained_encoder=pretrained, encoder_linear_out=False, train_shared=False,
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("pretrained encoder ReLU/linear-out mismatch must fail fast")
+
+    shutil.rmtree(root, ignore_errors=True)
+    print("  root/frozen/pretrained policies + architecture mismatch guard OK")
+
+
+def check_distill_selection_ablation():
+    print("\n=== distillation model-selection ablation check ===")
+    root = f"{TMP_ROOT}/distill_last_epoch"
+    shutil.rmtree(root, ignore_errors=True)
+    d0 = f"{root}/task0"
+    d1 = f"{root}/task1"
+    save_root(d0, "classic_cka", True, False)
+    m1 = CkaRlAgent(
+        OBS_DIM, ACT_DIM, d0, d0, pool_size=2, distillation=True,
+        fusion_mode="classic_cka", encoder_from_base=True, similarity_samples=32,
+        distill_max_samples=64, distill_epochs=2, distill_batch_size=32,
+        distill_select_best_val=False,
+    )
+    train_a_bit(m1, steps=1)
+    m1.set_own_buffer(fake_buffer(48, task_id=1, source_id=1))
+    m1.finalize(); m1.save(d1)
+    m2 = CkaRlAgent(
+        OBS_DIM, ACT_DIM, d0, d1, pool_size=2, distillation=True,
+        fusion_mode="classic_cka", encoder_from_base=True, similarity_samples=32,
+        distill_max_samples=64, distill_epochs=2, distill_batch_size=32,
+        distill_test_frac=0.25, distill_select_best_val=False,
+    )
+    train_a_bit(m2, steps=1)
+    m2.set_own_buffer(fake_buffer(48, task_id=2, source_id=2))
+    m2.finalize()
+    metrics = m2.get_distill_metrics()
+    assert metrics["policy/distill_selected_epoch"] == 2
+    assert metrics["policy/distill_select_best_val"] == 0.0
+    shutil.rmtree(root, ignore_errors=True)
+    print("  --no-distill-select-best-val keeps final epoch OK")
 
 
 def main():
@@ -263,6 +393,9 @@ def main():
     run_chain("weight_delta", True, True)    # combined
     check_behavioral_pair_not_weight_cosine()
     check_alpha_mass_restriction()
+    check_trainable_encoder_loads_latest()
+    check_encoder_policy_flags()
+    check_distill_selection_ablation()
 
     shutil.rmtree(TMP_ROOT, ignore_errors=True)
     print("\n*** ALL CHECKS PASSED ***")

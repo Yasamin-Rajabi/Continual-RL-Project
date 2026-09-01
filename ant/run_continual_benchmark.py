@@ -1,4 +1,4 @@
-"""Four-way continual benchmark for HalfCheetahVel and HalfCheetahWindVel.
+"""Four-way continual benchmark for AntVel and AntWindVel.
 
 The four experimental cases intentionally differ only along two method axes:
 
@@ -35,6 +35,7 @@ import argparse
 import pathlib
 import shutil
 import subprocess
+import sys
 from collections import OrderedDict
 
 import torch
@@ -69,7 +70,7 @@ def parse_args():
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument(
         "--task-suites", nargs="+",
-        default=["halfcheetah_vel", "halfcheetah_wind_vel"],
+        default=["ant_vel", "ant_wind_vel"],
         choices=sorted(TASK_SUITES.keys()),
     )
     p.add_argument("--seeds", nargs="+", type=int, default=[1, 2, 3])
@@ -95,9 +96,9 @@ def parse_args():
     p.add_argument("--distill-batch-size", type=int, default=256)
     p.add_argument("--distill-test-frac", type=float, default=0.2)
     p.add_argument("--analysis-log-every", type=int, default=5_000)
-    p.add_argument("--save-root", default="agents_halfcheetah")
+    p.add_argument("--save-root", default="agents_ant")
     p.add_argument("--runs-root", default="runs")
-    p.add_argument("--plots-root", default="plots_halfcheetah_continual")
+    p.add_argument("--plots-root", default="plots_ant_continual")
     p.add_argument("--analysis-root", default="analysis_runs")
     p.add_argument("--skip-training", action="store_true")
     p.add_argument("--skip-retention", action="store_true")
@@ -106,13 +107,40 @@ def parse_args():
         "--scratch-seeds", nargs="+", type=int, default=scratch_baselines.DEFAULT_SCRATCH_SEEDS,
         help="Must match the seeds scratch_baselines.py was run with.",
     )
+    p.add_argument(
+        "--scratch-save-root", default=scratch_baselines.SCRATCH_SAVE_ROOT,
+        help="Checkpoint root used by scratch_baselines.py.",
+    )
     p.add_argument("--force-retrain", action="store_true")
-    p.add_argument("--train-shared", action="store_true")
+
+    # Encoder/algorithm ablations. Defaults are the stable final configuration:
+    # learn a root encoder once (or load TD-JEPA), then keep the basis fixed.
+    p.add_argument("--train-shared", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--freeze-root-encoder", action=argparse.BooleanOptionalAction, default=False,
+                   help="Random-frozen root encoder ablation. Contradicts --train-shared.")
+    p.add_argument("--encoder-from-base", action=argparse.BooleanOptionalAction, default=True,
+                   help="When the encoder is frozen, reload the immutable root encoder on later tasks.")
     p.add_argument("--pretrained-encoder", default=None,
-                   help="fc.pt from tdjepa_pretrain.py; implies a frozen encoder.")
-    p.add_argument("--encoder-linear-out", action="store_true",
-                   help="Must match the setting the pretrained encoder was built "
-                        "with. Changes the critic too, so baselines must be re-run.")
+                   help="fc.pt from tdjepa_pretrain.py. Frozen from task 0 unless --train-shared.")
+    p.add_argument("--encoder-linear-out", action=argparse.BooleanOptionalAction, default=False,
+                   help="Must match the serialized encoder architecture; also changes the critic.")
+
+    p.add_argument("--use-alpha-scale", action=argparse.BooleanOptionalAction, default=False,
+                   help="Learn a global logit scale for historical alpha; off is closer to paper CKA.")
+    p.add_argument("--weight-use-alpha-mass", action=argparse.BooleanOptionalAction, default=True,
+                   help="Enable alpha-mass in weight_delta modes. Disable to isolate representation alone.")
+    p.add_argument("--constrain-alpha-mass", action=argparse.BooleanOptionalAction, default=True,
+                   help="Positive softplus alpha-mass stabilization; disable for the legacy ablation.")
+    p.add_argument("--distill-select-best-val", action=argparse.BooleanOptionalAction, default=True,
+                   help="Restore the lowest held-out-KL distillation epoch; disable for last-epoch legacy behavior.")
+    p.add_argument("--collect-cosine-buffers", action=argparse.BooleanOptionalAction, default=False,
+                   help="Cosine modes do not need rollout buffers. Enable only to equalize post-training interactions.")
+
+    p.add_argument("--alpha", type=float, default=0.2,
+                   help="Fixed SAC entropy coefficient, or optional autotune initialization.")
+    p.add_argument("--autotune", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--autotune-init-from-alpha", action=argparse.BooleanOptionalAction, default=False,
+                   help="If enabled, entropy autotuning starts at --alpha instead of legacy 1.0.")
     p.add_argument("--cpu", action="store_true")
     p.add_argument(
         "--condition-index", type=int, default=0, choices=[0, 1, 2, 3, 4],
@@ -121,11 +149,14 @@ def parse_args():
              "(1=baseline, 2=distil_only, 3=weight_only, 4=combined).",
     )
     p.add_argument("--quick-test", action="store_true")
+    p.add_argument("--allow-provisional-ant-calibration", action="store_true",
+                   help="Smoke/debug only: permit Ant runs without ant_calibration.json.")
     args = p.parse_args()
 
     if args.quick_test:
         # Exercises at least one merge without committing to the full paper run.
-        args.task_suites = ["halfcheetah_vel"]
+        args.task_suites = ["ant_vel"]
+        args.allow_provisional_ant_calibration = True
         args.seeds = [1]
         args.task_sequence = [0, 1, 2, 3]
         args.total_timesteps = 20_000
@@ -142,13 +173,68 @@ def parse_args():
         args.distill_epochs = 2
         args.analysis_log_every = 2_000
 
+    if args.train_shared and args.freeze_root_encoder:
+        p.error("--train-shared and --freeze-root-encoder are contradictory")
+    if args.autotune_init_from_alpha and args.alpha <= 0:
+        p.error("--alpha must be > 0 with --autotune-init-from-alpha")
+
     return args
 
 
 # ==========================================================================
 # TRAINING: the only thing this file still does directly.
 # ==========================================================================
+def _effective_condition_config(args, cfg):
+    cfg = dict(cfg)
+    if cfg["fusion_mode"] == "weight_delta":
+        cfg["use_alpha_mass"] = bool(cfg["use_alpha_mass"] and args.weight_use_alpha_mass)
+    return cfg
+
+
+def _expected_training_config(args, suite, task_id, seq_idx, seed, cfg):
+    """Subset of run_sac training knobs used to validate resumable checkpoints."""
+    return {
+        "model_type": "cka-rl",
+        "task_suite": suite,
+        "task_id": int(task_id),
+        "seq_idx": int(seq_idx),
+        "seed": int(seed),
+        "cuda": not bool(args.cpu),
+        "fusion_mode": cfg["fusion_mode"],
+        "total_timesteps": int(args.total_timesteps),
+        "gamma": float(args.gamma),
+        "tau": float(args.tau),
+        "batch_size": int(args.batch_size),
+        "learning_starts": int(args.learning_starts),
+        "random_actions_end": int(args.random_actions_end),
+        "policy_lr": float(args.policy_lr),
+        "q_lr": float(args.q_lr),
+        "alpha": float(args.alpha),
+        "autotune": bool(args.autotune),
+        "autotune_init_from_alpha": bool(args.autotune_init_from_alpha),
+        "pool_size": int(args.pool_size),
+        "encoder_from_base": bool(args.encoder_from_base),
+        "freeze_root_encoder": bool(args.freeze_root_encoder),
+        "distillation": bool(cfg["distillation"]),
+        "use_alpha_mass": bool(cfg["use_alpha_mass"]),
+        "use_alpha_scale": bool(args.use_alpha_scale),
+        "constrain_alpha_mass": bool(args.constrain_alpha_mass),
+        "train_shared": bool(args.train_shared),
+        "encoder_linear_out": bool(args.encoder_linear_out),
+        "distill_extra_steps": int(args.distill_extra_steps),
+        "collect_cosine_buffers": bool(args.collect_cosine_buffers),
+        "max_distill_buffer": int(args.max_distill_buffer),
+        "similarity_samples": int(args.similarity_samples),
+        "distill_max_samples": int(args.distill_max_samples),
+        "distill_epochs": int(args.distill_epochs),
+        "distill_lr": float(args.distill_lr),
+        "distill_batch_size": int(args.distill_batch_size),
+        "distill_test_frac": float(args.distill_test_frac),
+        "distill_select_best_val": bool(args.distill_select_best_val),
+    }
+
 def train_chain(args, suite, condition, cfg, seed):
+    cfg = _effective_condition_config(args, cfg)
     previous = []
     for seq_idx, task_id in enumerate(args.task_sequence):
         if task_id < 0 or task_id >= len(TASK_SUITES[suite]):
@@ -157,36 +243,52 @@ def train_chain(args, suite, condition, cfg, seed):
         save_parent = metrics.checkpoint_dir(args.save_root, suite, condition, seed, seq_idx, task_id).parent
         run_dir = metrics.checkpoint_dir(args.save_root, suite, condition, seed, seq_idx, task_id)
         tb_dir = metrics.event_dir(args.runs_root, suite, condition, seed, seq_idx, task_id)
+        analysis_dir = metrics.analysis_snapshot_path(
+            args.analysis_root, suite, condition, seed, seq_idx, task_id
+        ).parent
+        prev_args = []
+        if previous:
+            prev_args = [previous[0]] if len(previous) == 1 else [previous[0], previous[-1]]
+        expected_config = _expected_training_config(args, suite, task_id, seq_idx, seed, cfg)
+
         if args.force_retrain:
-            if run_dir.exists():
-                shutil.rmtree(run_dir)
-            if tb_dir.exists():
-                shutil.rmtree(tb_dir)
+            for path in (run_dir, tb_dir, analysis_dir):
+                if path.exists():
+                    shutil.rmtree(path)
 
         if metrics.checkpoint_complete(run_dir):
-            print(f"[{suite}/{condition}/seed={seed}] seq{seq_idx} already complete: {run_dir}")
-            previous.append(run_dir)
-            continue
+            matches, reason = metrics.checkpoint_matches(
+                run_dir, expected_config, parent_dirs=prev_args,
+                pretrained_encoder=args.pretrained_encoder,
+            )
+            if matches:
+                print(f"[{suite}/{condition}/seed={seed}] seq{seq_idx} already complete: {run_dir}")
+                previous.append(run_dir)
+                continue
+            print(f"[{suite}/{condition}/seed={seed}] seq{seq_idx} stale checkpoint: {reason}; retraining")
 
         if args.skip_training:
-            raise FileNotFoundError(f"Missing checkpoint while --skip-training was set: {run_dir}")
+            raise FileNotFoundError(
+                f"Missing/stale checkpoint while --skip-training was set: {run_dir}"
+            )
 
         # Remove partial outputs before a retry, otherwise TensorBoard can mix
         # stale and fresh event files from two different attempts.
-        if run_dir.exists():
-            shutil.rmtree(run_dir)
-        if tb_dir.exists():
-            shutil.rmtree(tb_dir)
+        for path in (run_dir, tb_dir, analysis_dir):
+            if path.exists():
+                shutil.rmtree(path)
 
         tag = f"{suite}/{condition}/seed_{seed}/seq_{seq_idx}"
         cmd = [
-            "python3", "run_sac.py",
+            sys.executable, "run_sac.py",
             "--model-type=cka-rl",
             f"--task-suite={suite}",
             f"--task-id={task_id}",
+            f"--seq-idx={seq_idx}",
             f"--seed={seed}",
             f"--tag={tag}",
             f"--save-dir={save_parent}",
+            f"--runs-root={args.runs_root}",
             f"--analysis-root={args.analysis_root}",
             f"--total-timesteps={args.total_timesteps}",
             f"--learning-starts={args.learning_starts}",
@@ -209,22 +311,29 @@ def train_chain(args, suite, condition, cfg, seed):
             f"--distill-test-frac={args.distill_test_frac}",
             f"--analysis-log-every={args.analysis_log_every}",
             f"--fusion-mode={cfg['fusion_mode']}",
-            "--no-use-alpha-scale",
+            f"--alpha={args.alpha}",
+            "--autotune" if args.autotune else "--no-autotune",
+            "--autotune-init-from-alpha" if args.autotune_init_from_alpha else "--no-autotune-init-from-alpha",
+            "--use-alpha-scale" if args.use_alpha_scale else "--no-use-alpha-scale",
             "--distillation" if cfg["distillation"] else "--no-distillation",
+            "--distill-select-best-val" if args.distill_select_best_val else "--no-distill-select-best-val",
+            "--collect-cosine-buffers" if args.collect_cosine_buffers else "--no-collect-cosine-buffers",
             "--train-shared" if args.train_shared else "--no-train-shared",
+            "--freeze-root-encoder" if args.freeze_root_encoder else "--no-freeze-root-encoder",
+            "--encoder-from-base" if args.encoder_from_base else "--no-encoder-from-base",
             "--encoder-linear-out" if args.encoder_linear_out else "--no-encoder-linear-out",
             "--use-alpha-mass" if cfg["use_alpha_mass"] else "--no-use-alpha-mass",
+            "--constrain-alpha-mass" if args.constrain_alpha_mass else "--no-constrain-alpha-mass",
         ]
         if args.pretrained_encoder:
             cmd.append(f"--pretrained-encoder={args.pretrained_encoder}")
         if args.cpu:
             cmd.append("--no-cuda")
 
-        if previous:
+        if prev_args:
             # run_sac only needs the immutable root and latest continual state.
-            prev_args = [previous[0]] if len(previous) == 1 else [previous[0], previous[-1]]
             cmd.append("--prev-units")
-            cmd.extend(str(p) for p in prev_args)
+            cmd.extend(str(path) for path in prev_args)
 
         print(
             f"\n>>> {suite} | {condition} | seed {seed} | seq{seq_idx} "
@@ -233,6 +342,12 @@ def train_chain(args, suite, condition, cfg, seed):
         subprocess.run(cmd, check=True)
         if not metrics.checkpoint_complete(run_dir):
             raise RuntimeError(f"Training command finished but checkpoint is incomplete: {run_dir}")
+        matches, reason = metrics.checkpoint_matches(
+            run_dir, expected_config, parent_dirs=prev_args,
+            pretrained_encoder=args.pretrained_encoder,
+        )
+        if not matches:
+            raise RuntimeError(f"Training produced a checkpoint with unexpected identity: {reason}")
         previous.append(run_dir)
     return previous
 
@@ -242,6 +357,9 @@ def train_chain(args, suite, condition, cfg, seed):
 # ==========================================================================
 def main():
     args = parse_args()
+    if any(suite.startswith("ant") for suite in args.task_suites) and not args.allow_provisional_ant_calibration:
+        from tasks import require_ant_calibration
+        require_ant_calibration()
     pathlib.Path(args.plots_root).mkdir(parents=True, exist_ok=True)
     import json
     with open(pathlib.Path(args.plots_root) / "benchmark_config.json", "w") as f:
@@ -281,21 +399,34 @@ def main():
             plots.write_summary_csv(args, suite, conditions, all_payloads)
 
         if not args.skip_survey_metrics:
-            missing_baselines = [
-                task_id for task_id in range(len(TASK_SUITES[suite]))
-                for seed in args.scratch_seeds
-                if not scratch_baselines.checkpoint_complete(
-                    scratch_baselines.scratch_checkpoint_dir(
-                        scratch_baselines.SCRATCH_SAVE_ROOT, suite, task_id, args.total_timesteps, seed,
+            used_task_ids = sorted(set(args.task_sequence))
+            missing_baselines = []
+            stale_baselines = []
+            for task_id in used_task_ids:
+                for scratch_seed in args.scratch_seeds:
+                    scratch_dir = scratch_baselines.scratch_checkpoint_dir(
+                        args.scratch_save_root, suite, task_id, args.total_timesteps, scratch_seed,
                     )
-                )
-            ]
+                    if not scratch_baselines.checkpoint_complete(scratch_dir):
+                        missing_baselines.append(task_id)
+                        continue
+                    matches, reason = scratch_baselines.checkpoint_matches(
+                        scratch_dir, suite, task_id, args.total_timesteps, scratch_seed, args
+                    )
+                    if not matches:
+                        stale_baselines.append((task_id, scratch_seed, reason))
+            if stale_baselines:
+                print("\n!!! Scratch baseline identity mismatch(es):")
+                for task_id, scratch_seed, reason in stale_baselines:
+                    print(f"    task {task_id}, seed {scratch_seed}: {reason}")
+                missing_baselines.extend(task_id for task_id, _, _ in stale_baselines)
             if missing_baselines:
                 print(
                     f"\n!!! Skipping survey metrics for {suite}: missing scratch baselines for "
                     f"task_id(s) {sorted(set(missing_baselines))}. Run:\n"
-                    f"    python3 scratch_baselines.py --task-suites {suite} "
-                    f"--total-timesteps {args.total_timesteps} --seeds {' '.join(map(str, args.scratch_seeds))}\n"
+                    f"    {sys.executable} scratch_baselines.py --task-suites {suite} "
+                    f"--total-timesteps {args.total_timesteps} --seeds {' '.join(map(str, args.scratch_seeds))} "
+                    f"--save-root {args.scratch_save_root} --runs-root {args.runs_root}\n"
                 )
             else:
                 survey_payloads = {condition: [] for condition in conditions}
