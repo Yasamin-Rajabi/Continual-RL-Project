@@ -49,19 +49,19 @@ import scratch_baselines
 CONDITIONS = OrderedDict([
     (
         "baseline",
-        {"fusion_mode": "classic_cka", "distillation": False, "use_alpha_mass": False, "use_alpha_scale": True},
+        {"fusion_mode": "classic_cka", "distillation": False, "use_alpha_mass": False, "fix_alpha_scale": False},
     ),
     (
         "distil_only",
-        {"fusion_mode": "classic_cka", "distillation": True, "use_alpha_mass": False, "use_alpha_scale": True},
+        {"fusion_mode": "classic_cka", "distillation": True, "use_alpha_mass": False, "fix_alpha_scale": False},
     ),
     (
         "weight_only",
-        {"fusion_mode": "weight_delta", "distillation": False, "use_alpha_mass": True, "use_alpha_scale": False},
+        {"fusion_mode": "weight_delta", "distillation": False, "use_alpha_mass": True, "fix_alpha_scale": True},
     ),
     (
         "combined",
-        {"fusion_mode": "weight_delta", "distillation": True, "use_alpha_mass": True, "use_alpha_scale": False},
+        {"fusion_mode": "weight_delta", "distillation": True, "use_alpha_mass": True, "fix_alpha_scale": True},
     ),
 ])
 
@@ -132,6 +132,7 @@ def parse_args():
     p.add_argument("--quick-test", action="store_true")
     p.add_argument("--test-adapt-steps", type=int, default=5_000,
                    help="Number of steps to adapt alpha logits during test-time evaluation")
+
     args = p.parse_args()
 
     if args.quick_test:
@@ -227,7 +228,7 @@ def train_chain(args, suite, condition, cfg, seed):
             f"--distill-test-frac={args.distill_test_frac}",
             f"--analysis-log-every={args.analysis_log_every}",
             f"--fusion-mode={cfg['fusion_mode']}",
-            "--use-alpha-scale" if cfg["use_alpha_scale"] else "--no-use-alpha-scale",
+            "--fix-alpha-scale" if cfg["fix_alpha_scale"] else "--no-fix-alpha-scale",
             "--distillation" if cfg["distillation"] else "--no-distillation",
             "--train-shared" if args.train_shared else "--no-train-shared",
             "--encoder-linear-out" if args.encoder_linear_out else "--no-encoder-linear-out",

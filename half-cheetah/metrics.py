@@ -61,6 +61,33 @@ from policy_utils import bound_log_std
 _trapz = getattr(np, "trapezoid", None) or np.trapz
 
 
+
+# ==========================================================================
+# Custom Model Mapping Support (Added without removing existing features)
+# ==========================================================================
+_CUSTOM_MODEL_MAP = {}
+
+def set_custom_model_map(mapping):
+    global _CUSTOM_MODEL_MAP
+    _CUSTOM_MODEL_MAP = mapping
+
+def checkpoint_dir(save_root, suite, condition, seed, seq_idx, task_id):
+    if condition in _CUSTOM_MODEL_MAP:
+        return pathlib.Path(_CUSTOM_MODEL_MAP[condition]) / f"seq_{seq_idx}" / run_name(suite, task_id, seed)
+    return (
+        pathlib.Path(save_root) / suite / condition / f"seed_{seed}"
+        / f"seq_{seq_idx}" / run_name(suite, task_id, seed)
+    )
+
+def event_dir(runs_root, suite, condition, seed, seq_idx, task_id):
+    if condition in _CUSTOM_MODEL_MAP:
+        custom_base = pathlib.Path(_CUSTOM_MODEL_MAP[condition])
+        if (custom_base.parent / "runs").exists():
+            return custom_base.parent / "runs" / f"seq_{seq_idx}" / run_name(suite, task_id, seed)
+        return custom_base / f"seq_{seq_idx}" / run_name(suite, task_id, seed)
+    tag = f"{suite}/{condition}/seed_{seed}/seq_{seq_idx}"
+    return pathlib.Path(runs_root) / tag / run_name(suite, task_id, seed)
+
 # ==========================================================================
 # Path helpers (the single source of truth -- plots.py and
 # run_continual_benchmark.py both import these from here).
@@ -239,8 +266,9 @@ def adapt_and_evaluate_checkpoint(
         distillation = bool(snapshot.get("distillation", False))
 
         mean_pool_data = torch.load(mean_pool_path, map_location="cpu", weights_only=False)
-        fusion_mode = mean_pool_data.fusion_mode
-        use_alpha_mass = mean_pool_data.use_alpha_mass
+        fusion_mode = getattr(mean_pool_data, "fusion_mode", "classic_cka")
+        use_alpha_mass = getattr(mean_pool_data, "use_alpha_mass", False)
+        fix_alpha_scale = (fusion_mode == "weight_delta")
 
         from cka_rl import CkaRlAgent
         agent = CkaRlAgent(
@@ -250,6 +278,7 @@ def adapt_and_evaluate_checkpoint(
             latest_dir=str(run_dir),
             fusion_mode=fusion_mode,
             use_alpha_mass=use_alpha_mass,
+            fix_alpha_scale=fix_alpha_scale,
             distillation=distillation,
         ).to(device)
         

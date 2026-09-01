@@ -44,7 +44,7 @@ class CkaRlAgent(nn.Module):
         alpha_major=0.6,
         alpha_factor=1e-3,
         fix_alpha=False,
-        use_alpha_scale=True,
+        fix_alpha_scale=True,
         use_alpha_mass=False,
         encoder_from_base=False,
         distillation=True,
@@ -107,7 +107,7 @@ class CkaRlAgent(nn.Module):
         # One alpha vector controls each whole knowledge vector, across both heads.
         self.alpha, self.alpha_scale, self.alpha_mass = self._make_alpha(
             self.mean_pool.pool_length(), fix_alpha, alpha_init, alpha_major,
-            alpha_factor, use_alpha_scale, use_alpha_mass,
+            alpha_factor, fix_alpha_scale, use_alpha_mass,
         )
         self.mean_pool.set_alpha(self.alpha, self.alpha_scale, self.alpha_mass)
         self.logstd_pool.set_alpha(self.alpha, self.alpha_scale, self.alpha_mass)
@@ -172,7 +172,7 @@ class CkaRlAgent(nn.Module):
 
     def _make_alpha(
         self, num_vectors, fix_alpha, alpha_init, alpha_major, alpha_factor,
-        use_alpha_scale, use_alpha_mass,
+        fix_alpha_scale, use_alpha_mass,
     ):
         if num_vectors <= 0:
             return None, None, None
@@ -189,9 +189,9 @@ class CkaRlAgent(nn.Module):
         else:
             raise NotImplementedError(f"unknown alpha_init: {alpha_init}")
 
-        scale_init_val = 5.0 if use_alpha_scale else 1.0
+        scale_init_val = 5.0 if fix_alpha_scale else 1.0
         alpha_scale = nn.Parameter(torch.tensor([scale_init_val], dtype=torch.float32), 
-                                   requires_grad=(use_alpha_scale and not fix_alpha))
+                                   requires_grad=((not fix_alpha_scale) and (not fix_alpha)))
 
         alpha_mass = (
             nn.Parameter(torch.ones(1), requires_grad=not fix_alpha)

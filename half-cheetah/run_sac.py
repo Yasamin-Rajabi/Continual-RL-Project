@@ -77,7 +77,7 @@ class Args:
     distillation: bool = True
     use_alpha_mass: bool = False
     alpha_mass_reg: float = 0.05
-    use_alpha_scale: bool = False
+    fix_alpha_scale: bool = False
     drift_reg: float = 1.0
     # Was True, which contradicted both cka_rl.py's own docstring ("train_shared=False
     # (default)") and run_continual_benchmark.py, which always passes --no-train-shared.
@@ -396,7 +396,7 @@ if __name__ == "__main__":
         max_distill_buffer=args.max_distill_buffer,
         fusion_mode=args.fusion_mode,
         use_alpha_mass=args.use_alpha_mass,
-        use_alpha_scale=args.use_alpha_scale,
+        fix_alpha_scale=args.fix_alpha_scale,
         distill_test_frac=args.distill_test_frac,
         similarity_samples=args.similarity_samples,
         distill_max_samples=args.distill_max_samples,

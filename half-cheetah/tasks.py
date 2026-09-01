@@ -87,6 +87,7 @@ def get_task(task_id: int, task_suite: str = "halfcheetah_vel", render: bool = F
     if task_suite == "halfcheetah_wind_vel":
         kwargs["wind"] = task.wind
     env = env_cls(**kwargs)
+
     # Every observation from this point on (reset AND step) carries
     # [target_velocity, wind_x, wind_z] appended -- see
     # halfcheetah_envs.make_task_specific_observation for why the critic
@@ -96,6 +97,7 @@ def get_task(task_id: int, task_suite: str = "halfcheetah_vel", render: bool = F
     # metrics.evaluate_checkpoint) reads obs_dim dynamically from
     # observation_space, so no other file needs to change.
     env = TaskConditionedObservationWrapper(env, task)
+
     # Directly instantiating a MuJoCo class bypasses gym.make's TimeLimit.
     return gym.wrappers.TimeLimit(env, max_episode_steps=1000)
 
