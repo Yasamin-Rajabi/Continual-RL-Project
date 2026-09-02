@@ -56,6 +56,16 @@ step_setup() {
     echo "OK"
 }
 
+step_tasks() {
+    # For callers that install deps themselves (e.g. the notebook) and don't
+    # want step_setup's own pip/git-install logic to run at all. Just builds
+    # the task pool that everything downstream expects.
+    echo ">>> tasks: build task pool (deps assumed already installed)"
+    python3 -c "import metaworld" || { echo "ERROR: metaworld not importable -- install it first"; exit 1; }
+    python3 tasks.py
+    echo "OK"
+}
+
 step_check() {
     echo ">>> check: builds every task and asserts constant shapes + info keys"
     python3 sanity_check_pool.py
@@ -182,6 +192,7 @@ step_report() {
 
 case "${1:-}" in
     setup)       step_setup ;;
+    tasks)       step_tasks ;;
     check)       step_check ;;
     pilot)       step_pilot ;;
     pretrain)    step_pretrain ;;
@@ -190,7 +201,7 @@ case "${1:-}" in
     run-tdjepa)  step_run_tdjepa "${2:-A}" ;;
     report)      step_report ;;
     *)
-        echo "Usage: bash run_kaggle.sh {setup|check|pilot|pretrain|baselines|run|run-tdjepa|report} [A|B|all]"
+        echo "Usage: bash run_kaggle.sh {setup|tasks|check|pilot|pretrain|baselines|run|run-tdjepa|report} [A|B|all]"
         exit 1
         ;;
 esac
