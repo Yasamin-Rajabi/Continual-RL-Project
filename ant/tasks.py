@@ -1,42 +1,25 @@
-"""Deterministic continual locomotion task suites.
+"""Deterministic continual locomotion task suites used by the Ant project.
 
-Four suites are provided:
-- halfcheetah_vel:      target velocity changes across tasks.
-- halfcheetah_wind_vel: target velocity + a hidden fixed wind change.
-- ant_vel:              same template on Ant (3D quadruped).
-- ant_wind_vel:         same, plus a hidden horizontal crosswind.
+The Ant directory intentionally keeps the reusable HalfCheetah environment
+helpers because TD-JEPA/pretraining utilities share the same target-velocity
+interface.  Final Ant experiments use ``ant_vel`` and ``ant_wind_vel``.
 
-get_task() wraps every environment with
-halfcheetah_envs.TaskConditionedObservationWrapper, which appends
-[target_velocity, wind_a, wind_b] to every observation. So all tasks WITHIN
-a suite share the same observation and action space:
-
-    halfcheetah_* : 17 raw + 3 task dims = 20-D obs, 6-D action
-    ant_*         : 27 raw + 3 task dims = 30-D obs, 8-D action
-
-Shapes must be constant within a suite (knowledge vectors are added
-element-wise to the head parameters), but NOT across suites -- each suite is
-its own independent continual chain, exactly as halfcheetah_vel and
-halfcheetah_wind_vel already are.
-
-DROP-IN: this file keeps every public symbol and every existing behaviour of
-the original tasks.py. The HalfCheetah labels are byte-identical.
+Every benchmark task is wrapped with ``TaskConditionedObservationWrapper``,
+which appends [target_velocity, wind_a, wind_b] so actor and critic receive the
+reward context.  The *calibration* environment is the one exception: it uses a
+plain forward reward and raw Ant observations, with no fake target value.
 """
 from __future__ import annotations
 
+import json
+import os
+import pathlib
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 
 @dataclass(frozen=True)
-class HalfCheetahTask:
-    """Name kept for backward compatibility; used by all suites.
-
-    Any object with .target_velocity (float) and .wind (2-tuple) satisfies
-    halfcheetah_envs.make_task_specific_observation, which is why the Ant
-    suites reuse this class rather than defining a parallel one.
-    """
-
+class LocomotionTask:
     target_velocity: float
     wind: Tuple[float, float] = (0.0, 0.0)
 
@@ -50,8 +33,12 @@ class HalfCheetahTask:
         )
 
 
-# Eight distinct tasks is enough to force several merges with the recommended
-# pool_size=5, while keeping a 2-pass continual benchmark computationally sane.
+# Backward-compatible public name used by tdjepa_pretrain.py and older scripts.
+HalfCheetahTask = LocomotionTask
+
+
+# Reusable HalfCheetah task specs kept only because the Ant-side TD-JEPA tools
+# can build either robot family from the same module.
 _VELOCITIES = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 1.25, 2.25)
 _WIND_PAIRS = (
     (-2.5, 0.0),
@@ -64,54 +51,76 @@ _WIND_PAIRS = (
     (2.5, -5.0),
 )
 
-# --------------------------------------------------------------------------
-# ANT TARGETS
-#
-# Ant is much slower than HalfCheetah (which reaches ~5-8 m/s under SAC), so
-# targets are defined as FRACTIONS of the velocity Ant can actually reach, not
-# as absolute numbers copied across robots. Copying HalfCheetah's absolute
-# targets would put the fast tasks out of reach, several of them would collapse
-# onto the single behaviour "run flat out", and they would stop being distinct
-# tasks at all.
-#
-# CALIBRATE _ANT_V_MAX BEFORE THE FIRST REAL RUN:
-#     bash run_kaggle.sh calibrate ant
-# (or: python3 calibrate_ant.py). It trains plain forward-reward SAC on Ant and
-# prints the value to paste here.
-#
-# WHY THE RANGE GOES UP TO 1.1x AND DOWN TO 0.1x
-# The spread across tasks is what makes methods distinguishable. Two of the
-# paper's claims -- weight_delta vs classic_cka, and a task-agnostic shared
-# encoder vs one fit to task 0 -- both predict effects that GROW with the shift
-# between consecutive tasks. A narrow band of similar velocities would show all
-# methods performing the same and measure nothing. So the band deliberately
-# spans from a near-crawl to slightly past the calibrated ceiling.
-#
-# The 1.1x task is intentionally at or just past what SAC reached during
-# calibration; that is where methods separate. But watch for the floor effect:
-# if EVERY method scores ~0 on task 5, it is measuring "impossible" rather than
-# "hard" -- drop the top fraction to 1.0 and re-run. Check this on the first
-# seed before spending the rest of the budget.
-# --------------------------------------------------------------------------
-_ANT_V_MAX = 3.3                      # PROVISIONAL -- replace with your calibration
 
-# Indices 0-5 are the continual sequence; 6-7 are intermediates that only enter
-# the pool, mirroring how _VELOCITIES is structured for HalfCheetah.
+# ---------------------------------------------------------------------------
+# Ant velocity calibration
+# ---------------------------------------------------------------------------
+# A calibration run writes this JSON next to tasks.py by default.  Final Ant
+# benchmark/pretraining scripts refuse the provisional fallback unless an
+# explicit --allow-provisional-ant-calibration flag is supplied.
+ANT_CALIBRATION_FILENAME = "ant_calibration.json"
+_ANT_V_MAX_FALLBACK = 3.3
+
+
+def ant_calibration_path() -> pathlib.Path:
+    override = os.environ.get("CKA_ANT_CALIBRATION_FILE")
+    if override:
+        return pathlib.Path(override).expanduser().resolve()
+    return pathlib.Path(__file__).resolve().with_name(ANT_CALIBRATION_FILENAME)
+
+
+def _read_ant_calibration():
+    path = ant_calibration_path()
+    if not path.exists():
+        return {
+            "schema_version": 1,
+            "v_max": _ANT_V_MAX_FALLBACK,
+            "provisional": True,
+            "source": "built-in fallback",
+        }
+    try:
+        with path.open() as f:
+            data = json.load(f)
+        v_max = float(data["v_max"])
+    except Exception as exc:
+        raise RuntimeError(f"invalid Ant calibration file {path}: {exc}") from exc
+    if not (v_max > 0.0):
+        raise RuntimeError(f"invalid Ant calibration v_max={v_max!r} in {path}")
+    data = dict(data)
+    data["v_max"] = v_max
+    data["provisional"] = False
+    data["source"] = str(path)
+    return data
+
+
+ANT_CALIBRATION = _read_ant_calibration()
+ANT_CALIBRATION_IS_PROVISIONAL = bool(ANT_CALIBRATION["provisional"])
+ANT_CALIBRATION_PATH = ant_calibration_path()
+_ANT_V_MAX = float(ANT_CALIBRATION["v_max"])
+
+
+def require_ant_calibration():
+    if ANT_CALIBRATION_IS_PROVISIONAL:
+        raise RuntimeError(
+            "Ant velocity calibration is still provisional. Run `python3 calibrate_ant.py` "
+            f"to create {ANT_CALIBRATION_PATH}, then restart the Python process. "
+            "For smoke tests only, pass --allow-provisional-ant-calibration."
+        )
+
+
+# Eight distinct task targets.  Fractions are deliberately spread from a crawl
+# to slightly beyond the sustainable calibration speed so the continual methods
+# face meaningful shifts.  If every method floors on 1.10x, reduce the top
+# fraction in a *new* experiment rather than silently changing an existing run.
 _ANT_VELOCITY_FRACTIONS = (0.10, 0.30, 0.50, 0.70, 0.90, 1.10, 0.40, 0.80)
 _ANT_VELOCITIES = tuple(round(f * _ANT_V_MAX, 3) for f in _ANT_VELOCITY_FRACTIONS)
+_ANT_SUCCESS_TOLERANCE_FRAC = float(ANT_CALIBRATION.get("success_tolerance_frac", 0.08))
+if not (0.0 < _ANT_SUCCESS_TOLERANCE_FRAC < 1.0):
+    raise RuntimeError(
+        f"invalid Ant success_tolerance_frac={_ANT_SUCCESS_TOLERANCE_FRAC!r}; expected (0, 1)"
+    )
+_ANT_SUCCESS_TOLERANCE = round(_ANT_SUCCESS_TOLERANCE_FRAC * _ANT_V_MAX, 3)
 
-# HalfCheetah uses a fixed 0.2 over a 0.5-3.0 target band, i.e. ~8% of the band.
-# Keeping the same relative tolerance means "success" is equally strict on both
-# robots, which is what makes the success-rate-based metrics comparable across
-# suites. An absolute 0.2 on Ant would be a much harsher criterion.
-_ANT_SUCCESS_TOLERANCE = round(0.08 * _ANT_V_MAX, 3)
-
-# Ant is lighter than HalfCheetah, so the same force is a much larger
-# perturbation; these are ~40% of the HalfCheetah magnitudes. Wind is kept as a
-# SECONDARY axis: unlike target velocity, the wind vector is handed to the
-# policy through the observation and mainly induces a conditional correction
-# rather than a genuinely different gait. Widen the velocity band first if you
-# need more separation between methods; only then touch these.
 _ANT_WIND_PAIRS = (
     (-1.0, 0.0),
     (1.0, 0.0),
@@ -123,55 +132,73 @@ _ANT_WIND_PAIRS = (
     (1.0, -2.0),
 )
 
-# Single throwaway task used only by calibrate_ant.py. With a target this far
-# above anything Ant can do, reward = -|v - 1000| - ctrl_cost reduces to
-# v - 1000 - ctrl_cost, i.e. plain forward-reward SAC -- so calibration needs no
-# new training code, just this task and the existing run_sac.py.
-_ANT_CALIBRATION_VELOCITY = 1000.0
 
-TASK_SUITES: Dict[str, List[HalfCheetahTask]] = {
-    "halfcheetah_vel": [HalfCheetahTask(v) for v in _VELOCITIES],
+def ant_pretrain_velocities():
+    """Held-out TD-JEPA train velocities between benchmark targets."""
+    return tuple(round(f * _ANT_V_MAX, 3) for f in (0.20, 0.60, 1.00))
+
+
+def ant_heldout_velocities():
+    """Real benchmark velocities reserved for TD-JEPA representation checks."""
+    return tuple(round(f * _ANT_V_MAX, 3) for f in (0.10, 0.50, 0.90))
+
+
+TASK_SUITES: Dict[str, List[LocomotionTask]] = {
+    "halfcheetah_vel": [LocomotionTask(v) for v in _VELOCITIES],
     "halfcheetah_wind_vel": [
-        HalfCheetahTask(v, wind=w) for v, w in zip(_VELOCITIES, _WIND_PAIRS)
+        LocomotionTask(v, wind=w) for v, w in zip(_VELOCITIES, _WIND_PAIRS)
     ],
-    "ant_vel": [HalfCheetahTask(v) for v in _ANT_VELOCITIES],
+    "ant_vel": [LocomotionTask(v) for v in _ANT_VELOCITIES],
     "ant_wind_vel": [
-        HalfCheetahTask(v, wind=w) for v, w in zip(_ANT_VELOCITIES, _ANT_WIND_PAIRS)
+        LocomotionTask(v, wind=w) for v, w in zip(_ANT_VELOCITIES, _ANT_WIND_PAIRS)
     ],
-    "ant_calibrate": [HalfCheetahTask(_ANT_CALIBRATION_VELOCITY)],
 }
 
-# Paper-style second pass through the same tasks to expose retention/relearning.
-DEFAULT_CONTINUAL_SEQUENCE = tuple(range(6)) + tuple(range(6))
+CALIBRATION_SUITE = "ant_calibrate"
 
-# Reversed-order variant of the first pass. Running this changes ONLY which
-# task the frozen shared encoder is trained on (task 0 is the fastest instead
-# of the slowest). It is the cheapest possible test of whether the root-task
-# encoder bias described in the analysis doc is real -- no code changes, one
-# CLI flag.
-REVERSED_CONTINUAL_SEQUENCE = tuple(range(5, -1, -1)) + tuple(range(5, -1, -1))
+# Two passes through all eight tasks.  source_ids/seq_idx distinguish repeated
+# occurrences for the upcoming buffer-decay analysis.
+DEFAULT_CONTINUAL_SEQUENCE = tuple(range(len(_ANT_VELOCITIES))) * 2
+REVERSED_CONTINUAL_SEQUENCE = tuple(reversed(range(len(_ANT_VELOCITIES)))) * 2
 
 
 def available_task_suites():
     return tuple(TASK_SUITES.keys())
 
 
-def get_task_name(task_id: int, task_suite: str = "halfcheetah_vel") -> str:
+def get_task_name(task_id: int, task_suite: str = "ant_vel") -> str:
+    if task_suite == CALIBRATION_SUITE:
+        if task_id != 0:
+            raise IndexError("ant_calibrate contains exactly one task (task_id=0)")
+        return "Ant forward-reward calibration"
     task = TASK_SUITES[task_suite][task_id]
     return task.label(task_suite)
 
 
-def get_task_spec(task_id: int, task_suite: str = "halfcheetah_vel") -> HalfCheetahTask:
+def get_task_spec(task_id: int, task_suite: str = "ant_vel") -> LocomotionTask:
+    if task_suite == CALIBRATION_SUITE:
+        raise ValueError("ant_calibrate has no target-velocity task spec")
     return TASK_SUITES[task_suite][task_id]
 
 
-def get_task(task_id: int, task_suite: str = "halfcheetah_vel", render: bool = False):
+def get_task(task_id: int, task_suite: str = "ant_vel", render: bool = False):
     import gymnasium as gym
-    from halfcheetah_envs import (
+    from locomotion_envs import (
         HalfCheetahVelEnv,
         HalfCheetahWindVelEnv,
         TaskConditionedObservationWrapper,
     )
+
+    if task_suite == CALIBRATION_SUITE:
+        if task_id != 0:
+            raise IndexError("ant_calibrate contains exactly one task (task_id=0)")
+        from ant_envs import AntForwardCalibrationEnv
+
+        env = AntForwardCalibrationEnv(render_mode="human" if render else None)
+        # No TaskConditionedObservationWrapper here: calibration is forward
+        # reward with no target variable, so appending an artificial target is
+        # both unnecessary and numerically harmful.
+        return gym.wrappers.TimeLimit(env, max_episode_steps=1000)
 
     task = get_task_spec(task_id, task_suite)
     kwargs = {
@@ -195,29 +222,23 @@ def get_task(task_id: int, task_suite: str = "halfcheetah_vel", render: bool = F
         kwargs["wind"] = task.wind
 
     env = env_cls(**kwargs)
-    # Every observation from this point on (reset AND step) carries
-    # [target_velocity, wind_a, wind_b] appended -- see
-    # halfcheetah_envs.make_task_specific_observation for why the critic
-    # needs this too, not just the actor. Applied once, here, at
-    # construction time -- everything downstream (replay buffer, Actor,
-    # SoftQNetwork, SyncVectorEnv batching, eval loops,
-    # metrics.evaluate_checkpoint) reads obs_dim dynamically from
-    # observation_space, so no other file needs to change.
     env = TaskConditionedObservationWrapper(env, task)
-    # Directly instantiating a MuJoCo class bypasses gym.make's TimeLimit.
     return gym.wrappers.TimeLimit(env, max_episode_steps=1000)
 
 
 if __name__ == "__main__":
     import sys
 
+    print(
+        f"Ant calibration: v_max={_ANT_V_MAX:g} m/s | "
+        f"source={ANT_CALIBRATION['source']} | provisional={ANT_CALIBRATION_IS_PROVISIONAL}"
+    )
     for suite in available_task_suites():
         print(suite)
         for idx, task in enumerate(TASK_SUITES[suite]):
             print(f"  {idx}: {task.label(suite)}")
 
     if "--check" in sys.argv:
-        # Verifies the hard constraint: constant obs/act shape within a suite.
         import numpy as np
 
         for suite in available_task_suites():
@@ -225,6 +246,7 @@ if __name__ == "__main__":
             for idx in range(len(TASK_SUITES[suite])):
                 env = get_task(idx, task_suite=suite)
                 env.reset(seed=0)
+                env.action_space.seed(0)
                 env.step(env.action_space.sample())
                 shapes.add(
                     (

@@ -10,7 +10,7 @@ TensorBoard logs back.
 Run this once, BEFORE computing forward transfer, with the SAME
 --total-timesteps you use for the real continual run:
 
-    python3 scratch_baselines.py --task-suites halfcheetah_vel halfcheetah_wind_vel \
+    python3 scratch_baselines.py --task-suites ant_vel ant_wind_vel \
         --total-timesteps 300000
 
 Resumable: an already-complete (suite, task_id, seed) combination is
@@ -19,17 +19,22 @@ by default (101, 102, 103 -- deliberately disjoint from the continual run's
 seeds 1/2/3, so nobody mistakes a baseline seed for a continual-run seed).
 
 Everything lands under --save-root (default scratch_models/) for
-checkpoints and under runs/scratch/... for TensorBoard logs (the "runs/"
-prefix is NOT configurable -- run_sac.py hardcodes it, see
-SummaryWriter(f"runs/{args.tag}/{run_name}") in run_sac.py).
+checkpoints and under --runs-root/scratch/... for TensorBoard logs.
 """
 from __future__ import annotations
 
 import argparse
 import pathlib
+import shutil
 import subprocess
+import sys
 
 from tasks import TASK_SUITES, get_task_name
+from experiment_identity import (
+    MANIFEST_NAME,
+    checkpoint_matches as identity_checkpoint_matches,
+    load_manifest,
+)
 
 SCRATCH_SAVE_ROOT = "scratch_models"
 DEFAULT_SCRATCH_SEEDS = [101, 102, 103]
@@ -60,25 +65,101 @@ def scratch_event_dir(runs_root, suite, task_id, total_timesteps, seed):
     )
 
 
+def scratch_analysis_dir(analysis_root, suite, task_id, total_timesteps, seed):
+    return (
+        pathlib.Path(analysis_root) / scratch_tag(suite, task_id, total_timesteps, seed)
+        / scratch_run_name(suite, task_id, seed)
+    )
+
+
 def checkpoint_complete(path):
-    required = ["policy_snapshot.pt", "fc.pt", "mean_pool.pt", "logstd_pool.pt"]
-    return path.exists() and all((path / name).exists() for name in required)
+    path = pathlib.Path(path)
+    required = ["policy_snapshot.pt", "fc.pt", "mean_pool.pt", "logstd_pool.pt", MANIFEST_NAME]
+    return path.exists() and all((path / name).exists() for name in required) and load_manifest(path) is not None
+
+
+def _expected_training_config(suite, task_id, total_timesteps, seed, args):
+    return {
+        "model_type": "cka-rl",
+        "task_suite": suite,
+        "task_id": int(task_id),
+        "seq_idx": 0,
+        "seed": int(seed),
+        "cuda": not bool(args.cpu),
+        "fusion_mode": "classic_cka",
+        "total_timesteps": int(total_timesteps),
+        "gamma": float(args.gamma),
+        "tau": float(args.tau),
+        "batch_size": int(args.batch_size),
+        "learning_starts": int(args.learning_starts),
+        "random_actions_end": int(args.random_actions_end),
+        "policy_lr": float(args.policy_lr),
+        "q_lr": float(args.q_lr),
+        "alpha": float(args.alpha),
+        "autotune": bool(args.autotune),
+        "autotune_init_from_alpha": bool(args.autotune_init_from_alpha),
+        "pool_size": int(args.pool_size),
+        "encoder_from_base": bool(args.encoder_from_base),
+        "freeze_root_encoder": bool(args.freeze_root_encoder),
+        "distillation": False,
+        "use_alpha_mass": False,
+        "use_alpha_scale": False,
+        "constrain_alpha_mass": bool(args.constrain_alpha_mass),
+        "train_shared": bool(args.train_shared),
+        "encoder_linear_out": bool(args.encoder_linear_out),
+        "distill_extra_steps": int(args.distill_extra_steps),
+        "collect_cosine_buffers": False,
+        "max_distill_buffer": int(args.max_distill_buffer),
+        "similarity_samples": int(args.similarity_samples),
+        "distill_max_samples": int(args.distill_max_samples),
+        "distill_epochs": int(args.distill_epochs),
+        "distill_lr": float(args.distill_lr),
+        "distill_batch_size": int(args.distill_batch_size),
+        "distill_test_frac": float(args.distill_test_frac),
+        "distill_select_best_val": bool(args.distill_select_best_val),
+    }
+
+
+def checkpoint_matches(path, suite, task_id, total_timesteps, seed, args):
+    expected = _expected_training_config(suite, task_id, total_timesteps, seed, args)
+    if not checkpoint_complete(path):
+        return False, "checkpoint files or valid run_manifest.json are missing"
+    return identity_checkpoint_matches(
+        path, expected, pretrained_encoder=args.pretrained_encoder
+    )
 
 
 def train_one_baseline(suite, task_id, total_timesteps, seed, args):
     run_dir = scratch_checkpoint_dir(args.save_root, suite, task_id, total_timesteps, seed)
+    event_dir = scratch_event_dir(args.runs_root, suite, task_id, total_timesteps, seed)
+    analysis_dir = scratch_analysis_dir(args.analysis_root, suite, task_id, total_timesteps, seed)
+    expected = _expected_training_config(suite, task_id, total_timesteps, seed, args)
     if checkpoint_complete(run_dir) and not args.force_retrain:
-        print(f"[scratch] {suite}/task_{task_id}/seed_{seed} already complete: {run_dir}")
-        return run_dir
+        matches, reason = identity_checkpoint_matches(
+            run_dir, expected, pretrained_encoder=args.pretrained_encoder
+        )
+        if matches:
+            print(f"[scratch] {suite}/task_{task_id}/seed_{seed} already complete: {run_dir}")
+            return run_dir
+        print(f"[scratch] stale checkpoint ({reason}); retraining: {run_dir}")
+
+    # A forced retrain OR a retry after a partial checkpoint must start with
+    # clean TensorBoard/analysis directories. Otherwise EventAccumulator can
+    # silently combine scalars from multiple attempts and corrupt AUC/FWT.
+    for path in (run_dir, event_dir, analysis_dir):
+        if path.exists():
+            shutil.rmtree(path)
 
     cmd = [
-        "python3", "run_sac.py",
+        sys.executable, "run_sac.py",
         "--model-type=cka-rl",
         f"--task-suite={suite}",
         f"--task-id={task_id}",
+        "--seq-idx=0",
         f"--seed={seed}",
         f"--tag={scratch_tag(suite, task_id, total_timesteps, seed)}",
         f"--save-dir={run_dir.parent}",
+        f"--runs-root={args.runs_root}",
         f"--analysis-root={args.analysis_root}",
         f"--total-timesteps={total_timesteps}",
         f"--learning-starts={args.learning_starts}",
@@ -88,6 +169,9 @@ def train_one_baseline(suite, task_id, total_timesteps, seed, args):
         f"--q-lr={args.q_lr}",
         f"--gamma={args.gamma}",
         f"--tau={args.tau}",
+        f"--alpha={args.alpha}",
+        "--autotune" if args.autotune else "--no-autotune",
+        "--autotune-init-from-alpha" if args.autotune_init_from_alpha else "--no-autotune-init-from-alpha",
         f"--pool-size={args.pool_size}",
         f"--eval-every={args.eval_every}",
         f"--num-evals={args.num_evals}",
@@ -107,6 +191,12 @@ def train_one_baseline(suite, task_id, total_timesteps, seed, args):
         "--no-use-alpha-scale",
         "--no-distillation",
         "--no-use-alpha-mass",
+        "--constrain-alpha-mass" if args.constrain_alpha_mass else "--no-constrain-alpha-mass",
+        "--distill-select-best-val" if args.distill_select_best_val else "--no-distill-select-best-val",
+        "--no-collect-cosine-buffers",
+        "--train-shared" if args.train_shared else "--no-train-shared",
+        "--freeze-root-encoder" if args.freeze_root_encoder else "--no-freeze-root-encoder",
+        "--encoder-from-base" if args.encoder_from_base else "--no-encoder-from-base",
         # The encoder configuration MUST match the continual runs these baselines
         # are the denominator for. Forward transfer compares a continual run's AUC
         # against this run's AUC; if the continual runs get a TD-JEPA pretrained
@@ -126,6 +216,11 @@ def train_one_baseline(suite, task_id, total_timesteps, seed, args):
     subprocess.run(cmd, check=True)
     if not checkpoint_complete(run_dir):
         raise RuntimeError(f"scratch baseline finished but checkpoint is incomplete: {run_dir}")
+    matches, reason = identity_checkpoint_matches(
+        run_dir, expected, pretrained_encoder=args.pretrained_encoder
+    )
+    if not matches:
+        raise RuntimeError(f"scratch baseline has unexpected identity: {reason}")
     return run_dir
 
 
@@ -133,7 +228,7 @@ def parse_args():
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument(
         "--task-suites", nargs="+",
-        default=["halfcheetah_vel", "halfcheetah_wind_vel"],
+        default=["ant_vel", "ant_wind_vel"],
         choices=sorted(TASK_SUITES.keys()),
     )
     p.add_argument("--seeds", nargs="+", type=int, default=DEFAULT_SCRATCH_SEEDS)
@@ -146,6 +241,9 @@ def parse_args():
     p.add_argument("--q-lr", type=float, default=3e-4)
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--tau", type=float, default=0.005)
+    p.add_argument("--alpha", type=float, default=0.2)
+    p.add_argument("--autotune", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--autotune-init-from-alpha", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--pool-size", type=int, default=5)
     p.add_argument("--eval-every", type=int, default=10_000)
     p.add_argument("--num-evals", type=int, default=5)
@@ -157,20 +255,36 @@ def parse_args():
     p.add_argument("--distill-lr", type=float, default=3e-4)
     p.add_argument("--distill-batch-size", type=int, default=256)
     p.add_argument("--distill-test-frac", type=float, default=0.2)
+    p.add_argument("--distill-select-best-val", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--analysis-log-every", type=int, default=5_000)
     p.add_argument("--save-root", default=SCRATCH_SAVE_ROOT)
+    p.add_argument("--runs-root", default="runs")
     p.add_argument("--analysis-root", default="analysis_runs_scratch")
     p.add_argument("--force-retrain", action="store_true")
     p.add_argument("--cpu", action="store_true")
     p.add_argument("--pretrained-encoder", default=None,
                    help="Must match the continual runs these baselines are the "
                         "denominator for, or forward transfer is meaningless.")
-    p.add_argument("--encoder-linear-out", action="store_true")
-    return p.parse_args()
+    p.add_argument("--train-shared", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--freeze-root-encoder", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--encoder-from-base", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--encoder-linear-out", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--constrain-alpha-mass", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--allow-provisional-ant-calibration", action="store_true",
+                   help="Debug/smoke only: allow the provisional 3.3 m/s fallback.")
+    args = p.parse_args()
+    if args.train_shared and args.freeze_root_encoder:
+        p.error("--train-shared and --freeze-root-encoder are contradictory")
+    if args.autotune_init_from_alpha and args.alpha <= 0:
+        p.error("--alpha must be > 0 with --autotune-init-from-alpha")
+    return args
 
 
 def main():
     args = parse_args()
+    if any(suite.startswith("ant") for suite in args.task_suites) and not args.allow_provisional_ant_calibration:
+        from tasks import require_ant_calibration
+        require_ant_calibration()
     for suite in args.task_suites:
         n_tasks = len(TASK_SUITES[suite])
         for task_id in range(n_tasks):

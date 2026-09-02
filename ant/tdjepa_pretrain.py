@@ -67,14 +67,14 @@ def make_pretrain_env(task_suite: str, velocity: float, wind: Tuple[float, float
     same task-conditioning wrapper, same TimeLimit.
     """
     import gymnasium as gym
-    from halfcheetah_envs import (
+    from locomotion_envs import (
         HalfCheetahVelEnv,
         HalfCheetahWindVelEnv,
         TaskConditionedObservationWrapper,
     )
-    from tasks import HalfCheetahTask
+    from tasks import LocomotionTask
 
-    task = HalfCheetahTask(target_velocity=float(velocity), wind=tuple(wind))
+    task = LocomotionTask(target_velocity=float(velocity), wind=tuple(wind))
     kwargs = {"target_velocity": float(velocity), "render_mode": None}
 
     if task_suite.startswith("ant"):
@@ -197,10 +197,17 @@ def to_tensors(data: Dict[str, np.ndarray], device, rew_mean: float, rew_std: fl
 
 @torch.no_grad()
 def evaluate(encoder, predictor, enc_t, pred_t, T, cfg, batch=4096):
+    """Held-out TD-JEPA loss on the SAME scale as td_jepa_loss().
+
+    Training uses ``0.5 * mse_loss(..., reduction="mean")``. The old
+    evaluator summed all 256 latent dimensions but divided only by row count,
+    inflating the reported held-out value by roughly 512x.
+    """
     encoder.eval()
     predictor.eval()
     n = T["obs"].shape[0]
-    total = 0.0
+    total_sq = 0.0
+    total_elements = 0
     for start in range(0, n, batch):
         sl = slice(start, start + batch)
         task = T["task"][sl] if cfg.task_conditioned else None
@@ -208,10 +215,11 @@ def evaluate(encoder, predictor, enc_t, pred_t, T, cfg, batch=4096):
         pred = predictor(z, T["act"][sl], task)
         z_next = enc_t(T["next_obs"][sl])
         tgt = z_next + cfg.gamma * pred_t(z_next, T["next_act"][sl], task)
-        total += float(F.mse_loss(pred, tgt, reduction="sum"))
+        total_sq += float(F.mse_loss(pred, tgt, reduction="sum"))
+        total_elements += int(pred.numel())
     encoder.train()
     predictor.train()
-    return total / (n * T["obs"].shape[1] if False else n)
+    return 0.5 * total_sq / max(total_elements, 1)
 
 
 def train(data, heldout, cfg: TDJepaConfig, epochs, batch_size, device,
@@ -314,19 +322,18 @@ def train(data, heldout, cfg: TDJepaConfig, epochs, batch_size, device,
 # =========================================================================== #
 def parse_args():
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("--task-suite", default="halfcheetah_vel",
+    p.add_argument("--task-suite", default="ant_vel",
                    choices=["halfcheetah_vel", "halfcheetah_wind_vel",
                             "ant_vel", "ant_wind_vel"])
-    p.add_argument("--pretrain-velocities", nargs="+", type=float,
-                   default=[0.75, 1.75, 2.75],
-                   help="Held-out velocities, deliberately NOT in TASK_SUITES.")
+    p.add_argument("--pretrain-velocities", nargs="+", type=float, default=None,
+                   help="Training velocities deliberately NOT in TASK_SUITES. "
+                        "For Ant, calibrated between-task defaults are used when omitted.")
     p.add_argument("--pretrain-winds", nargs="+", type=float, default=None,
                    help="Flat list of wind pairs (wa wb wa wb ...), one per velocity. "
                         "Required for *_wind_vel suites.")
-    p.add_argument("--heldout-velocities", nargs="+", type=float, default=[0.5, 2.0, 3.0],
-                   help="Evaluation-only velocities. Put REAL benchmark velocities "
-                        "here: the held-out TD error is the number that shows whether "
-                        "the representation generalises to unseen tasks.")
+    p.add_argument("--heldout-velocities", nargs="+", type=float, default=None,
+                   help="Evaluation-only velocities. For Ant, calibrated benchmark "
+                        "targets are chosen automatically when omitted.")
     p.add_argument("--heldout-winds", nargs="+", type=float, default=None)
     p.add_argument("--steps-per-task", type=int, default=100_000)
     p.add_argument("--epochs", type=int, default=30)
@@ -351,11 +358,26 @@ def parse_args():
     p.add_argument("--out", default="pretrained_encoders/tdjepa")
     p.add_argument("--cpu", action="store_true")
     p.add_argument("--smoke-test", action="store_true")
+    p.add_argument("--allow-provisional-ant-calibration", action="store_true",
+                   help="Smoke/debug only: permit the built-in provisional Ant v_max.")
     args = p.parse_args()
 
+    if args.pretrain_velocities is None or args.heldout_velocities is None:
+        if args.task_suite.startswith("ant"):
+            from tasks import ant_pretrain_velocities, ant_heldout_velocities
+            if args.pretrain_velocities is None:
+                args.pretrain_velocities = list(ant_pretrain_velocities())
+            if args.heldout_velocities is None:
+                args.heldout_velocities = list(ant_heldout_velocities())
+        else:
+            if args.pretrain_velocities is None:
+                args.pretrain_velocities = [0.75, 1.75, 2.75]
+            if args.heldout_velocities is None:
+                args.heldout_velocities = [0.5, 2.0, 3.0]
+
     if args.smoke_test:
-        args.pretrain_velocities = [0.75]
-        args.heldout_velocities = [2.0]
+        args.pretrain_velocities = [float(args.pretrain_velocities[0])]
+        args.heldout_velocities = [float(args.heldout_velocities[0])]
         if args.task_suite.endswith("wind_vel"):
             args.pretrain_winds = [0.0, 0.0]
             args.heldout_winds = [0.0, 0.0]
@@ -377,6 +399,9 @@ def winds_for(suite: str, flat: Optional[Sequence[float]], n: int, label: str):
 
 def main():
     args = parse_args()
+    if args.task_suite.startswith("ant") and not args.allow_provisional_ant_calibration:
+        from tasks import require_ant_calibration
+        require_ant_calibration()
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
     os.makedirs(args.out, exist_ok=True)
     np.random.seed(args.seed)
@@ -462,12 +487,21 @@ def main():
     torch.save(predictor.to("cpu").state_dict(), os.path.join(args.out, "predictor.pt"))
 
     final = history[-1] if history else {}
+    ant_calibration = None
+    if args.task_suite.startswith("ant"):
+        from tasks import ANT_CALIBRATION
+        ant_calibration = {
+            "v_max": float(ANT_CALIBRATION["v_max"]),
+            "source": str(ANT_CALIBRATION["source"]),
+        }
+
     report = {
         "method": "td_jepa_symmetric",
         "paper": "arXiv:2510.00739 (symmetric variant, Alg. 2)",
         "args": vars(args),
         "config": vars(cfg),
         "encoder_linear_out": not args.relu_out,
+        "ant_calibration": ant_calibration,
         "obs_dim": int(data["obs"].shape[1]),
         "act_dim": int(data["act"].shape[1]),
         "train_rows": int(len(data["obs"])),

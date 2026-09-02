@@ -1,8 +1,8 @@
 """Ant target-velocity tasks, with an optional fixed external wind.
 
-Deliberately mirrors halfcheetah_envs.py one-for-one so that nothing
+Deliberately mirrors locomotion_envs.py one-for-one so that nothing
 downstream has to learn a second pattern. Same reward, same info keys, same
-task-conditioning wrapper (imported from halfcheetah_envs, not duplicated).
+task-conditioning wrapper (imported from locomotion_envs, not duplicated).
 
     reward = -|v_x - target_velocity| - ctrl_cost_weight * ||action||^2
 
@@ -40,10 +40,7 @@ import numpy as np
 try:
     import gymnasium as gym
     import mujoco
-    try:
-        from gymnasium.envs.mujoco.ant_v5 import AntEnv
-    except ImportError:
-        from gymnasium.envs.mujoco.ant_v4 import AntEnv
+    from gymnasium.envs.mujoco.ant_v5 import AntEnv
 except ImportError as exc:
     gym = None
     mujoco = None
@@ -71,18 +68,15 @@ class AntVelocityEnv(AntEnv):
                 "Install the repository requirements first."
             ) from _IMPORT_ERROR
 
-        # v5 exposes these; v4 does not know include_cfrc_ext_in_observation
-        # (it used use_contact_forces instead) so fall back gracefully.
-        base_kwargs = dict(
+        # Final experiments require Ant-v5 so the observation/dynamics API is
+        # identical across machines. Do not silently fall back to Ant-v4.
+        super().__init__(
             render_mode=render_mode,
             ctrl_cost_weight=ctrl_cost_weight,
             terminate_when_unhealthy=False,
+            include_cfrc_ext_in_observation=False,
             **kwargs,
         )
-        try:
-            super().__init__(include_cfrc_ext_in_observation=False, **base_kwargs)
-        except TypeError:
-            super().__init__(**base_kwargs)
 
         self.target_velocity = float(target_velocity)
         self.wind_x = float(wind[0])
@@ -145,6 +139,9 @@ class AntVelocityEnv(AntEnv):
             # Same three keys as the HalfCheetah suite so nothing downstream
             # needs a branch; for Ant the second component is a y-wind.
             "wind_x": self.wind_x,
+            "wind_y": self.wind_y,
+            # Backward-compatible alias retained because old analysis code used
+            # the HalfCheetah name for the second wind component.
             "wind_z": self.wind_y,
             "success": float(velocity_error <= self.success_tolerance),
         }
@@ -157,6 +154,99 @@ class AntVelocityEnv(AntEnv):
         return observation, reward, False, False, info
 
 
+
+
+class AntForwardCalibrationEnv(AntVelocityEnv):
+    """Ant calibration task with a numerically well-scaled forward reward.
+
+    This intentionally does NOT use a huge target velocity.  The objective is
+
+        reward = x_velocity - ctrl_cost_weight * ||action||^2
+
+    so the critic sees ordinary reward/Q magnitudes and the observation remains
+    the raw Ant state (tasks.get_task does not append a fake target for the
+    calibration suite).  It uses the same dynamics, control penalty and episode
+    horizon as the benchmark tasks.
+    """
+
+    def __init__(
+        self,
+        ctrl_cost_weight: float = 0.05,
+        render_mode: Optional[str] = None,
+        **kwargs,
+    ):
+        super().__init__(
+            target_velocity=0.0,
+            wind=(0.0, 0.0),
+            success_tolerance=float("inf"),
+            ctrl_cost_weight=ctrl_cost_weight,
+            render_mode=render_mode,
+            **kwargs,
+        )
+
+    @property
+    def task_name(self) -> str:
+        return "AntForwardCalibration"
+
+    def step(self, action):
+        x_before = float(self.data.qpos[0])
+        self._simulate(action)
+        x_after = float(self.data.qpos[0])
+        x_velocity = (x_after - x_before) / self.dt
+
+        # ctrl_cost = self.velocity_ctrl_cost_weight * float(np.square(action).sum())
+        # reward = x_velocity - ctrl_cost
+        # observation = self._get_obs()
+        #
+        # info = {
+        #     "x_position": x_after,
+        #     "x_velocity": x_velocity,
+        #     "reward_forward": x_velocity,
+        #     "reward_ctrl": -ctrl_cost,
+        #     "calibration": 1.0,
+        # }
+
+        action_sq = float(np.square(action).sum())
+        ctrl_cost = self.velocity_ctrl_cost_weight * action_sq
+        reward = x_velocity - ctrl_cost
+
+        observation = self._get_obs()
+
+        torso_z = float(self.data.qpos[2])
+        state_finite = bool(
+            np.isfinite(self.data.qpos).all()
+            and np.isfinite(self.data.qvel).all()
+        )
+        is_healthy = bool(
+            state_finite
+            and 0.2 <= torso_z <= 1.0
+        )
+
+        info = {
+            "x_position": x_after,
+            "x_velocity": x_velocity,
+
+            "reward_forward": x_velocity,
+            "reward_ctrl": -ctrl_cost,
+
+            "action_sq": action_sq,
+            "action_abs_mean": float(np.abs(action).mean()),
+            "action_saturation_frac": float(
+                np.mean(np.abs(action) >= 0.95)
+            ),
+
+            "torso_z": torso_z,
+            "is_healthy": float(is_healthy),
+
+            "calibration": 1.0,
+        }
+
+        if self.render_mode == "human":
+            self.render()
+
+        return observation, reward, False, False, info
+
+
 class AntVelEnv(AntVelocityEnv):
     """Named convenience wrapper for the target-velocity-only suite."""
 
@@ -165,30 +255,11 @@ class AntVelEnv(AntVelocityEnv):
 
 
 class AntWindVelEnv(AntVelocityEnv):
-    """Named convenience wrapper for joint target-velocity + hidden-wind tasks."""
+    """Named convenience wrapper for joint target-velocity + task-conditioned fixed-wind tasks."""
 
     def __init__(self, target_velocity: float, wind: Tuple[float, float], **kwargs):
         super().__init__(target_velocity=target_velocity, wind=wind, **kwargs)
 
 
-# ---------------------------------------------------------------------------
-# Velocity calibration helper -- READ THIS BEFORE THE FIRST REAL RUN
-# ---------------------------------------------------------------------------
-def measure_reachable_velocity(total_timesteps: int = 150_000, seed: int = 0) -> float:
-    """Train plain forward-reward SAC on Ant and report the velocity reached.
-
-    The HalfCheetah suite's targets (0.5 .. 3.0 m/s) were chosen for a robot
-    that reaches roughly 5-8 m/s. Ant is substantially slower. Copying those
-    numbers across would make the fast tasks unreachable, collapsing several
-    of them onto the same behaviour ("run flat out") and destroying the
-    benchmark's ability to distinguish tasks at all.
-
-    This is a stub on purpose: run it in your own environment, read off the
-    achievable v_max, then set _ANT_VELOCITIES in tasks.py to roughly
-    {0.15, 0.3, 0.45, 0.6, 0.75, 0.9} * v_max and success_tolerance to
-    0.1 * v_max.
-    """
-    raise NotImplementedError(
-        "Run a plain SAC baseline on Ant-v5 (standard forward reward) and read "
-        "off info['x_velocity'] at convergence. See section 4.4 of the analysis doc."
-    )
+# Calibration orchestration lives in calibrate_ant.py.  Keeping the environment
+# class here makes the reward/dynamics definition explicit and unit-testable.

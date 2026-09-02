@@ -30,22 +30,23 @@ class HalfCheetahTask:
         )
 
 
-# Eight distinct tasks is enough to force several merges with the recommended
-# pool_size=5, while keeping a 2-pass continual benchmark computationally sane.
+# Friend branch: six task targets, repeated twice by DEFAULT_CONTINUAL_SEQUENCE.
+# With pool_size=5 the second pass still forces repeated merges while keeping the
+# benchmark cheaper than the earlier eight-task sweep.
 _VELOCITIES = (
-    1.0, 
+    1.0,
     0.5,
-    1.5, 
+    1.5,
     2.0,
     1.25,
     0.75,
 )
 
 _WIND_PAIRS = (
-    (2.5, 0.0),  
-    (-2.5, 0.0), 
-    (0.0, -5.0), 
-    (2.5, -5.0), 
+    (2.5, 0.0),
+    (-2.5, 0.0),
+    (0.0, -5.0),
+    (2.5, -5.0),
     (1.25, 0.0),
     (-1.25, -2.5)
 )

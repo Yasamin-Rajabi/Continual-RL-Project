@@ -1,4 +1,4 @@
-"""All plotting and table/CSV writing for the continual HalfCheetah benchmark.
+"""All plotting and table/CSV writing for the continual locomotion benchmark.
 
 Pure drawing: every function here takes already-computed data (or reads
 already-logged TensorBoard scalars via metrics.py's path helpers) and writes
@@ -51,8 +51,18 @@ SEQUENCE_METRICS = {
     "analysis/merge/symmetric_kl": ("Selected merge-pair symmetric KL", "merge_selected_skl"),
     "analysis/merge/pairwise_kl_mean": ("Mean pairwise symmetric KL in pool", "merge_pool_mean_skl"),
     "analysis/merge/pairwise_kl_max": ("Maximum pairwise symmetric KL in pool", "merge_pool_max_skl"),
+    "analysis/merge/selected_state_kl_p95": ("Selected merge-pair statewise KL p95", "merge_selected_state_kl_p95"),
+    "analysis/merge/selected_state_kl_max": ("Selected merge-pair statewise KL max", "merge_selected_state_kl_max"),
     "distillation/policy/distill_train_kl": ("Distillation train KL", "distill_train_kl"),
     "distillation/policy/distill_test_kl": ("Distillation held-out KL", "distill_test_kl"),
+    "distillation/policy/distill_train_kl_p95": ("Distillation train KL p95", "distill_train_kl_p95"),
+    "distillation/policy/distill_test_kl_p95": ("Distillation held-out KL p95", "distill_test_kl_p95"),
+    "distillation/policy/distill_train_kl_max": ("Distillation train KL max", "distill_train_kl_max"),
+    "distillation/policy/distill_test_kl_max": ("Distillation held-out KL max", "distill_test_kl_max"),
+    "distillation/policy/distill_best_val_kl": ("Distillation best validation KL", "distill_best_val_kl"),
+    "distillation/policy/distill_best_epoch": ("Distillation best validation epoch", "distill_best_epoch"),
+    "distillation/policy/distill_selected_val_kl": ("Distillation selected validation KL", "distill_selected_val_kl"),
+    "distillation/policy/distill_selected_epoch": ("Distillation selected epoch", "distill_selected_epoch"),
     "distillation/policy/distill_train_mean_mse": ("Distillation train mean MSE", "distill_train_mean_mse"),
     "distillation/policy/distill_test_mean_mse": ("Distillation held-out mean MSE", "distill_test_mean_mse"),
     "distillation/policy/distill_train_logstd_mse": ("Distillation train log-std MSE", "distill_train_logstd_mse"),
@@ -414,6 +424,60 @@ def plot_merge_lineage(args, suite, conditions):
         fig.tight_layout()
         fig.savefig(out_dir / f"merge_lineage_{condition}.png", dpi=180)
         plt.close(fig)
+
+        # Occurrence-level lineage: unlike task IDs, source IDs are unique
+        # sequence positions, so repeated visits to the same task do not hide
+        # whether the original occurrence is decaying out of merged buffers.
+        source_seed_matrices = []
+        source_labels = [f"{i}:T{task}" for i, task in enumerate(args.task_sequence)]
+        for seed in args.seeds:
+            matrix = np.full(
+                (len(args.task_sequence), len(args.task_sequence)),
+                np.nan, dtype=np.float64,
+            )
+            for seq_idx, task_id in enumerate(args.task_sequence):
+                path = analysis_snapshot_path(args.analysis_root, suite, condition, seed, seq_idx, task_id)
+                if not path.exists():
+                    continue
+                try:
+                    snap = torch.load(path, map_location="cpu", weights_only=False)
+                    info = snap["actor"]["mean_headpool"].get("last_merge_info")
+                except Exception:
+                    continue
+                if not info or not info.get("merged_source_lineage"):
+                    continue
+                lineage = info["merged_source_lineage"]
+                counts = np.asarray([
+                    float(lineage.get(str(source_idx), 0.0))
+                    for source_idx in range(len(args.task_sequence))
+                ])
+                total = counts.sum()
+                if total > 0:
+                    matrix[seq_idx] = counts / total
+            source_seed_matrices.append(matrix)
+
+        source_stack = np.asarray(source_seed_matrices)
+        valid = np.sum(np.isfinite(source_stack), axis=0)
+        source_mean = np.divide(
+            np.nansum(source_stack, axis=0), valid,
+            out=np.full(source_stack.shape[1:], np.nan), where=valid > 0,
+        )
+        if np.isfinite(source_mean).any():
+            fig, ax = plt.subplots(figsize=(13.0, 7.0))
+            im = ax.imshow(source_mean, aspect="auto", vmin=0.0, vmax=1.0)
+            fig.colorbar(im, ax=ax, label="Fraction of selected merged buffer")
+            ax.set_xticks(np.arange(len(source_labels)))
+            ax.set_xticklabels(source_labels, rotation=45, ha="right")
+            ax.set_yticks(np.arange(len(ylabels)))
+            ax.set_yticklabels(ylabels)
+            ax.set_xlabel("Original sequence occurrence represented in selected merge")
+            ax.set_ylabel("Continual sequence position")
+            ax.set_title(
+                f"{suite} / {condition}: selected-merge occurrence lineage composition"
+            )
+            fig.tight_layout()
+            fig.savefig(out_dir / f"merge_source_lineage_{condition}.png", dpi=180)
+            plt.close(fig)
 
 
 def plot_zero_shot(args, suite, conditions):

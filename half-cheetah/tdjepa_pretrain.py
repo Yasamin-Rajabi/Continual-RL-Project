@@ -197,10 +197,17 @@ def to_tensors(data: Dict[str, np.ndarray], device, rew_mean: float, rew_std: fl
 
 @torch.no_grad()
 def evaluate(encoder, predictor, enc_t, pred_t, T, cfg, batch=4096):
+    """Held-out TD-JEPA loss on the SAME scale as td_jepa_loss().
+
+    Training uses ``0.5 * mse_loss(..., reduction="mean")``. The old
+    evaluator summed all 256 latent dimensions but divided only by row count,
+    inflating the reported held-out value by roughly 512x.
+    """
     encoder.eval()
     predictor.eval()
     n = T["obs"].shape[0]
-    total = 0.0
+    total_sq = 0.0
+    total_elements = 0
     for start in range(0, n, batch):
         sl = slice(start, start + batch)
         task = T["task"][sl] if cfg.task_conditioned else None
@@ -208,10 +215,11 @@ def evaluate(encoder, predictor, enc_t, pred_t, T, cfg, batch=4096):
         pred = predictor(z, T["act"][sl], task)
         z_next = enc_t(T["next_obs"][sl])
         tgt = z_next + cfg.gamma * pred_t(z_next, T["next_act"][sl], task)
-        total += float(F.mse_loss(pred, tgt, reduction="sum"))
+        total_sq += float(F.mse_loss(pred, tgt, reduction="sum"))
+        total_elements += int(pred.numel())
     encoder.train()
     predictor.train()
-    return total / (n * T["obs"].shape[1] if False else n)
+    return 0.5 * total_sq / max(total_elements, 1)
 
 
 def train(data, heldout, cfg: TDJepaConfig, epochs, batch_size, device,

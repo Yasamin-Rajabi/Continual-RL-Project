@@ -49,19 +49,23 @@ import scratch_baselines
 CONDITIONS = OrderedDict([
     (
         "baseline",
-        {"fusion_mode": "classic_cka", "distillation": False, "use_alpha_mass": False, "fix_alpha_scale": False},
+        {"fusion_mode": "classic_cka", "distillation": False, "use_alpha_mass": False,
+         "use_alpha_scale": True, "fix_alpha_scale": False},
     ),
     (
         "distil_only",
-        {"fusion_mode": "classic_cka", "distillation": True, "use_alpha_mass": False, "fix_alpha_scale": False},
+        {"fusion_mode": "classic_cka", "distillation": True, "use_alpha_mass": False,
+         "use_alpha_scale": True, "fix_alpha_scale": False},
     ),
     (
         "weight_only",
-        {"fusion_mode": "weight_delta", "distillation": False, "use_alpha_mass": True, "fix_alpha_scale": True},
+        {"fusion_mode": "weight_delta", "distillation": False, "use_alpha_mass": True,
+         "use_alpha_scale": False, "fix_alpha_scale": True},
     ),
     (
         "combined",
-        {"fusion_mode": "weight_delta", "distillation": True, "use_alpha_mass": True, "fix_alpha_scale": True},
+        {"fusion_mode": "weight_delta", "distillation": True, "use_alpha_mass": True,
+         "use_alpha_scale": False, "fix_alpha_scale": True},
     ),
 ])
 
@@ -81,7 +85,7 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--policy-lr", type=float, default=3e-4)
     p.add_argument("--alpha-lr", type=float, default=5e-3)
-    p.add_argument("--alpha-mass-reg", type=float, default=0.05)  
+    p.add_argument("--alpha-mass-reg", type=float, default=0.05)
     p.add_argument("--alpha-warmup-steps", type=int, default=5_000)
     p.add_argument("--drift-reg", type=float, default=1.0)
     p.add_argument("--q-lr", type=float, default=3e-4)
@@ -91,6 +95,12 @@ def parse_args():
     p.add_argument("--eval-every", type=int, default=10_000)
     p.add_argument("--num-evals", type=int, default=5)
     p.add_argument("--retention-eval-episodes", type=int, default=3)
+    p.add_argument("--test-adapt-steps", type=int, default=5_000,
+                   help="Test-time alpha-only adaptation steps before retention/final-row evaluation; 0 disables it.")
+    p.add_argument("--test-adapt-lr", type=float, default=1e-2,
+                   help="Learning rate for test-time alpha adaptation.")
+    p.add_argument("--distill-observation-skip", action=argparse.BooleanOptionalAction, default=True,
+                   help="Concatenate raw observations to encoder features before policy heads in distillation modes.")
     p.add_argument("--distill-extra-steps", type=int, default=10_000)
     p.add_argument("--max-distill-buffer", type=int, default=50_000)
     p.add_argument("--similarity-samples", type=int, default=2_048)
@@ -116,12 +126,40 @@ def parse_args():
         help="Checkpoint root used by scratch_baselines.py.",
     )
     p.add_argument("--force-retrain", action="store_true")
-    p.add_argument("--train-shared", action="store_true")
+
+    # Encoder/algorithm ablations.  Keep the historical frozen-root CLI default
+    # for reproducible ablations; the friend's current notebook workflow passes
+    # --train-shared explicitly and does not require a pretrained encoder.
+    p.add_argument("--train-shared", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--freeze-root-encoder", action=argparse.BooleanOptionalAction, default=False,
+                   help="Random-frozen root encoder ablation. Contradicts --train-shared.")
+    p.add_argument("--encoder-from-base", action=argparse.BooleanOptionalAction, default=True,
+                   help="When the encoder is frozen, reload the immutable root encoder on later tasks.")
     p.add_argument("--pretrained-encoder", default=None,
-                   help="fc.pt from tdjepa_pretrain.py; implies a frozen encoder.")
-    p.add_argument("--encoder-linear-out", action="store_true",
-                   help="Must match the setting the pretrained encoder was built "
-                        "with. Changes the critic too, so baselines must be re-run.")
+                   help="fc.pt from tdjepa_pretrain.py. Frozen from task 0 unless --train-shared.")
+    p.add_argument("--encoder-linear-out", action=argparse.BooleanOptionalAction, default=False,
+                   help="Must match the serialized encoder architecture; also changes the critic.")
+
+    p.add_argument("--condition-alpha-scale", action=argparse.BooleanOptionalAction, default=True,
+                   help="Use friend's condition-specific alpha-scale rule: learned for classic CKA, fixed at 5 for weight_delta.")
+    p.add_argument("--use-alpha-scale", action=argparse.BooleanOptionalAction, default=False,
+                   help="Global learned alpha-scale ablation used when --no-condition-alpha-scale.")
+    p.add_argument("--fix-alpha-scale", action=argparse.BooleanOptionalAction, default=False,
+                   help="Global fixed alpha-scale=5 ablation used when --no-condition-alpha-scale.")
+    p.add_argument("--weight-use-alpha-mass", action=argparse.BooleanOptionalAction, default=True,
+                   help="Enable alpha-mass in weight_delta modes. Disable to isolate representation alone.")
+    p.add_argument("--constrain-alpha-mass", action=argparse.BooleanOptionalAction, default=True,
+                   help="Positive softplus alpha-mass stabilization; disable for the legacy ablation.")
+    p.add_argument("--distill-select-best-val", action=argparse.BooleanOptionalAction, default=True,
+                   help="Restore the lowest held-out-KL distillation epoch; disable for last-epoch legacy behavior.")
+    p.add_argument("--collect-cosine-buffers", action=argparse.BooleanOptionalAction, default=False,
+                   help="Cosine modes do not need rollout buffers. Enable only to equalize post-training interactions.")
+
+    p.add_argument("--alpha", type=float, default=0.2,
+                   help="Fixed SAC entropy coefficient, or optional autotune initialization.")
+    p.add_argument("--autotune", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--autotune-init-from-alpha", action=argparse.BooleanOptionalAction, default=False,
+                   help="If enabled, entropy autotuning starts at --alpha instead of legacy 1.0.")
     p.add_argument("--cpu", action="store_true")
     p.add_argument(
         "--condition-index", type=int, default=0, choices=[0, 1, 2, 3, 4],
@@ -130,9 +168,6 @@ def parse_args():
              "(1=baseline, 2=distil_only, 3=weight_only, 4=combined).",
     )
     p.add_argument("--quick-test", action="store_true")
-    p.add_argument("--test-adapt-steps", type=int, default=5_000,
-                   help="Number of steps to adapt alpha logits during test-time evaluation")
-
     args = p.parse_args()
 
     if args.quick_test:
@@ -154,13 +189,81 @@ def parse_args():
         args.distill_epochs = 2
         args.analysis_log_every = 2_000
 
+    if args.train_shared and args.freeze_root_encoder:
+        p.error("--train-shared and --freeze-root-encoder are contradictory")
+    if args.autotune_init_from_alpha and args.alpha <= 0:
+        p.error("--alpha must be > 0 with --autotune-init-from-alpha")
+    if args.use_alpha_scale and args.fix_alpha_scale:
+        p.error("--use-alpha-scale and --fix-alpha-scale are mutually exclusive")
+    if args.test_adapt_steps < 0 or args.test_adapt_lr <= 0:
+        p.error("--test-adapt-steps must be >=0 and --test-adapt-lr must be >0")
+
     return args
 
 
 # ==========================================================================
 # TRAINING: the only thing this file still does directly.
 # ==========================================================================
+def _effective_condition_config(args, cfg):
+    cfg = dict(cfg)
+    if cfg["fusion_mode"] == "weight_delta":
+        cfg["use_alpha_mass"] = bool(cfg["use_alpha_mass"] and args.weight_use_alpha_mass)
+    if not args.condition_alpha_scale:
+        cfg["use_alpha_scale"] = bool(args.use_alpha_scale)
+        cfg["fix_alpha_scale"] = bool(args.fix_alpha_scale)
+    return cfg
+
+
+def _expected_training_config(args, suite, task_id, seq_idx, seed, cfg):
+    """Subset of run_sac training knobs used to validate resumable checkpoints."""
+    return {
+        "model_type": "cka-rl",
+        "task_suite": suite,
+        "task_id": int(task_id),
+        "seq_idx": int(seq_idx),
+        "seed": int(seed),
+        "cuda": not bool(args.cpu),
+        "fusion_mode": cfg["fusion_mode"],
+        "total_timesteps": int(args.total_timesteps),
+        "gamma": float(args.gamma),
+        "tau": float(args.tau),
+        "batch_size": int(args.batch_size),
+        "learning_starts": int(args.learning_starts),
+        "random_actions_end": int(args.random_actions_end),
+        "policy_lr": float(args.policy_lr),
+        "alpha_lr": float(args.alpha_lr),
+        "alpha_warmup_steps": int(args.alpha_warmup_steps),
+        "q_lr": float(args.q_lr),
+        "alpha": float(args.alpha),
+        "autotune": bool(args.autotune),
+        "autotune_init_from_alpha": bool(args.autotune_init_from_alpha),
+        "pool_size": int(args.pool_size),
+        "encoder_from_base": bool(args.encoder_from_base),
+        "freeze_root_encoder": bool(args.freeze_root_encoder),
+        "distillation": bool(cfg["distillation"]),
+        "use_alpha_mass": bool(cfg["use_alpha_mass"]),
+        "use_alpha_scale": bool(cfg["use_alpha_scale"]),
+        "fix_alpha_scale": bool(cfg["fix_alpha_scale"]),
+        "alpha_mass_reg": float(args.alpha_mass_reg),
+        "drift_reg": float(args.drift_reg),
+        "constrain_alpha_mass": bool(args.constrain_alpha_mass),
+        "train_shared": bool(args.train_shared),
+        "encoder_linear_out": bool(args.encoder_linear_out),
+        "distill_observation_skip": bool(args.distill_observation_skip),
+        "distill_extra_steps": int(args.distill_extra_steps),
+        "collect_cosine_buffers": bool(args.collect_cosine_buffers),
+        "max_distill_buffer": int(args.max_distill_buffer),
+        "similarity_samples": int(args.similarity_samples),
+        "distill_max_samples": int(args.distill_max_samples),
+        "distill_epochs": int(args.distill_epochs),
+        "distill_lr": float(args.distill_lr),
+        "distill_batch_size": int(args.distill_batch_size),
+        "distill_test_frac": float(args.distill_test_frac),
+        "distill_select_best_val": bool(args.distill_select_best_val),
+    }
+
 def train_chain(args, suite, condition, cfg, seed):
+    cfg = _effective_condition_config(args, cfg)
     previous = []
     for seq_idx, task_id in enumerate(args.task_sequence):
         if task_id < 0 or task_id >= len(TASK_SUITES[suite]):
@@ -172,18 +275,31 @@ def train_chain(args, suite, condition, cfg, seed):
         analysis_dir = metrics.analysis_snapshot_path(
             args.analysis_root, suite, condition, seed, seq_idx, task_id
         ).parent
+        prev_args = []
+        if previous:
+            prev_args = [previous[0]] if len(previous) == 1 else [previous[0], previous[-1]]
+        expected_config = _expected_training_config(args, suite, task_id, seq_idx, seed, cfg)
+
         if args.force_retrain:
             for path in (run_dir, tb_dir, analysis_dir):
                 if path.exists():
                     shutil.rmtree(path)
 
         if metrics.checkpoint_complete(run_dir):
-            print(f"[{suite}/{condition}/seed={seed}] seq{seq_idx} already complete: {run_dir}")
-            previous.append(run_dir)
-            continue
+            matches, reason = metrics.checkpoint_matches(
+                run_dir, expected_config, parent_dirs=prev_args,
+                pretrained_encoder=args.pretrained_encoder,
+            )
+            if matches:
+                print(f"[{suite}/{condition}/seed={seed}] seq{seq_idx} already complete: {run_dir}")
+                previous.append(run_dir)
+                continue
+            print(f"[{suite}/{condition}/seed={seed}] seq{seq_idx} stale checkpoint: {reason}; retraining")
 
         if args.skip_training:
-            raise FileNotFoundError(f"Missing checkpoint while --skip-training was set: {run_dir}")
+            raise FileNotFoundError(
+                f"Missing/stale checkpoint while --skip-training was set: {run_dir}"
+            )
 
         # Remove partial outputs before a retry, otherwise TensorBoard can mix
         # stale and fresh event files from two different attempts.
@@ -218,6 +334,7 @@ def train_chain(args, suite, condition, cfg, seed):
             f"--pool-size={args.pool_size}",
             f"--eval-every={args.eval_every}",
             f"--num-evals={args.num_evals}",
+            "--distill-observation-skip" if args.distill_observation_skip else "--no-distill-observation-skip",
             f"--distill-extra-steps={args.distill_extra_steps}",
             f"--max-distill-buffer={args.max_distill_buffer}",
             f"--similarity-samples={args.similarity_samples}",
@@ -228,22 +345,30 @@ def train_chain(args, suite, condition, cfg, seed):
             f"--distill-test-frac={args.distill_test_frac}",
             f"--analysis-log-every={args.analysis_log_every}",
             f"--fusion-mode={cfg['fusion_mode']}",
+            f"--alpha={args.alpha}",
+            "--autotune" if args.autotune else "--no-autotune",
+            "--autotune-init-from-alpha" if args.autotune_init_from_alpha else "--no-autotune-init-from-alpha",
+            "--use-alpha-scale" if cfg["use_alpha_scale"] else "--no-use-alpha-scale",
             "--fix-alpha-scale" if cfg["fix_alpha_scale"] else "--no-fix-alpha-scale",
             "--distillation" if cfg["distillation"] else "--no-distillation",
+            "--distill-select-best-val" if args.distill_select_best_val else "--no-distill-select-best-val",
+            "--collect-cosine-buffers" if args.collect_cosine_buffers else "--no-collect-cosine-buffers",
             "--train-shared" if args.train_shared else "--no-train-shared",
+            "--freeze-root-encoder" if args.freeze_root_encoder else "--no-freeze-root-encoder",
+            "--encoder-from-base" if args.encoder_from_base else "--no-encoder-from-base",
             "--encoder-linear-out" if args.encoder_linear_out else "--no-encoder-linear-out",
             "--use-alpha-mass" if cfg["use_alpha_mass"] else "--no-use-alpha-mass",
+            "--constrain-alpha-mass" if args.constrain_alpha_mass else "--no-constrain-alpha-mass",
         ]
         if args.pretrained_encoder:
             cmd.append(f"--pretrained-encoder={args.pretrained_encoder}")
         if args.cpu:
             cmd.append("--no-cuda")
 
-        if previous:
+        if prev_args:
             # run_sac only needs the immutable root and latest continual state.
-            prev_args = [previous[0]] if len(previous) == 1 else [previous[0], previous[-1]]
             cmd.append("--prev-units")
-            cmd.extend(str(p) for p in prev_args)
+            cmd.extend(str(path) for path in prev_args)
 
         print(
             f"\n>>> {suite} | {condition} | seed {seed} | seq{seq_idx} "
@@ -252,6 +377,12 @@ def train_chain(args, suite, condition, cfg, seed):
         subprocess.run(cmd, check=True)
         if not metrics.checkpoint_complete(run_dir):
             raise RuntimeError(f"Training command finished but checkpoint is incomplete: {run_dir}")
+        matches, reason = metrics.checkpoint_matches(
+            run_dir, expected_config, parent_dirs=prev_args,
+            pretrained_encoder=args.pretrained_encoder,
+        )
+        if not matches:
+            raise RuntimeError(f"Training produced a checkpoint with unexpected identity: {reason}")
         previous.append(run_dir)
     return previous
 
@@ -301,15 +432,26 @@ def main():
 
         if not args.skip_survey_metrics:
             used_task_ids = sorted(set(args.task_sequence))
-            missing_baselines = [
-                task_id for task_id in used_task_ids
-                for seed in args.scratch_seeds
-                if not scratch_baselines.checkpoint_complete(
-                    scratch_baselines.scratch_checkpoint_dir(
-                        args.scratch_save_root, suite, task_id, args.total_timesteps, seed,
+            missing_baselines = []
+            stale_baselines = []
+            for task_id in used_task_ids:
+                for scratch_seed in args.scratch_seeds:
+                    scratch_dir = scratch_baselines.scratch_checkpoint_dir(
+                        args.scratch_save_root, suite, task_id, args.total_timesteps, scratch_seed,
                     )
-                )
-            ]
+                    if not scratch_baselines.checkpoint_complete(scratch_dir):
+                        missing_baselines.append(task_id)
+                        continue
+                    matches, reason = scratch_baselines.checkpoint_matches(
+                        scratch_dir, suite, task_id, args.total_timesteps, scratch_seed, args
+                    )
+                    if not matches:
+                        stale_baselines.append((task_id, scratch_seed, reason))
+            if stale_baselines:
+                print("\n!!! Scratch baseline identity mismatch(es):")
+                for task_id, scratch_seed, reason in stale_baselines:
+                    print(f"    task {task_id}, seed {scratch_seed}: {reason}")
+                missing_baselines.extend(task_id for task_id, _, _ in stale_baselines)
             if missing_baselines:
                 print(
                     f"\n!!! Skipping survey metrics for {suite}: missing scratch baselines for "

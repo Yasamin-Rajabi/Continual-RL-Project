@@ -28,17 +28,19 @@ def parse_args():
     p.add_argument("--seeds", nargs="+", type=int, default=[101])
     p.add_argument("--task-sequence", nargs="+", type=int, default=list(DEFAULT_CONTINUAL_SEQUENCE))
     p.add_argument("--total-timesteps", type=int, default=80_000)
-    
-    # تنظیمات کلیدی مربوط به متریک‌ها و فاز وارم‌آپ/تطبیق تستی
+
+    # Metric and test-time adaptation controls.
     p.add_argument("--retention-eval-episodes", type=int, default=3)
     p.add_argument("--test-adapt-steps", type=int, default=1000,
-                   help="Number of steps to adapt alpha logits during test-time evaluation (e.g. 1000 instead of 5000)")
-    
+                   help="Number of alpha-only adaptation steps before retention/final evaluation; 0 disables it.")
+    p.add_argument("--test-adapt-lr", type=float, default=1e-2,
+                   help="Learning rate for test-time alpha adaptation.")
+
     p.add_argument("--save-root", default="agents_halfcheetah")
     p.add_argument("--runs-root", default="runs")
     p.add_argument("--plots-root", default="plots_custom_evaluation")
     p.add_argument("--analysis-root", default="analysis_runs")
-    
+
     p.add_argument("--skip-retention", action="store_true")
     p.add_argument("--skip-survey-metrics", action="store_true")
     p.add_argument(
@@ -49,30 +51,33 @@ def parse_args():
     )
     p.add_argument("--force-retrain", action="store_true")
     p.add_argument("--cpu", action="store_true")
-    
-    # آرگومان اصلی برای دریافت دیکشنری سفارشی پوشه‌ها / هایپرپارامترها
+
+    # Map user-defined condition names to model-root directories.
     p.add_argument(
         "--custom-models-json", required=True,
         help="JSON string or path to JSON file containing custom condition-to-path dictionary, "
              "e.g. '{\"Aware_Seed101\": \"/path/to/aware\", \"Agnostic_Seed101\": \"/path/to/agnostic\"}'"
     )
-    
-    return p.parse_args()
+
+    args = p.parse_args()
+    if args.test_adapt_steps < 0 or args.test_adapt_lr <= 0:
+        p.error("--test-adapt-steps must be >=0 and --test-adapt-lr must be >0")
+    return args
 
 
 def main():
     args = parse_args()
     pathlib.Path(args.plots_root).mkdir(parents=True, exist_ok=True)
-    
+
     custom_path = pathlib.Path(args.custom_models_json)
     if custom_path.exists():
         with open(custom_path) as f:
             custom_map = json.load(f)
     else:
         custom_map = json.loads(args.custom_models_json)
-        
+
     metrics.set_custom_model_map(custom_map)
-    
+
     conditions = list(custom_map.keys())
     print(f"Custom evaluation conditions / hyperparameters: {conditions}")
 
@@ -86,14 +91,14 @@ def main():
 
     for suite in args.task_suites:
         print(f"\n================ {suite} ================")
-        
-        # توجه: بخش آموزش (train_chain) کاملاً حذف شده است تا خطایی رخ ندهد.
 
-        # ۲. رسم پلات‌ها و تحلیل‌های تشخیصی با استفاده از مسیرهای سفارشی
+        # Evaluation only: no training is launched from this script.
+
+        # Diagnostic plots using the custom checkpoint paths.
         plots.plot_sequence_diagnostics(args, suite, conditions)
         plots.plot_zero_shot(args, suite, conditions)
 
-        # ۳. محاسبه ماتریس حفظ دانش (Retention Matrix) با اعمال استپ‌های تطبیق تستی جدید
+        # Retention matrix with the requested test-time adaptation budget.
         if not args.skip_retention:
             all_payloads = {condition: [] for condition in conditions}
             for condition in conditions:
@@ -105,7 +110,7 @@ def main():
             plots.plot_retention(args, suite, conditions, all_payloads)
             plots.write_summary_csv(args, suite, conditions, all_payloads)
 
-        # ۴. محاسبه متریک‌های سروی (Survey Metrics: A_N, FG, BWT, FT)
+        # Survey metrics: A_N, FG, BWT, and FT.
         if not args.skip_survey_metrics:
             used_task_ids = sorted(set(args.task_sequence))
             missing_baselines = [
