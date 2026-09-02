@@ -1,0 +1,13 @@
+numpy>=1.26
+torch>=2.1
+gymnasium>=0.29.1
+mujoco>=2.3.7
+# Meta-World is not on PyPI under this name; install from source:
+#   pip install git+https://github.com/Farama-Foundation/Metaworld.git@master
+# The code uses ALL_V2_ENVIRONMENTS_GOAL_OBSERVABLE, present in the v2 API.
+stable-baselines3>=2.2.1
+tensorboard>=2.15
+matplotlib>=3.7
+tyro>=0.8
+loguru>=0.7
+tqdm>=4.66
