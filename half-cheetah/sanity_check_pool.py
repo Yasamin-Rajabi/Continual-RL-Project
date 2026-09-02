@@ -382,6 +382,56 @@ def check_distill_selection_ablation():
     print("  --no-distill-select-best-val keeps final epoch OK")
 
 
+
+def check_friend_policy_controls():
+    print("\n=== friend-method policy-control checks ===")
+
+    # Distillation observation skip changes the first head's input dimension,
+    # but remains an explicit ablation switch.
+    with_skip = CkaRlAgent(
+        OBS_DIM, ACT_DIM, None, None, distillation=True,
+        distill_observation_skip=True,
+    )
+    without_skip = CkaRlAgent(
+        OBS_DIM, ACT_DIM, None, None, distillation=True,
+        distill_observation_skip=False,
+    )
+    assert with_skip.mean_pool.own_l0_weight.shape[1] == 256 + OBS_DIM
+    assert without_skip.mean_pool.own_l0_weight.shape[1] == 256
+    assert with_skip(torch.zeros(2, OBS_DIM))[0].shape == (2, ACT_DIM)
+
+    root = f"{TMP_ROOT}/friend_scale_modes"
+    shutil.rmtree(root, ignore_errors=True)
+    d0 = f"{root}/task0"
+    save_root(d0, "classic_cka", False, False)
+
+    learned = CkaRlAgent(
+        OBS_DIM, ACT_DIM, d0, d0, distillation=False,
+        fusion_mode="classic_cka", use_alpha_scale=True, fix_alpha_scale=False,
+    )
+    assert learned.alpha_scale is not None and learned.alpha_scale.requires_grad
+    assert abs(float(learned.alpha_scale.item()) - 1.0) < 1e-8
+
+    fixed = CkaRlAgent(
+        OBS_DIM, ACT_DIM, d0, d0, distillation=False,
+        fusion_mode="weight_delta", use_alpha_scale=False, fix_alpha_scale=True,
+    )
+    assert fixed.alpha_scale is not None and not fixed.alpha_scale.requires_grad
+    assert abs(float(fixed.alpha_scale.item()) - 5.0) < 1e-8
+
+    try:
+        CkaRlAgent(
+            OBS_DIM, ACT_DIM, d0, d0, distillation=False,
+            use_alpha_scale=True, fix_alpha_scale=True,
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("learned and fixed alpha-scale modes must be mutually exclusive")
+
+    shutil.rmtree(root, ignore_errors=True)
+    print("  observation-skip + learned/fixed alpha-scale modes OK")
+
 def main():
     torch.manual_seed(0)
     np.random.seed(0)
@@ -396,6 +446,7 @@ def main():
     check_trainable_encoder_loads_latest()
     check_encoder_policy_flags()
     check_distill_selection_ablation()
+    check_friend_policy_controls()
 
     shutil.rmtree(TMP_ROOT, ignore_errors=True)
     print("\n*** ALL CHECKS PASSED ***")

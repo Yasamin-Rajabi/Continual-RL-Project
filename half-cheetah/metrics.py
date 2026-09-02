@@ -51,6 +51,7 @@ import torch
 from tensorboard.backend.event_processing import event_accumulator
 
 from cka_rl import FrozenCkaPolicy
+from policy_utils import bound_log_std
 from tasks import get_task
 import scratch_baselines as scratch
 from experiment_identity import (
@@ -67,6 +68,29 @@ _trapz = getattr(np, "trapezoid", None) or np.trapz
 
 
 # ==========================================================================
+# Optional custom checkpoint mapping used by run_eval_custom.py. Normal
+# training leaves this empty, so resumable benchmark paths are unchanged.
+# ==========================================================================
+_CUSTOM_MODEL_MAP = {}
+
+
+def set_custom_model_map(mapping):
+    global _CUSTOM_MODEL_MAP
+    _CUSTOM_MODEL_MAP = {str(k): pathlib.Path(v) for k, v in dict(mapping).items()}
+
+
+def _is_custom_checkpoint_path(path):
+    path = pathlib.Path(path).resolve()
+    for root in _CUSTOM_MODEL_MAP.values():
+        try:
+            path.relative_to(root.resolve())
+            return True
+        except ValueError:
+            pass
+    return False
+
+
+# ==========================================================================
 # Path helpers (the single source of truth -- plots.py and
 # run_continual_benchmark.py both import these from here).
 # ==========================================================================
@@ -75,11 +99,19 @@ def run_name(suite, task_id, seed):
 
 
 def event_dir(runs_root, suite, condition, seed, seq_idx, task_id):
+    if condition in _CUSTOM_MODEL_MAP:
+        custom_base = _CUSTOM_MODEL_MAP[condition]
+        sibling_runs = custom_base.parent / "runs"
+        if sibling_runs.exists():
+            return sibling_runs / f"seq_{seq_idx}" / run_name(suite, task_id, seed)
+        return custom_base / f"seq_{seq_idx}" / run_name(suite, task_id, seed)
     tag = f"{suite}/{condition}/seed_{seed}/seq_{seq_idx}"
     return pathlib.Path(runs_root) / tag / run_name(suite, task_id, seed)
 
 
 def checkpoint_dir(save_root, suite, condition, seed, seq_idx, task_id):
+    if condition in _CUSTOM_MODEL_MAP:
+        return _CUSTOM_MODEL_MAP[condition] / f"seq_{seq_idx}" / run_name(suite, task_id, seed)
     return (
         pathlib.Path(save_root) / suite / condition / f"seed_{seed}"
         / f"seq_{seq_idx}" / run_name(suite, task_id, seed)
@@ -93,8 +125,14 @@ def analysis_snapshot_path(analysis_root, suite, condition, seed, seq_idx, task_
 
 def checkpoint_complete(path):
     path = pathlib.Path(path)
-    required = ["policy_snapshot.pt", "fc.pt", "mean_pool.pt", "logstd_pool.pt", MANIFEST_NAME]
-    return path.exists() and all((path / name).exists() for name in required) and load_manifest(path) is not None
+    core = ["policy_snapshot.pt", "fc.pt", "mean_pool.pt", "logstd_pool.pt"]
+    if not (path.exists() and all((path / name).exists() for name in core)):
+        return False
+    # Custom evaluation intentionally supports older/arbitrary checkpoints that
+    # predate run_manifest.json. Normal training/resume still requires it.
+    if _is_custom_checkpoint_path(path):
+        return True
+    return (path / MANIFEST_NAME).exists() and load_manifest(path) is not None
 
 
 def checkpoint_matches(path, expected_mapping, *, parent_dirs=(), pretrained_encoder=None):
@@ -107,7 +145,7 @@ def checkpoint_matches(path, expected_mapping, *, parent_dirs=(), pretrained_enc
     )
 
 
-CACHE_SCHEMA_VERSION = 3
+CACHE_SCHEMA_VERSION = 4
 
 
 def _benchmark_cache_config(args):
@@ -115,15 +153,16 @@ def _benchmark_cache_config(args):
     keys = (
         "task_sequence", "save_root", "runs_root", "analysis_root",
         "total_timesteps", "learning_starts", "random_actions_end",
-        "batch_size", "policy_lr", "q_lr", "gamma", "tau", "alpha",
+        "batch_size", "policy_lr", "alpha_lr", "alpha_warmup_steps", "q_lr", "gamma", "tau", "alpha",
         "autotune", "autotune_init_from_alpha", "pool_size", "eval_every",
-        "num_evals", "distill_extra_steps", "collect_cosine_buffers",
+        "num_evals", "test_adapt_steps", "test_adapt_lr", "distill_observation_skip",
+        "distill_extra_steps", "collect_cosine_buffers",
         "max_distill_buffer", "similarity_samples", "distill_max_samples",
         "distill_epochs", "distill_lr", "distill_batch_size",
         "distill_test_frac", "distill_select_best_val", "train_shared",
         "freeze_root_encoder", "encoder_from_base", "pretrained_encoder",
-        "encoder_linear_out", "use_alpha_scale", "weight_use_alpha_mass",
-        "constrain_alpha_mass",
+        "encoder_linear_out", "condition_alpha_scale", "use_alpha_scale", "fix_alpha_scale",
+        "weight_use_alpha_mass", "alpha_mass_reg", "drift_reg", "constrain_alpha_mass",
     )
     config = {}
     for key in keys:
@@ -165,6 +204,11 @@ def _validate_scratch_checkpoints(args, suite, scratch_seeds, scratch_total_time
     Cache signatures alone prevent stale JSON reuse, but direct metric calls must
     also reject a baseline trained with different encoder/SAC settings.
     """
+    # Arbitrary custom-model evaluation cannot reconstruct the training CLI of
+    # externally supplied checkpoints. Keep the normal benchmark strict, but
+    # allow run_eval_custom.py to use user-supplied scratch baselines explicitly.
+    if _CUSTOM_MODEL_MAP:
+        return
     save_root = getattr(args, "scratch_save_root", scratch.SCRATCH_SAVE_ROOT)
     problems = []
     for task_id in sorted(set(args.task_sequence)):
@@ -265,6 +309,138 @@ def evaluate_checkpoint(run_dir, suite, task_id, episodes, seed, device):
     }
 
 
+def adapt_and_evaluate_checkpoint(
+    run_dir, suite, task_id, episodes, seed, device, *, adapt_steps=5_000, adapt_lr=1e-2
+):
+    """Evaluate after optional test-time adaptation of knowledge-mixture scalars.
+
+    This integrates the friend's alpha-adaptation evaluator while keeping the
+    normal frozen-checkpoint evaluator available with adapt_steps=0. Head/encoder
+    weights stay frozen; only alpha, an enabled learnable alpha-scale, and
+    alpha-mass are adapted.
+    """
+    if adapt_steps <= 0:
+        return evaluate_checkpoint(run_dir, suite, task_id, episodes, seed, device)
+
+    run_dir = pathlib.Path(run_dir)
+    required = [run_dir / name for name in ("policy_snapshot.pt", "fc.pt", "mean_pool.pt", "logstd_pool.pt")]
+    if not all(path.exists() for path in required):
+        return evaluate_checkpoint(run_dir, suite, task_id, episodes, seed, device)
+
+    snapshot = torch.load(run_dir / "policy_snapshot.pt", map_location=device, weights_only=False)
+    mean_pool_data = torch.load(run_dir / "mean_pool.pt", map_location="cpu", weights_only=False)
+    fusion_mode = getattr(mean_pool_data, "fusion_mode", "classic_cka")
+    use_alpha_mass = bool(getattr(mean_pool_data, "use_alpha_mass", False))
+    constrain_alpha_mass = bool(getattr(mean_pool_data, "constrain_alpha_mass", True))
+
+    saved_scale = getattr(mean_pool_data, "alpha_scale", None)
+    saved_scale_value = None if saved_scale is None else float(saved_scale.detach().cpu().reshape(-1)[0])
+    saved_scale_trainable = bool(saved_scale is not None and saved_scale.requires_grad)
+    fix_alpha_scale = bool(
+        saved_scale is not None and (not saved_scale_trainable)
+        and saved_scale_value is not None and abs(saved_scale_value - 5.0) < 1e-6
+    )
+    use_alpha_scale = bool(saved_scale_trainable and not fix_alpha_scale)
+
+    from cka_rl import CkaRlAgent
+    # A finalized pool no longer has a semantically valid pre-finalize alpha
+    # vector. Start adaptation deterministically from a uniform mixture instead
+    # of reusing stale/reindexed logits or random initialization.
+    agent = CkaRlAgent(
+        obs_dim=int(snapshot["obs_dim"]),
+        act_dim=int(snapshot["act_dim"]),
+        base_dir=None,
+        latest_dir=str(run_dir),
+        alpha_init="Uniform",
+        fusion_mode=fusion_mode,
+        use_alpha_mass=use_alpha_mass,
+        constrain_alpha_mass=constrain_alpha_mass,
+        use_alpha_scale=use_alpha_scale,
+        fix_alpha_scale=fix_alpha_scale,
+        distillation=bool(snapshot.get("distillation", False)),
+        distill_observation_skip=bool(snapshot.get("distill_observation_skip", True)),
+        encoder_linear_out=bool(snapshot.get("encoder_linear_out", False)),
+        train_shared=False,
+    ).to(device)
+
+    # Remember intended alpha-scale trainability BEFORE freezing everything.
+    adapt_scale = use_alpha_scale
+    for param in agent.parameters():
+        param.requires_grad_(False)
+
+    adapt_params = []
+    if agent.alpha is not None and agent.alpha.numel() > 1:
+        agent.alpha.requires_grad_(True)
+        adapt_params.append(agent.alpha)
+    if adapt_scale and agent.alpha_scale is not None:
+        agent.alpha_scale.requires_grad_(True)
+        adapt_params.append(agent.alpha_scale)
+    if use_alpha_mass and agent.alpha_mass is not None:
+        agent.alpha_mass.requires_grad_(True)
+        adapt_params.append(agent.alpha_mass)
+
+    env = get_task(task_id, task_suite=suite)
+    if adapt_params:
+        optimizer = torch.optim.Adam(adapt_params, lr=adapt_lr)
+        torch.manual_seed(int(seed))
+        obs, _ = env.reset(seed=seed)
+        for _ in range(int(adapt_steps)):
+            obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+            mean, raw_log_std = agent(obs_t)
+            std = bound_log_std(raw_log_std).exp()
+            dist = torch.distributions.Normal(mean, std)
+            sampled = dist.sample()
+            action = torch.tanh(sampled)[0].detach().cpu().numpy()
+            next_obs, reward, terminated, truncated, _ = env.step(action)
+
+            # Friend's test-time rule: one-step REINFORCE on the mixture scalars.
+            # The sampled action is treated as the score-function sample.
+            loss = -dist.log_prob(sampled).sum(dim=-1) * float(reward)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            if terminated or truncated:
+                obs, _ = env.reset()
+            else:
+                obs = next_obs
+
+    agent.eval()
+    returns, success, velocity_errors = [], [], []
+    for ep in range(episodes):
+        obs, _ = env.reset(seed=seed + 10_000 * task_id + ep)
+        ep_return = 0.0
+        ep_success, ep_error = [], []
+        while True:
+            obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+            with torch.no_grad():
+                mean, _ = agent(obs_t)
+            action = torch.tanh(mean[0]).cpu().numpy()
+            obs, reward, terminated, truncated, info = env.step(action)
+            ep_return += float(reward)
+            ep_success.append(float(info.get("success", np.nan)))
+            ep_error.append(float(info.get("velocity_error", np.nan)))
+            if terminated or truncated:
+                break
+        returns.append(ep_return)
+        success.append(float(np.nanmean(ep_success)))
+        velocity_errors.append(float(np.nanmean(ep_error)))
+    env.close()
+    return {
+        "return": float(np.mean(returns)),
+        "success": float(np.nanmean(success)),
+        "velocity_error": float(np.nanmean(velocity_errors)),
+    }
+
+
+def _evaluate_metric_checkpoint(args, run_dir, suite, task_id, episodes, seed, device):
+    return adapt_and_evaluate_checkpoint(
+        run_dir, suite, task_id, episodes, seed, device,
+        adapt_steps=int(getattr(args, "test_adapt_steps", 0)),
+        adapt_lr=float(getattr(args, "test_adapt_lr", 1e-2)),
+    )
+
+
 # ==========================================================================
 # FULL retention matrix (unchanged logic from before -- kept for the
 # existing heatmap/sequence-diagnostic plots, which want every checkpoint x
@@ -314,8 +490,8 @@ def build_retention_matrix(args, suite, condition, seed, device):
             raise FileNotFoundError(run_dir)
         rows = {metric: [] for metric in ("return", "success", "velocity_error")}
         for eval_task in eval_task_ids:
-            metrics = evaluate_checkpoint(
-                run_dir, suite, eval_task, args.retention_eval_episodes,
+            metrics = _evaluate_metric_checkpoint(
+                args, run_dir, suite, eval_task, args.retention_eval_episodes,
                 seed + seq_idx * 100_000, device,
             )
             for metric in rows:
@@ -364,8 +540,8 @@ def compute_p_final_row(args, suite, condition, seed, device):
 
     row = {}
     for task_id in sorted(set(args.task_sequence)):
-        result = evaluate_checkpoint(
-            final_run_dir, suite, task_id, args.retention_eval_episodes,
+        result = _evaluate_metric_checkpoint(
+            args, final_run_dir, suite, task_id, args.retention_eval_episodes,
             seed + 500_000, device,
         )
         row[str(task_id)] = result["success"]

@@ -45,10 +45,12 @@ class CkaRlAgent(nn.Module):
         alpha_factor=1e-3,
         fix_alpha=False,
         use_alpha_scale=False,
+        fix_alpha_scale=False,
         use_alpha_mass=False,
         constrain_alpha_mass=True,
         encoder_from_base=False,
         distillation=True,
+        distill_observation_skip=True,
         fusion_mode=BASE_FUSION_MODE,
         max_distill_buffer=50_000,
         distill_test_frac=0.2,
@@ -71,6 +73,11 @@ class CkaRlAgent(nn.Module):
         self.act_dim = int(act_dim)
         self.pool_size = int(pool_size)
         self.distillation = bool(distillation)
+        self.distill_observation_skip = bool(distill_observation_skip)
+        self.use_alpha_scale = bool(use_alpha_scale)
+        self.fix_alpha_scale = bool(fix_alpha_scale)
+        if self.fix_alpha_scale and self.use_alpha_scale:
+            raise ValueError("use_alpha_scale=True and fix_alpha_scale=True are mutually exclusive")
         self.fusion_mode = fusion_mode
         self.max_distill_buffer = int(max_distill_buffer)
         self.use_alpha_mass = bool(use_alpha_mass)
@@ -89,15 +96,20 @@ class CkaRlAgent(nn.Module):
         self.last_merge_info = None
         self.last_distill_metrics = {}
 
+        head_in_dim = (
+            shared_dim + self.obs_dim
+            if self.distillation and self.distill_observation_skip
+            else shared_dim
+        )
         self.mean_pool = HeadPool(
-            "mean", shared_dim, hidden_dim, act_dim,
+            "mean", head_in_dim, hidden_dim, act_dim,
             fusion_mode=fusion_mode, pool_size=pool_size,
             distillation=distillation, max_distill_buffer=max_distill_buffer,
             use_alpha_mass=use_alpha_mass, constrain_alpha_mass=constrain_alpha_mass,
             distill_test_frac=distill_test_frac,
         )
         self.logstd_pool = HeadPool(
-            "logstd", shared_dim, hidden_dim, act_dim,
+            "logstd", head_in_dim, hidden_dim, act_dim,
             fusion_mode=fusion_mode, pool_size=pool_size,
             distillation=distillation, max_distill_buffer=max_distill_buffer,
             use_alpha_mass=use_alpha_mass, constrain_alpha_mass=constrain_alpha_mass,
@@ -116,7 +128,7 @@ class CkaRlAgent(nn.Module):
         # One alpha vector controls each whole knowledge vector, across both heads.
         self.alpha, self.alpha_scale, self.alpha_mass = self._make_alpha(
             self.mean_pool.pool_length(), fix_alpha, alpha_init, alpha_major,
-            alpha_factor, use_alpha_scale, use_alpha_mass,
+            alpha_factor, use_alpha_scale, fix_alpha_scale, use_alpha_mass,
         )
         self.mean_pool.set_alpha(self.alpha, self.alpha_scale, self.alpha_mass)
         self.logstd_pool.set_alpha(self.alpha, self.alpha_scale, self.alpha_mass)
@@ -138,20 +150,17 @@ class CkaRlAgent(nn.Module):
         # training continually, not freeze. So train_shared=True is closer to
         # that original behavior; train_shared=False (current default) is a
         # deliberate later change, not a literal reading of the paper.
-        # Highest priority: an encoder pretrained with the TD latent-predictive
-        # objective across many tasks (see tdjepa_pretrain.py), instead of
-        # whatever task 0 happened to produce. Task 0 is _VELOCITIES[0] = 0.5 m/s,
-        # the slowest task in the suite, so the default base encoder has never
-        # seen fast-gait dynamics -- yet it holds 51% of the actor's parameters
-        # and is the fixed basis every knowledge vector is defined against.
-        # Encoder policy is explicit and ablatable:
-        #   * pretrained + frozen (TD-JEPA default): use the same pretrained basis
-        #     on every task;
-        #   * train_shared=True: task 0 starts from pretrained/scratch, then later
-        #     tasks continue from latest_dir rather than resetting to the root;
+        # Encoder policy is explicit and ablatable.  The current friend-workflow
+        # does NOT require encoder pretraining: with train_shared=True, task 0
+        # starts from scratch (unless an optional pretrained encoder is supplied)
+        # and every later task continues from the latest encoder.  The historical
+        # pretrained-encoder path is retained only as an optional ablation /
+        # backwards-compatible experiment mode.
+        #   * train_shared=True: continually fine-tune from latest_dir;
         #   * no pretrained + train_shared=False: task 0 learns the root encoder,
         #     then later tasks freeze/reuse that basis;
-        #   * freeze_root_encoder=True is an explicit random-frozen ablation.
+        #   * pretrained + train_shared=False: optional frozen-pretraining ablation;
+        #   * freeze_root_encoder=True: explicit random-frozen ablation.
         if latest_dir is not None and self.train_shared:
             logger.info(f"Loading latest trainable encoder from {latest_dir}")
             self.fc = _torch_load(f"{latest_dir}/fc.pt", map_location="cpu")
@@ -198,7 +207,7 @@ class CkaRlAgent(nn.Module):
 
     def _make_alpha(
         self, num_vectors, fix_alpha, alpha_init, alpha_major, alpha_factor,
-        use_alpha_scale, use_alpha_mass,
+        use_alpha_scale, fix_alpha_scale, use_alpha_mass,
     ):
         if num_vectors <= 0:
             return None, None, None
@@ -214,16 +223,33 @@ class CkaRlAgent(nn.Module):
             alpha = nn.Parameter(torch.tensor(vals, dtype=torch.float32), requires_grad=True)
         else:
             raise NotImplementedError(f"unknown alpha_init: {alpha_init}")
-        alpha_scale = nn.Parameter(torch.ones(1), requires_grad=(use_alpha_scale and not fix_alpha))
+
+        # Three alpha-scale regimes are kept explicit for ablations:
+        #   off     -> fixed multiplier 1 (closest to the paper's plain softmax)
+        #   learned -> trainable multiplier initialized at 1
+        #   fixed   -> friend's stabilized weight-delta setting, multiplier 5
+        scale_init_val = 5.0 if fix_alpha_scale else 1.0
+        alpha_scale = nn.Parameter(
+            torch.tensor([scale_init_val], dtype=torch.float32),
+            requires_grad=(use_alpha_scale and (not fix_alpha_scale) and (not fix_alpha)),
+        )
+
         alpha_mass = (
             nn.Parameter(torch.ones(1), requires_grad=not fix_alpha)
             if use_alpha_mass else None
         )
         return alpha, alpha_scale, alpha_mass
 
+
     def forward(self, x):
-        z = self.fc(x)
+        features = self.fc(x)
+        z = (
+            torch.cat([features, x], dim=-1)
+            if self.distillation and self.distill_observation_skip
+            else features
+        )
         return self.mean_pool(z), self.logstd_pool(z)
+
 
     def set_own_buffer(self, buffer):
         """Attach raw rollout states to the new policy slot.
@@ -268,10 +294,17 @@ class CkaRlAgent(nn.Module):
     def _encode_obs(self, obs: np.ndarray, batch_size: int = 4096) -> torch.Tensor:
         device = self.mean_pool.base_l0_weight.device
         chunks = []
+
         with torch.no_grad():
             for start in range(0, len(obs), batch_size):
                 x = torch.as_tensor(obs[start:start + batch_size], dtype=torch.float32, device=device)
-                chunks.append(self.fc(x))
+                features = self.fc(x)
+                z_chunk = (
+                    torch.cat([features, x], dim=-1)
+                    if self.distillation and self.distill_observation_skip
+                    else features
+                )
+                chunks.append(z_chunk)
         return torch.cat(chunks, dim=0)
 
     def _entry_outputs(self, z: torch.Tensor, index: int):
@@ -706,6 +739,8 @@ class CkaRlAgent(nn.Module):
             return {
                 "obs_dim": self.obs_dim,
                 "act_dim": self.act_dim,
+                "distillation": self.distillation,
+                "distill_observation_skip": self.distill_observation_skip,
                 # FrozenCkaPolicy rebuilds the encoder with shared(...) and then
                 # load_state_dict's into it. shared(linear_out=True) has the SAME
                 # parameters as shared(linear_out=False) but a different forward,
@@ -764,6 +799,8 @@ class FrozenCkaPolicy(nn.Module):
         super().__init__()
         self.obs_dim = int(snapshot["obs_dim"])
         self.act_dim = int(snapshot["act_dim"])
+        self.distillation = bool(snapshot.get("distillation", False))
+        self.distill_observation_skip = bool(snapshot.get("distill_observation_skip", True))
         # .get() so snapshots written before this flag existed still load, with
         # the original ReLU-terminated encoder.
         self.encoder_linear_out = bool(snapshot.get("encoder_linear_out", False))
@@ -782,7 +819,12 @@ class FrozenCkaPolicy(nn.Module):
         return F.linear(h, w2, b2)
 
     def forward(self, obs):
-        z = self.fc(obs)
+        features = self.fc(obs)
+        z = (
+            torch.cat([features, obs], dim=-1)
+            if self.distillation and self.distill_observation_skip
+            else features
+        )
         return self._head(z, "mean"), self._head(z, "logstd")
 
     @staticmethod

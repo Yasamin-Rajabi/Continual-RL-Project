@@ -37,7 +37,7 @@ from experiment_identity import (
 )
 
 SCRATCH_SAVE_ROOT = "scratch_models"
-DEFAULT_SCRATCH_SEEDS = [101, 102, 103]
+DEFAULT_SCRATCH_SEEDS = [101]
 
 
 def scratch_run_name(suite, task_id, seed):
@@ -94,6 +94,8 @@ def _expected_training_config(suite, task_id, total_timesteps, seed, args):
         "learning_starts": int(args.learning_starts),
         "random_actions_end": int(args.random_actions_end),
         "policy_lr": float(args.policy_lr),
+        "alpha_lr": float(args.alpha_lr),
+        "alpha_warmup_steps": int(args.alpha_warmup_steps),
         "q_lr": float(args.q_lr),
         "alpha": float(args.alpha),
         "autotune": bool(args.autotune),
@@ -104,9 +106,13 @@ def _expected_training_config(suite, task_id, total_timesteps, seed, args):
         "distillation": False,
         "use_alpha_mass": False,
         "use_alpha_scale": False,
+        "fix_alpha_scale": False,
+        "alpha_mass_reg": float(args.alpha_mass_reg),
+        "drift_reg": float(args.drift_reg),
         "constrain_alpha_mass": bool(args.constrain_alpha_mass),
         "train_shared": bool(args.train_shared),
         "encoder_linear_out": bool(args.encoder_linear_out),
+        "distill_observation_skip": bool(args.distill_observation_skip),
         "distill_extra_steps": int(args.distill_extra_steps),
         "collect_cosine_buffers": False,
         "max_distill_buffer": int(args.max_distill_buffer),
@@ -166,6 +172,10 @@ def train_one_baseline(suite, task_id, total_timesteps, seed, args):
         f"--random-actions-end={args.random_actions_end}",
         f"--batch-size={args.batch_size}",
         f"--policy-lr={args.policy_lr}",
+        f"--alpha-lr={args.alpha_lr}",
+        f"--alpha-mass-reg={args.alpha_mass_reg}",
+        f"--alpha-warmup-steps={args.alpha_warmup_steps}",
+        f"--drift-reg={args.drift_reg}",
         f"--q-lr={args.q_lr}",
         f"--gamma={args.gamma}",
         f"--tau={args.tau}",
@@ -175,6 +185,7 @@ def train_one_baseline(suite, task_id, total_timesteps, seed, args):
         f"--pool-size={args.pool_size}",
         f"--eval-every={args.eval_every}",
         f"--num-evals={args.num_evals}",
+        "--distill-observation-skip" if args.distill_observation_skip else "--no-distill-observation-skip",
         f"--distill-extra-steps={args.distill_extra_steps}",
         f"--max-distill-buffer={args.max_distill_buffer}",
         f"--similarity-samples={args.similarity_samples}",
@@ -189,6 +200,7 @@ def train_one_baseline(suite, task_id, total_timesteps, seed, args):
         # and there's no --prev-units, which is the whole point.
         "--fusion-mode=classic_cka",
         "--no-use-alpha-scale",
+        "--no-fix-alpha-scale",
         "--no-distillation",
         "--no-use-alpha-mass",
         "--constrain-alpha-mass" if args.constrain_alpha_mass else "--no-constrain-alpha-mass",
@@ -238,6 +250,10 @@ def parse_args():
     p.add_argument("--random-actions-end", type=int, default=10_000)
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--policy-lr", type=float, default=3e-4)
+    p.add_argument("--alpha-lr", type=float, default=5e-3)
+    p.add_argument("--alpha-mass-reg", type=float, default=0.05)
+    p.add_argument("--alpha-warmup-steps", type=int, default=5_000)
+    p.add_argument("--drift-reg", type=float, default=1.0)
     p.add_argument("--q-lr", type=float, default=3e-4)
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--tau", type=float, default=0.005)
@@ -247,12 +263,13 @@ def parse_args():
     p.add_argument("--pool-size", type=int, default=5)
     p.add_argument("--eval-every", type=int, default=10_000)
     p.add_argument("--num-evals", type=int, default=5)
+    p.add_argument("--distill-observation-skip", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--distill-extra-steps", type=int, default=10_000)
     p.add_argument("--max-distill-buffer", type=int, default=50_000)
     p.add_argument("--similarity-samples", type=int, default=2_048)
     p.add_argument("--distill-max-samples", type=int, default=20_000)
-    p.add_argument("--distill-epochs", type=int, default=8)
-    p.add_argument("--distill-lr", type=float, default=3e-4)
+    p.add_argument("--distill-epochs", type=int, default=16)
+    p.add_argument("--distill-lr", type=float, default=5e-4)
     p.add_argument("--distill-batch-size", type=int, default=256)
     p.add_argument("--distill-test-frac", type=float, default=0.2)
     p.add_argument("--distill-select-best-val", action=argparse.BooleanOptionalAction, default=True)

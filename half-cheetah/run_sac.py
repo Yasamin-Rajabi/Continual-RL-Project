@@ -60,6 +60,8 @@ class Args:
     learning_starts: int = 5_000
     random_actions_end: int = 10_000
     policy_lr: float = 3e-4
+    alpha_lr: float = 5e-3
+    alpha_warmup_steps: int = 5_000
     q_lr: float = 3e-4
     policy_frequency: int = 2
     target_network_frequency: int = 1
@@ -80,6 +82,9 @@ class Args:
     distillation: bool = True
     use_alpha_mass: bool = False
     use_alpha_scale: bool = False
+    fix_alpha_scale: bool = False
+    alpha_mass_reg: float = 0.05
+    drift_reg: float = 1.0
     constrain_alpha_mass: bool = True
     """When alpha-mass is enabled, map its raw scalar through a positive
     softplus transform. Disable only for the legacy/unconstrained ablation."""
@@ -106,16 +111,20 @@ class Args:
     # Distillation modes require rollout states for behavioral KL.
     # Cosine modes do not; collect_cosine_buffers=True is available when an
     # equal post-training interaction budget is desired for an ablation.
+    distill_observation_skip: bool = True
+    """Friend-method skip connection: in distillation modes concatenate raw
+    observations to shared features before the policy heads. Disable for the
+    pre-merge architecture ablation."""
     distill_extra_steps: int = 10_000
     collect_cosine_buffers: bool = False
     max_distill_buffer: int = 50_000
     similarity_samples: int = 2_048
     distill_max_samples: int = 20_000
-    distill_epochs: int = 8
+    distill_epochs: int = 16
     distill_select_best_val: bool = True
     """Restore the epoch with lowest held-out KL. Disable to reproduce the
     legacy behavior that always keeps the final distillation epoch."""
-    distill_lr: float = 3e-4
+    distill_lr: float = 5e-4
     distill_batch_size: int = 256
     distill_test_frac: float = 0.2
 
@@ -354,6 +363,14 @@ def collect_merge_buffer(actor, envs, steps, task_id, seq_idx, device, seed):
 def _validate_args(args):
     if args.fusion_mode == "classic_cka" and args.use_alpha_mass:
         raise ValueError("--use-alpha-mass is only valid with --fusion-mode=weight_delta")
+    if args.use_alpha_scale and args.fix_alpha_scale:
+        raise ValueError("--use-alpha-scale and --fix-alpha-scale are mutually exclusive")
+    if args.alpha_lr <= 0 or args.policy_lr <= 0 or args.q_lr <= 0:
+        raise ValueError("policy/q/alpha learning rates must be > 0")
+    if args.alpha_warmup_steps < 0:
+        raise ValueError("alpha_warmup_steps must be >= 0")
+    if args.alpha_mass_reg < 0 or args.drift_reg < 0:
+        raise ValueError("alpha_mass_reg and drift_reg must be >= 0")
     if args.pool_size < 2:
         raise ValueError("pool_size must be >= 2 for meaningful behavioral pair selection")
     if args.similarity_samples < 2:
@@ -428,10 +445,12 @@ if __name__ == "__main__":
         pool_size=args.pool_size,
         encoder_from_base=args.encoder_from_base,
         distillation=args.distillation,
+        distill_observation_skip=args.distill_observation_skip,
         max_distill_buffer=args.max_distill_buffer,
         fusion_mode=args.fusion_mode,
         use_alpha_mass=args.use_alpha_mass,
         use_alpha_scale=args.use_alpha_scale,
+        fix_alpha_scale=args.fix_alpha_scale,
         constrain_alpha_mass=args.constrain_alpha_mass,
         distill_test_frac=args.distill_test_frac,
         similarity_samples=args.similarity_samples,
@@ -447,6 +466,26 @@ if __name__ == "__main__":
     )
 
     actor = Actor(envs, model).to(device)
+
+    # Friend-method continual encoder stabilization. When the shared encoder is
+    # explicitly trainable in a distillation condition, keep a frozen copy of
+    # the incoming encoder and regularize its representation on historical
+    # buffer states. Frozen-encoder/default runs never enter this branch.
+    old_fc = None
+    past_obs_pool = None
+    if args.seq_idx > 0 and args.train_shared and args.distillation:
+        import copy
+        old_fc = copy.deepcopy(actor.model.fc).to(device)
+        old_fc.eval()
+        for p in old_fc.parameters():
+            p.requires_grad = False
+        past_obs_list = [
+            entry["buffer"]["obs"] for entry in actor.model.mean_pool.pool
+            if entry.get("buffer") is not None and "obs" in entry["buffer"]
+        ]
+        if past_obs_list:
+            past_obs_pool = np.concatenate(past_obs_list, axis=0)
+
     qf1 = SoftQNetwork(envs, linear_out=args.encoder_linear_out).to(device)
     qf2 = SoftQNetwork(envs, linear_out=args.encoder_linear_out).to(device)
     qf1_target = SoftQNetwork(envs, linear_out=args.encoder_linear_out).to(device)
@@ -458,7 +497,33 @@ if __name__ == "__main__":
     actor_params = [p for p in actor.parameters() if p.requires_grad]
     if not actor_params:
         raise RuntimeError("No trainable actor parameters found")
-    actor_optimizer = optim.Adam(actor_params, lr=args.policy_lr)
+
+    fc_param_ids = {id(p) for p in actor.model.fc.parameters()}
+    fc_params = [p for p in actor.model.fc.parameters() if p.requires_grad]
+    alpha_param_objs = []
+    if actor.model.alpha is not None and actor.model.alpha.requires_grad:
+        alpha_param_objs.append(actor.model.alpha)
+    if actor.model.alpha_scale is not None and actor.model.alpha_scale.requires_grad:
+        alpha_param_objs.append(actor.model.alpha_scale)
+    if actor.model.alpha_mass is not None and actor.model.alpha_mass.requires_grad:
+        alpha_param_objs.append(actor.model.alpha_mass)
+    alpha_param_ids = {id(p) for p in alpha_param_objs}
+    own_params = [
+        p for p in actor_params
+        if id(p) not in alpha_param_ids and id(p) not in fc_param_ids
+    ]
+
+    # Friend method: after task 0, a trainable shared encoder moves more slowly
+    # in distillation modes; alpha parameters get their own faster learning rate.
+    encoder_lr = args.policy_lr * 0.1 if (args.distillation and args.seq_idx > 0) else args.policy_lr
+    param_groups = []
+    if own_params:
+        param_groups.append({"params": own_params, "lr": args.policy_lr})
+    if fc_params:
+        param_groups.append({"params": fc_params, "lr": encoder_lr})
+    if alpha_param_objs:
+        param_groups.append({"params": alpha_param_objs, "lr": args.alpha_lr})
+    actor_optimizer = optim.Adam(param_groups)
 
     # The whole knowledge-vector formulation assumes a FIXED basis: every stored
     # pool entry was learned relative to one particular encoder. If the encoder
@@ -519,6 +584,9 @@ if __name__ == "__main__":
     obs, _ = envs.reset(seed=args.seed)
     actor_loss = None
     alpha_loss = None
+    drift_loss = None
+    alpha_entropy = None
+    mass_loss = None
     start_time = time.time()
 
     for global_step in tqdm(range(args.total_timesteps)):
@@ -565,8 +633,50 @@ if __name__ == "__main__":
                     pi, log_pi, _ = actor.get_action(data.observations)
                     min_q_pi = torch.min(qf1(data.observations, pi), qf2(data.observations, pi))
                     actor_loss = (alpha * log_pi - min_q_pi).mean()
+
+                    drift_loss = None
+                    if (
+                        args.distillation and old_fc is not None and past_obs_pool is not None
+                        and args.drift_reg > 0
+                    ):
+                        drift_idx = np.random.randint(0, len(past_obs_pool), size=args.batch_size)
+                        s_past = torch.as_tensor(
+                            past_obs_pool[drift_idx], dtype=torch.float32, device=device
+                        )
+                        with torch.no_grad():
+                            phi_old = old_fc(s_past)
+                        phi_curr = actor.model.fc(s_past)
+                        drift_loss = args.drift_reg * F.mse_loss(phi_curr, phi_old)
+                        actor_loss = actor_loss + drift_loss
+
+                    in_warmup = global_step < (args.learning_starts + args.alpha_warmup_steps)
+                    alpha_entropy = None
+                    if in_warmup and actor.model.alpha is not None and actor.model.alpha.numel() > 1:
+                        probs = torch.softmax(actor.model.alpha, dim=-1)
+                        alpha_entropy = -(probs * torch.log(probs + 1e-8)).sum()
+                        actor_loss = actor_loss - 0.01 * alpha_entropy
+
+                    mass_loss = None
+                    if (
+                        not in_warmup and actor.model.alpha_mass is not None
+                        and actor.model.alpha_mass.requires_grad and args.alpha_mass_reg > 0
+                    ):
+                        eff_mass = actor.model.mean_pool.effective_alpha_mass()
+                        mass_loss = args.alpha_mass_reg * (eff_mass ** 2) * ((eff_mass - 1.0) ** 2)
+                        actor_loss = actor_loss + mass_loss.mean()
+
                     actor_optimizer.zero_grad()
                     actor_loss.backward()
+
+                    # Friend method: weight-delta warmup first learns how to mix
+                    # historical slots before allowing the new residual or mass to move.
+                    if args.fusion_mode == "weight_delta" and in_warmup and actor.model.alpha is not None:
+                        for p in own_params:
+                            if p.grad is not None:
+                                p.grad.zero_()
+                        if actor.model.alpha_mass is not None and actor.model.alpha_mass.grad is not None:
+                            actor.model.alpha_mass.grad.zero_()
+
                     actor_optimizer.step()
 
                     if args.autotune:
@@ -592,6 +702,12 @@ if __name__ == "__main__":
                 writer.add_scalar("losses/qf_loss", 0.5 * qf_loss.item(), global_step)
                 if actor_loss is not None:
                     writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
+                if drift_loss is not None:
+                    writer.add_scalar("losses/encoder_drift_reg", float(drift_loss.item()), global_step)
+                if alpha_entropy is not None:
+                    writer.add_scalar("losses/knowledge_alpha_entropy", float(alpha_entropy.item()), global_step)
+                if mass_loss is not None:
+                    writer.add_scalar("losses/alpha_mass_reg", float(mass_loss.mean().item()), global_step)
                 writer.add_scalar("losses/alpha", alpha, global_step)
                 if args.autotune and alpha_loss is not None:
                     writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)

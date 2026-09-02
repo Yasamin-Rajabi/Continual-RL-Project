@@ -30,18 +30,25 @@ class HalfCheetahTask:
         )
 
 
-# Eight distinct tasks is enough to force several merges with the recommended
-# pool_size=5, while keeping a 2-pass continual benchmark computationally sane.
-_VELOCITIES = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 1.25, 2.25)
+# Friend branch: six task targets, repeated twice by DEFAULT_CONTINUAL_SEQUENCE.
+# With pool_size=5 the second pass still forces repeated merges while keeping the
+# benchmark cheaper than the earlier eight-task sweep.
+_VELOCITIES = (
+    1.0,
+    0.5,
+    1.5,
+    2.0,
+    1.25,
+    0.75,
+)
+
 _WIND_PAIRS = (
-    (-2.5, 0.0),
     (2.5, 0.0),
+    (-2.5, 0.0),
     (0.0, -5.0),
-    (0.0, 5.0),
-    (-1.25, -2.5),
-    (1.25, 2.5),
-    (-2.5, 5.0),
     (2.5, -5.0),
+    (1.25, 0.0),
+    (-1.25, -2.5)
 )
 
 TASK_SUITES: Dict[str, List[HalfCheetahTask]] = {
@@ -81,6 +88,7 @@ def get_task(task_id: int, task_suite: str = "halfcheetah_vel", render: bool = F
     if task_suite == "halfcheetah_wind_vel":
         kwargs["wind"] = task.wind
     env = env_cls(**kwargs)
+
     # Every observation from this point on (reset AND step) carries
     # [target_velocity, wind_x, wind_z] appended -- see
     # halfcheetah_envs.make_task_specific_observation for why the critic
@@ -90,6 +98,7 @@ def get_task(task_id: int, task_suite: str = "halfcheetah_vel", render: bool = F
     # metrics.evaluate_checkpoint) reads obs_dim dynamically from
     # observation_space, so no other file needs to change.
     env = TaskConditionedObservationWrapper(env, task)
+
     # Directly instantiating a MuJoCo class bypasses gym.make's TimeLimit.
     return gym.wrappers.TimeLimit(env, max_episode_steps=1000)
 

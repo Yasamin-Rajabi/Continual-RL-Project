@@ -49,19 +49,23 @@ import scratch_baselines
 CONDITIONS = OrderedDict([
     (
         "baseline",
-        {"fusion_mode": "classic_cka", "distillation": False, "use_alpha_mass": False},
+        {"fusion_mode": "classic_cka", "distillation": False, "use_alpha_mass": False,
+         "use_alpha_scale": True, "fix_alpha_scale": False},
     ),
     (
         "distil_only",
-        {"fusion_mode": "classic_cka", "distillation": True, "use_alpha_mass": False},
+        {"fusion_mode": "classic_cka", "distillation": True, "use_alpha_mass": False,
+         "use_alpha_scale": True, "fix_alpha_scale": False},
     ),
     (
         "weight_only",
-        {"fusion_mode": "weight_delta", "distillation": False, "use_alpha_mass": True},
+        {"fusion_mode": "weight_delta", "distillation": False, "use_alpha_mass": True,
+         "use_alpha_scale": False, "fix_alpha_scale": True},
     ),
     (
         "combined",
-        {"fusion_mode": "weight_delta", "distillation": True, "use_alpha_mass": True},
+        {"fusion_mode": "weight_delta", "distillation": True, "use_alpha_mass": True,
+         "use_alpha_scale": False, "fix_alpha_scale": True},
     ),
 ])
 
@@ -80,6 +84,10 @@ def parse_args():
     p.add_argument("--random-actions-end", type=int, default=10_000)
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--policy-lr", type=float, default=3e-4)
+    p.add_argument("--alpha-lr", type=float, default=5e-3)
+    p.add_argument("--alpha-mass-reg", type=float, default=0.05)
+    p.add_argument("--alpha-warmup-steps", type=int, default=5_000)
+    p.add_argument("--drift-reg", type=float, default=1.0)
     p.add_argument("--q-lr", type=float, default=3e-4)
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--tau", type=float, default=0.005)
@@ -87,12 +95,18 @@ def parse_args():
     p.add_argument("--eval-every", type=int, default=10_000)
     p.add_argument("--num-evals", type=int, default=5)
     p.add_argument("--retention-eval-episodes", type=int, default=3)
+    p.add_argument("--test-adapt-steps", type=int, default=5_000,
+                   help="Test-time alpha-only adaptation steps before retention/final-row evaluation; 0 disables it.")
+    p.add_argument("--test-adapt-lr", type=float, default=1e-2,
+                   help="Learning rate for test-time alpha adaptation.")
+    p.add_argument("--distill-observation-skip", action=argparse.BooleanOptionalAction, default=True,
+                   help="Concatenate raw observations to encoder features before policy heads in distillation modes.")
     p.add_argument("--distill-extra-steps", type=int, default=10_000)
     p.add_argument("--max-distill-buffer", type=int, default=50_000)
     p.add_argument("--similarity-samples", type=int, default=2_048)
     p.add_argument("--distill-max-samples", type=int, default=20_000)
-    p.add_argument("--distill-epochs", type=int, default=8)
-    p.add_argument("--distill-lr", type=float, default=3e-4)
+    p.add_argument("--distill-epochs", type=int, default=16)
+    p.add_argument("--distill-lr", type=float, default=5e-4)
     p.add_argument("--distill-batch-size", type=int, default=256)
     p.add_argument("--distill-test-frac", type=float, default=0.2)
     p.add_argument("--analysis-log-every", type=int, default=5_000)
@@ -113,8 +127,9 @@ def parse_args():
     )
     p.add_argument("--force-retrain", action="store_true")
 
-    # Encoder/algorithm ablations. Defaults are the stable final configuration:
-    # learn a root encoder once (or load TD-JEPA), then keep the basis fixed.
+    # Encoder/algorithm ablations.  Keep the historical frozen-root CLI default
+    # for reproducible ablations; the friend's current notebook workflow passes
+    # --train-shared explicitly and does not require a pretrained encoder.
     p.add_argument("--train-shared", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--freeze-root-encoder", action=argparse.BooleanOptionalAction, default=False,
                    help="Random-frozen root encoder ablation. Contradicts --train-shared.")
@@ -125,8 +140,12 @@ def parse_args():
     p.add_argument("--encoder-linear-out", action=argparse.BooleanOptionalAction, default=False,
                    help="Must match the serialized encoder architecture; also changes the critic.")
 
+    p.add_argument("--condition-alpha-scale", action=argparse.BooleanOptionalAction, default=True,
+                   help="Use friend's condition-specific alpha-scale rule: learned for classic CKA, fixed at 5 for weight_delta.")
     p.add_argument("--use-alpha-scale", action=argparse.BooleanOptionalAction, default=False,
-                   help="Learn a global logit scale for historical alpha; off is closer to paper CKA.")
+                   help="Global learned alpha-scale ablation used when --no-condition-alpha-scale.")
+    p.add_argument("--fix-alpha-scale", action=argparse.BooleanOptionalAction, default=False,
+                   help="Global fixed alpha-scale=5 ablation used when --no-condition-alpha-scale.")
     p.add_argument("--weight-use-alpha-mass", action=argparse.BooleanOptionalAction, default=True,
                    help="Enable alpha-mass in weight_delta modes. Disable to isolate representation alone.")
     p.add_argument("--constrain-alpha-mass", action=argparse.BooleanOptionalAction, default=True,
@@ -174,6 +193,10 @@ def parse_args():
         p.error("--train-shared and --freeze-root-encoder are contradictory")
     if args.autotune_init_from_alpha and args.alpha <= 0:
         p.error("--alpha must be > 0 with --autotune-init-from-alpha")
+    if args.use_alpha_scale and args.fix_alpha_scale:
+        p.error("--use-alpha-scale and --fix-alpha-scale are mutually exclusive")
+    if args.test_adapt_steps < 0 or args.test_adapt_lr <= 0:
+        p.error("--test-adapt-steps must be >=0 and --test-adapt-lr must be >0")
 
     return args
 
@@ -185,6 +208,9 @@ def _effective_condition_config(args, cfg):
     cfg = dict(cfg)
     if cfg["fusion_mode"] == "weight_delta":
         cfg["use_alpha_mass"] = bool(cfg["use_alpha_mass"] and args.weight_use_alpha_mass)
+    if not args.condition_alpha_scale:
+        cfg["use_alpha_scale"] = bool(args.use_alpha_scale)
+        cfg["fix_alpha_scale"] = bool(args.fix_alpha_scale)
     return cfg
 
 
@@ -205,6 +231,8 @@ def _expected_training_config(args, suite, task_id, seq_idx, seed, cfg):
         "learning_starts": int(args.learning_starts),
         "random_actions_end": int(args.random_actions_end),
         "policy_lr": float(args.policy_lr),
+        "alpha_lr": float(args.alpha_lr),
+        "alpha_warmup_steps": int(args.alpha_warmup_steps),
         "q_lr": float(args.q_lr),
         "alpha": float(args.alpha),
         "autotune": bool(args.autotune),
@@ -214,10 +242,14 @@ def _expected_training_config(args, suite, task_id, seq_idx, seed, cfg):
         "freeze_root_encoder": bool(args.freeze_root_encoder),
         "distillation": bool(cfg["distillation"]),
         "use_alpha_mass": bool(cfg["use_alpha_mass"]),
-        "use_alpha_scale": bool(args.use_alpha_scale),
+        "use_alpha_scale": bool(cfg["use_alpha_scale"]),
+        "fix_alpha_scale": bool(cfg["fix_alpha_scale"]),
+        "alpha_mass_reg": float(args.alpha_mass_reg),
+        "drift_reg": float(args.drift_reg),
         "constrain_alpha_mass": bool(args.constrain_alpha_mass),
         "train_shared": bool(args.train_shared),
         "encoder_linear_out": bool(args.encoder_linear_out),
+        "distill_observation_skip": bool(args.distill_observation_skip),
         "distill_extra_steps": int(args.distill_extra_steps),
         "collect_cosine_buffers": bool(args.collect_cosine_buffers),
         "max_distill_buffer": int(args.max_distill_buffer),
@@ -292,12 +324,17 @@ def train_chain(args, suite, condition, cfg, seed):
             f"--random-actions-end={args.random_actions_end}",
             f"--batch-size={args.batch_size}",
             f"--policy-lr={args.policy_lr}",
+            f"--alpha-lr={args.alpha_lr}",
+            f"--alpha-mass-reg={args.alpha_mass_reg}",
+            f"--alpha-warmup-steps={args.alpha_warmup_steps}",
+            f"--drift-reg={args.drift_reg}",
             f"--q-lr={args.q_lr}",
             f"--gamma={args.gamma}",
             f"--tau={args.tau}",
             f"--pool-size={args.pool_size}",
             f"--eval-every={args.eval_every}",
             f"--num-evals={args.num_evals}",
+            "--distill-observation-skip" if args.distill_observation_skip else "--no-distill-observation-skip",
             f"--distill-extra-steps={args.distill_extra_steps}",
             f"--max-distill-buffer={args.max_distill_buffer}",
             f"--similarity-samples={args.similarity_samples}",
@@ -311,7 +348,8 @@ def train_chain(args, suite, condition, cfg, seed):
             f"--alpha={args.alpha}",
             "--autotune" if args.autotune else "--no-autotune",
             "--autotune-init-from-alpha" if args.autotune_init_from_alpha else "--no-autotune-init-from-alpha",
-            "--use-alpha-scale" if args.use_alpha_scale else "--no-use-alpha-scale",
+            "--use-alpha-scale" if cfg["use_alpha_scale"] else "--no-use-alpha-scale",
+            "--fix-alpha-scale" if cfg["fix_alpha_scale"] else "--no-fix-alpha-scale",
             "--distillation" if cfg["distillation"] else "--no-distillation",
             "--distill-select-best-val" if args.distill_select_best_val else "--no-distill-select-best-val",
             "--collect-cosine-buffers" if args.collect_cosine_buffers else "--no-collect-cosine-buffers",
