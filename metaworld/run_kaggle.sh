@@ -54,18 +54,44 @@ MW_COMMIT="${MW_COMMIT:-c822f28f582ba1ad49eb5dcf61016566f28003ba}"
 mkdir -p "$OUT"/{pretrained_encoders,agents,plots,logs,runs,analysis,scratch_models,analysis_scratch}
 
 cuda_check() {
-python3 - <<'PY'
-import torch
+python3 - <<'PYEOF'
+import sys, torch
 print("torch:", torch.__version__)
 print("cuda available:", torch.cuda.is_available())
-if torch.cuda.is_available():
-    print("gpu:", torch.cuda.get_device_name(0), "| count:", torch.cuda.device_count())
-    # is_available() alone can be True on a P100 even when the wheel has no
-    # sm_60 kernels. An actual kernel launch catches that configuration.
-    x = torch.randn(256, 256, device="cuda"); y = x @ x
+if not torch.cuda.is_available():
+    print("NO GPU -- runs would fall back to CPU and be far too slow for this plan.")
+    sys.exit(3)
+
+name = torch.cuda.get_device_name(0)
+cap = torch.cuda.get_device_capability(0)
+arches = torch.cuda.get_arch_list()
+print(f"gpu: {name} | capability: sm_{cap[0]}{cap[1]} | count: {torch.cuda.device_count()}")
+print("wheel supports:", arches)
+
+# torch.cuda.is_available() returns True on a P100 even when the installed
+# wheel has no sm_60 kernels; the failure only surfaces much later as
+# "no kernel image is available for execution on the device", deep inside
+# training. Launch a real kernel here so it is caught during setup instead.
+try:
+    x = torch.randn(256, 256, device="cuda")
+    y = x @ x
     torch.cuda.synchronize()
     print("real CUDA kernel test: OK", float(y.mean()))
-PY
+except Exception as exc:
+    print()
+    print("=" * 72)
+    print("CUDA KERNEL TEST FAILED -- do not start any training run")
+    print("=" * 72)
+    print(f"  {type(exc).__name__}: {exc}")
+    print()
+    print(f"  This GPU is sm_{cap[0]}{cap[1]}, but the installed PyTorch was built for:")
+    print(f"    {arches}")
+    print()
+    print("  FIX: in the Kaggle right-hand panel set Accelerator = 'GPU T4 x2'")
+    print("       (T4 is sm_75). P100 is sm_60 and this wheel has no kernels for it.")
+    print("=" * 72)
+    sys.exit(4)
+PYEOF
 }
 
 step_setup() {
@@ -127,10 +153,17 @@ step_smoke() {
     values="$(roots_for smoke)"; IFS='|' read -r agents runs analysis scratch scratch_analysis plots <<< "$values"
     local extra; encoder_flags s0 extra
 
+    # --pool-size MUST match what the continual run below uses. The run manifest
+    # in experiment_identity.py includes pool_size in the training signature, so
+    # a baseline trained at the default 4 is rejected as a config mismatch and
+    # the survey metrics (FT/BWT/A_N) are silently skipped -- with only a
+    # warning buried in the log. Same rule for every real stage: baselines and
+    # continual runs must agree on every training-signature key.
     python3 scratch_baselines.py \
         --task-suites mw_smoke2 --seeds 101 \
         --total-timesteps 3000 --eval-every 1000 --num-evals 2 \
         --learning-starts 500 --random-actions-end 1000 \
+        --pool-size 2 \
         --save-root "$scratch" --runs-root "$runs" --analysis-root "$scratch_analysis" \
         "${extra[@]}" 2>&1 | tee "$OUT/logs/mw_smoke_baselines.log"
 
@@ -182,13 +215,21 @@ step_baselines() {
     python3 scratch_baselines.py \
         --task-suites "$SUITE" --seeds $SCRATCH_SEEDS \
         --total-timesteps "$TOTAL_TIMESTEPS" \
+        --pool-size "$POOL_SIZE" \
         --save-root "$scratch" --runs-root "$runs" --analysis-root "$scratch_analysis" \
         "${extra[@]}" 2>&1 | tee -a "$OUT/logs/mw_${stage}_baselines.log"
 }
 
 # --------------------------------------------------------------------------
-# cond: ONE condition at a time. This is the unit of work you schedule.
-#   bash run_kaggle.sh cond s0 3
+# cond: ONE condition at a time. With the measured throughput on a Kaggle T4
+# (~55 steps/s once the replay buffer is warm), one condition at 150k x 8
+# positions x 3 seeds is about 19 h -- past the 12 h session cap. So the real
+# unit of work is (condition, ONE seed) at ~6.5 h:
+#
+#   SEEDS=1 bash run_kaggle.sh cond s0 3
+#
+# Run the same command with SEEDS=2, then SEEDS=3, in later sessions. Results
+# accumulate under the same roots and `report` averages whatever is present.
 # --------------------------------------------------------------------------
 step_cond() {
     local stage="${1:-s0}" idx="${2:-}"
