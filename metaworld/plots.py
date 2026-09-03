@@ -60,7 +60,9 @@ SEQUENCE_METRICS = {
     "distillation/policy/distill_train_kl_max": ("Distillation train KL max", "distill_train_kl_max"),
     "distillation/policy/distill_test_kl_max": ("Distillation held-out KL max", "distill_test_kl_max"),
     "distillation/policy/distill_best_val_kl": ("Distillation best validation KL", "distill_best_val_kl"),
-    "distillation/policy/distill_best_epoch": ("Distillation selected epoch", "distill_best_epoch"),
+    "distillation/policy/distill_best_epoch": ("Distillation best validation epoch", "distill_best_epoch"),
+    "distillation/policy/distill_selected_val_kl": ("Distillation selected validation KL", "distill_selected_val_kl"),
+    "distillation/policy/distill_selected_epoch": ("Distillation selected epoch", "distill_selected_epoch"),
     "distillation/policy/distill_train_mean_mse": ("Distillation train mean MSE", "distill_train_mean_mse"),
     "distillation/policy/distill_test_mean_mse": ("Distillation held-out mean MSE", "distill_test_mean_mse"),
     "distillation/policy/distill_train_logstd_mse": ("Distillation train log-std MSE", "distill_train_logstd_mse"),
@@ -259,7 +261,7 @@ def plot_retention(args, suite, conditions, all_payloads):
 
     for metric, ylabel in (
         ("return", "Average return on seen tasks"),
-        ("task_error", "Average object-to-target distance on seen tasks"),
+        ("task_error", "Average task error on seen tasks"),
         ("success", "Average success fraction on seen tasks"),
     ):
         fig, ax = plt.subplots(figsize=(10.5, 5.3))
@@ -483,7 +485,7 @@ def plot_zero_shot(args, suite, conditions):
     out_dir.mkdir(parents=True, exist_ok=True)
     for scalar_tag, title, filename in (
         ("charts/test_episodic_return", "Zero-shot return before training each task", "zero_shot_return"),
-        ("charts/test_task_error", "Zero-shot object-to-target distance before training each task", "zero_shot_task_error"),
+        ("charts/test_task_error", "Zero-shot task error before training each task", "zero_shot_task_error"),
     ):
         fig, ax = plt.subplots(figsize=(10.5, 5.3))
         x = np.arange(len(args.task_sequence))

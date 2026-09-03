@@ -32,6 +32,7 @@ class HeadPool(nn.Module):
         distillation: bool = True,
         max_distill_buffer: int = 50_000,
         use_alpha_mass: bool = False,
+        constrain_alpha_mass: bool = True,
         distill_test_frac: float = 0.2,
     ):
         super().__init__()
@@ -52,6 +53,7 @@ class HeadPool(nn.Module):
         self.distillation = bool(distillation)
         self.max_distill_buffer = int(max_distill_buffer)
         self.use_alpha_mass = bool(use_alpha_mass)
+        self.constrain_alpha_mass = bool(constrain_alpha_mass)
         self.distill_test_frac = float(distill_test_frac)
 
         # Frozen task-1 base head.
@@ -112,7 +114,11 @@ class HeadPool(nn.Module):
     def effective_alpha_mass(self):
         if self.alpha_mass is None:
             return None
-        # softplus(raw) is strictly positive.  Dividing by softplus(1) keeps
+        if not self.constrain_alpha_mass:
+            # Legacy/ablation behaviour: the learned scalar may become zero or
+            # negative. Kept behind a flag so the stabilization can be isolated.
+            return self.alpha_mass
+        # softplus(raw) is strictly positive. Dividing by softplus(1) keeps
         # raw=1 (the existing initialization) exactly equivalent to mass=1.
         normalizer = F.softplus(torch.ones_like(self.alpha_mass))
         return F.softplus(self.alpha_mass) / normalizer

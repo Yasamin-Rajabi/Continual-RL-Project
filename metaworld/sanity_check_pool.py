@@ -14,6 +14,7 @@ import numpy as np
 import torch
 
 from cka_rl import CkaRlAgent, FrozenCkaPolicy
+from shared_arch import shared
 
 OBS_DIM = 6
 ACT_DIM = 3
@@ -249,18 +250,36 @@ def check_alpha_mass_restriction():
             pass
         else:
             raise AssertionError("classic_cka must reject use_alpha_mass in both distillation settings")
+
+    # alpha_mass exists only when there is historical knowledge to weight. Build
+    # a one-entry root checkpoint, then inspect the next-task agents.
     for distillation in (False, True):
+        case_root = f"{TMP_ROOT}/alpha_mass_{distillation}"
+        shutil.rmtree(case_root, ignore_errors=True)
+        base_dir = f"{case_root}/task0"
+        save_root(base_dir, "weight_delta", distillation, use_alpha_mass=True)
+
         model = CkaRlAgent(
-            OBS_DIM, ACT_DIM, None, None,
+            OBS_DIM, ACT_DIM, base_dir, base_dir,
             fusion_mode="weight_delta", distillation=distillation, use_alpha_mass=True,
+            constrain_alpha_mass=True,
         )
-        # The raw parameter is unconstrained, but the mass used by the policy
-        # must remain strictly positive even if optimization drives raw < 0.
-        if model.alpha_mass is not None:
-            with torch.no_grad():
-                model.alpha_mass.fill_(-10.0)
-            assert model.mean_pool.effective_alpha_mass().item() > 0.0
-    print("  alpha_mass restricted to weight_delta and effective mass stays positive OK")
+        assert model.alpha_mass is not None
+        # Raw is unconstrained; the default effective mass must stay positive.
+        with torch.no_grad():
+            model.alpha_mass.fill_(-10.0)
+        assert model.mean_pool.effective_alpha_mass().item() > 0.0
+
+        legacy = CkaRlAgent(
+            OBS_DIM, ACT_DIM, base_dir, base_dir,
+            fusion_mode="weight_delta", distillation=distillation, use_alpha_mass=True,
+            constrain_alpha_mass=False,
+        )
+        assert legacy.alpha_mass is not None
+        with torch.no_grad():
+            legacy.alpha_mass.fill_(-2.0)
+        assert legacy.mean_pool.effective_alpha_mass().item() == -2.0
+    print("  alpha_mass restriction + positive/default and legacy/unconstrained ablations OK")
 
 
 def check_trainable_encoder_loads_latest():
@@ -294,6 +313,125 @@ def check_trainable_encoder_loads_latest():
     print("  train_shared=True loads latest encoder instead of resetting to root OK")
 
 
+def check_encoder_policy_flags():
+    print("\n=== shared-encoder policy/architecture checks ===")
+    root = f"{TMP_ROOT}/encoder_flags"
+    shutil.rmtree(root, ignore_errors=True)
+    os.makedirs(root, exist_ok=True)
+
+    # Normal scratch root learns; explicit random-frozen ablation does not.
+    learned_root = CkaRlAgent(OBS_DIM, ACT_DIM, None, None, distillation=False)
+    assert all(p.requires_grad for p in learned_root.fc.parameters())
+    frozen_root = CkaRlAgent(
+        OBS_DIM, ACT_DIM, None, None, distillation=False, freeze_root_encoder=True
+    )
+    assert not any(p.requires_grad for p in frozen_root.fc.parameters())
+
+    # Serialized architecture is validated even though ReLU-vs-linear has the
+    # same state_dict shapes and would otherwise fail silently.
+    pretrained = f"{root}/linear_fc.pt"
+    torch.save(shared(OBS_DIM, linear_out=True), pretrained)
+    frozen_pre = CkaRlAgent(
+        OBS_DIM, ACT_DIM, None, None, distillation=False,
+        pretrained_encoder=pretrained, encoder_linear_out=True, train_shared=False,
+    )
+    assert not any(p.requires_grad for p in frozen_pre.fc.parameters())
+    try:
+        CkaRlAgent(
+            OBS_DIM, ACT_DIM, None, None, distillation=False,
+            pretrained_encoder=pretrained, encoder_linear_out=False, train_shared=False,
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("pretrained encoder ReLU/linear-out mismatch must fail fast")
+
+    shutil.rmtree(root, ignore_errors=True)
+    print("  root/frozen/pretrained policies + architecture mismatch guard OK")
+
+
+def check_distill_selection_ablation():
+    print("\n=== distillation model-selection ablation check ===")
+    root = f"{TMP_ROOT}/distill_last_epoch"
+    shutil.rmtree(root, ignore_errors=True)
+    d0 = f"{root}/task0"
+    d1 = f"{root}/task1"
+    save_root(d0, "classic_cka", True, False)
+    m1 = CkaRlAgent(
+        OBS_DIM, ACT_DIM, d0, d0, pool_size=2, distillation=True,
+        fusion_mode="classic_cka", encoder_from_base=True, similarity_samples=32,
+        distill_max_samples=64, distill_epochs=2, distill_batch_size=32,
+        distill_select_best_val=False,
+    )
+    train_a_bit(m1, steps=1)
+    m1.set_own_buffer(fake_buffer(48, task_id=1, source_id=1))
+    m1.finalize(); m1.save(d1)
+    m2 = CkaRlAgent(
+        OBS_DIM, ACT_DIM, d0, d1, pool_size=2, distillation=True,
+        fusion_mode="classic_cka", encoder_from_base=True, similarity_samples=32,
+        distill_max_samples=64, distill_epochs=2, distill_batch_size=32,
+        distill_test_frac=0.25, distill_select_best_val=False,
+    )
+    train_a_bit(m2, steps=1)
+    m2.set_own_buffer(fake_buffer(48, task_id=2, source_id=2))
+    m2.finalize()
+    metrics = m2.get_distill_metrics()
+    assert metrics["policy/distill_selected_epoch"] == 2
+    assert metrics["policy/distill_select_best_val"] == 0.0
+    shutil.rmtree(root, ignore_errors=True)
+    print("  --no-distill-select-best-val keeps final epoch OK")
+
+
+
+def check_friend_policy_controls():
+    print("\n=== friend-method policy-control checks ===")
+
+    # Distillation observation skip changes the first head's input dimension,
+    # but remains an explicit ablation switch.
+    with_skip = CkaRlAgent(
+        OBS_DIM, ACT_DIM, None, None, distillation=True,
+        distill_observation_skip=True,
+    )
+    without_skip = CkaRlAgent(
+        OBS_DIM, ACT_DIM, None, None, distillation=True,
+        distill_observation_skip=False,
+    )
+    assert with_skip.mean_pool.own_l0_weight.shape[1] == 256 + OBS_DIM
+    assert without_skip.mean_pool.own_l0_weight.shape[1] == 256
+    assert with_skip(torch.zeros(2, OBS_DIM))[0].shape == (2, ACT_DIM)
+
+    root = f"{TMP_ROOT}/friend_scale_modes"
+    shutil.rmtree(root, ignore_errors=True)
+    d0 = f"{root}/task0"
+    save_root(d0, "classic_cka", False, False)
+
+    learned = CkaRlAgent(
+        OBS_DIM, ACT_DIM, d0, d0, distillation=False,
+        fusion_mode="classic_cka", use_alpha_scale=True, fix_alpha_scale=False,
+    )
+    assert learned.alpha_scale is not None and learned.alpha_scale.requires_grad
+    assert abs(float(learned.alpha_scale.item()) - 1.0) < 1e-8
+
+    fixed = CkaRlAgent(
+        OBS_DIM, ACT_DIM, d0, d0, distillation=False,
+        fusion_mode="weight_delta", use_alpha_scale=False, fix_alpha_scale=True,
+    )
+    assert fixed.alpha_scale is not None and not fixed.alpha_scale.requires_grad
+    assert abs(float(fixed.alpha_scale.item()) - 5.0) < 1e-8
+
+    try:
+        CkaRlAgent(
+            OBS_DIM, ACT_DIM, d0, d0, distillation=False,
+            use_alpha_scale=True, fix_alpha_scale=True,
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("learned and fixed alpha-scale modes must be mutually exclusive")
+
+    shutil.rmtree(root, ignore_errors=True)
+    print("  observation-skip + learned/fixed alpha-scale modes OK")
+
 def main():
     torch.manual_seed(0)
     np.random.seed(0)
@@ -306,6 +444,9 @@ def main():
     check_behavioral_pair_not_weight_cosine()
     check_alpha_mass_restriction()
     check_trainable_encoder_loads_latest()
+    check_encoder_policy_flags()
+    check_distill_selection_ablation()
+    check_friend_policy_controls()
 
     shutil.rmtree(TMP_ROOT, ignore_errors=True)
     print("\n*** ALL CHECKS PASSED ***")
