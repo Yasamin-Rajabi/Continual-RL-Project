@@ -246,3 +246,6 @@ gym_tmp/
 # Patch files (if you want to keep them tracked, remove this line)
 *.patch
 *.diff
+
+# results directories
+_walker2d_*

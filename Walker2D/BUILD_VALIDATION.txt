@@ -1,0 +1,29 @@
+CKA-RL WALKER2D BUILD VALIDATION
+================================
+
+Template source:
+  Revised half-cheetah directory from the user-provided Continual-RL project.
+
+Completed in the build sandbox:
+  PASS  Python compileall for all .py files
+  PASS  bash -n for run_kaggle.sh, run_recommended.sh, local_smoke_test.sh, job.sh
+  PASS  sanity_check_pool.py full structural CKA-RL test suite
+  PASS  task-suite definitions and CLI/source static inspection
+  PASS  no functional HalfCheetah environment references remain in Walker-specific code
+
+Not executable in the build sandbox:
+  LIVE  Gymnasium Walker2d-v5 / MuJoCo rollouts
+  LIVE  Stable-Baselines3 replay-buffer training integration
+
+Reason:
+  The sandbox image does not contain gymnasium, mujoco, stable-baselines3,
+  tensorboard, or tyro, and its Python package installer has no network access.
+
+The following included checks close that gap on macOS or Kaggle after installing
+requirements.txt:
+  python3 tasks.py --check
+  python3 walker2d_smoke.py
+  bash local_smoke_test.sh
+  bash run_kaggle.sh sanity
+
+See README.md for expected behavior and the result bundle to send back.
