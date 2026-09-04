@@ -144,7 +144,7 @@ def checkpoint_matches(path, expected_mapping, *, parent_dirs=(), pretrained_enc
     )
 
 
-CACHE_SCHEMA_VERSION = 5
+CACHE_SCHEMA_VERSION = 6
 
 
 def _benchmark_cache_config(args):
@@ -327,13 +327,15 @@ def adapt_and_evaluate_checkpoint(
     """Evaluate after optional test-time adaptation of knowledge-mixture scalars.
 
     This integrates the friend's alpha-adaptation evaluator while keeping the
-    normal frozen-checkpoint evaluator available with adapt_steps=0. Head/encoder
+    adapt_steps=0 evaluates the frozen finalized pool from a uniform mixture. Head/encoder
     weights stay frozen; only alpha, an enabled learnable alpha-scale, and
     alpha-mass are adapted.
     """
-    if adapt_steps <= 0:
-        return evaluate_checkpoint(run_dir, suite, task_id, episodes, seed, device)
-
+    # Always reconstruct the FINALIZED knowledge pool.  With
+    # adapt_steps == 0 this gives a deterministic frozen finalized-pool
+    # evaluation from the same uniform routing initialization used by the
+    # adaptation protocol, rather than falling back to the pre-finalize
+    # policy_snapshot.pt.
     run_dir = pathlib.Path(run_dir)
     required = [run_dir / name for name in ("policy_snapshot.pt", "fc.pt", "mean_pool.pt", "logstd_pool.pt")]
     if not all(path.exists() for path in required):
