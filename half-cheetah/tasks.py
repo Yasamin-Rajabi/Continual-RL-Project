@@ -104,7 +104,26 @@ def get_task(task_id: int, task_suite: str = "halfcheetah_vel", render: bool = F
 
 
 if __name__ == "__main__":
+    import sys
+    import numpy as np
+
     for suite in available_task_suites():
         print(suite)
         for idx, task in enumerate(TASK_SUITES[suite]):
             print(f"  {idx}: {task.label(suite)}")
+
+    if "--check" in sys.argv:
+        for suite in available_task_suites():
+            shapes = set()
+            for idx in range(len(TASK_SUITES[suite])):
+                env = get_task(idx, task_suite=suite)
+                obs, _ = env.reset(seed=0)
+                env.action_space.seed(0)
+                obs2, _, _, _, _ = env.step(env.action_space.sample())
+                assert obs.shape == env.observation_space.shape
+                assert obs2.shape == env.observation_space.shape
+                shapes.add((int(np.prod(env.observation_space.shape)), int(np.prod(env.action_space.shape))))
+                env.close()
+            assert len(shapes) == 1, f"{suite}: inconsistent obs/action shapes {shapes}"
+            obs_dim, act_dim = shapes.pop()
+            print(f"[ok] {suite}: obs={obs_dim}, act={act_dim}")

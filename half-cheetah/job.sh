@@ -201,8 +201,8 @@ srun python -u run_continual_benchmark.py \
     --similarity-samples 2048 \
     --max-distill-buffer 50000 \
     --distill-max-samples 20000 \
-    --distill-epochs 8 \
-    --distill-lr 3e-4 \
+    --distill-epochs 16 \
+    --distill-lr 5e-4 \
     --distill-batch-size 256 \
     --distill-test-frac 0.2 \
     --save-root "$RUN_ROOT/agents" \

@@ -49,6 +49,10 @@ def parse_args():
     p.add_argument(
         "--scratch-save-root", default=scratch_baselines.SCRATCH_SAVE_ROOT,
     )
+    p.add_argument(
+        "--scratch-variant", choices=list(scratch_baselines.SCRATCH_VARIANTS), default="plain",
+        help="FT denominator architecture for custom model labels; choose distill_skip for [phi(s), s] actor heads.",
+    )
     p.add_argument("--force-retrain", action="store_true")
     p.add_argument("--cpu", action="store_true")
 
@@ -119,6 +123,7 @@ def main():
                 if not scratch_baselines.checkpoint_complete(
                     scratch_baselines.scratch_checkpoint_dir(
                         args.scratch_save_root, suite, task_id, args.total_timesteps, seed,
+                        args.scratch_variant,
                     )
                 )
             ]

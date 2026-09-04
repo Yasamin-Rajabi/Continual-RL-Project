@@ -72,7 +72,10 @@ def main():
         )
 
     if train:
-        n_conditions = 4 if int(config.get("condition_index", 0)) == 0 else 1
+        condition_index = config.get("condition_index", [0])
+        if isinstance(condition_index, int):
+            condition_index = [condition_index]
+        n_conditions = 4 if 0 in condition_index else len(set(condition_index))
         task_runs = (
             len(config["task_suites"])
             * n_conditions

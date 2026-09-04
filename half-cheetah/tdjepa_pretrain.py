@@ -13,18 +13,17 @@ WHY THIS EXISTS
 ---------------
 The shared encoder `fc` holds 71,168 of the actor's 138,508 parameters (51.4%)
 and sits entirely outside the knowledge-vector mechanism. Under the benchmark's
-current configuration it is whatever task 0 produced -- and task 0 is
-_VELOCITIES[0] = 0.5 m/s, the slowest task in the suite. This script replaces
-that with an encoder trained across many tasks to be predictive of long-term
+frozen-root configuration it is whatever task 0 produced. This script replaces
+that root-task representation with an encoder trained across held-out locomotion
+settings to be predictive of long-term
 latent dynamics, and then frozen so the knowledge-vector basis stops moving.
 
-WORKS FOR BOTH ENVIRONMENT FAMILIES
------------------------------------
-`--task-suite` accepts halfcheetah_vel, halfcheetah_wind_vel, ant_vel and
-ant_wind_vel. Pretraining tasks are specified as HELD-OUT velocities that do not
-appear in TASK_SUITES, so no benchmark task is ever seen during pretraining.
-For Ant, remember to calibrate velocities first (see ant_envs and the analysis
-doc) -- the HalfCheetah numbers are wrong for Ant.
+OPTIONAL HALFCHEETAH ABLATION
+-------------------------------
+`--task-suite` accepts the two HalfCheetah suites in this directory. Pretraining
+tasks are specified as held-out velocities that do not appear in TASK_SUITES, so
+no benchmark task is seen during pretraining. The current default workflow does
+not require encoder pretraining; this script is retained for explicit ablations.
 
 NOT EXECUTED IN THIS SANDBOX (no torch/mujoco) -- syntax-checked only.
 Run `--smoke-test` before committing GPU hours.
@@ -77,18 +76,11 @@ def make_pretrain_env(task_suite: str, velocity: float, wind: Tuple[float, float
     task = HalfCheetahTask(target_velocity=float(velocity), wind=tuple(wind))
     kwargs = {"target_velocity": float(velocity), "render_mode": None}
 
-    if task_suite.startswith("ant"):
-        from ant_envs import AntVelEnv, AntWindVelEnv
-        from tasks import _ANT_SUCCESS_TOLERANCE
-
-        env_cls = AntWindVelEnv if task_suite == "ant_wind_vel" else AntVelEnv
-        kwargs["success_tolerance"] = _ANT_SUCCESS_TOLERANCE
-    else:
-        env_cls = (
-            HalfCheetahWindVelEnv
-            if task_suite == "halfcheetah_wind_vel"
-            else HalfCheetahVelEnv
-        )
+    env_cls = (
+        HalfCheetahWindVelEnv
+        if task_suite == "halfcheetah_wind_vel"
+        else HalfCheetahVelEnv
+    )
 
     if task_suite.endswith("wind_vel"):
         kwargs["wind"] = tuple(wind)
@@ -323,8 +315,7 @@ def train(data, heldout, cfg: TDJepaConfig, epochs, batch_size, device,
 def parse_args():
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--task-suite", default="halfcheetah_vel",
-                   choices=["halfcheetah_vel", "halfcheetah_wind_vel",
-                            "ant_vel", "ant_wind_vel"])
+                   choices=["halfcheetah_vel", "halfcheetah_wind_vel"])
     p.add_argument("--pretrain-velocities", nargs="+", type=float,
                    default=[0.75, 1.75, 2.75],
                    help="Held-out velocities, deliberately NOT in TASK_SUITES.")

@@ -42,6 +42,8 @@ TRAINING_KEYS = (
     "policy_lr",
     "alpha_lr",
     "alpha_warmup_steps",
+    "alpha_entropy_reg",
+    "distill_encoder_lr_mult",
     "q_lr",
     "policy_frequency",
     "target_network_frequency",
@@ -49,6 +51,10 @@ TRAINING_KEYS = (
     "autotune",
     "autotune_init_from_alpha",
     "pool_size",
+    # These do not change gradient updates, but they define the periodic learning
+    # curves used by Forward Transfer and therefore belong to reusable run identity.
+    "eval_every",
+    "num_evals",
     "encoder_from_base",
     "freeze_root_encoder",
     "distillation",
@@ -84,12 +90,7 @@ SOURCE_CANDIDATES = (
     "policy_utils.py",
     "tasks.py",
     "halfcheetah_envs.py",
-    "locomotion_envs.py",
-    "ant_envs.py",
     "analysis_logging.py",
-    # Ant task targets are derived from this generated file. It is absent in
-    # HalfCheetah and during Ant calibration, which is fine.
-    "ant_calibration.json",
 )
 
 

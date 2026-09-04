@@ -50,13 +50,17 @@ make the new method changes individually switchable:
 | `--condition-alpha-scale` | `--no-condition-alpha-scale` | Classic modes learn alpha scale from 1; weight-delta modes use fixed scale 5. Disabling this lets `--use-alpha-scale/--fix-alpha-scale` choose one global rule. |
 | `--distill-observation-skip` | `--no-distill-observation-skip` | Distillation modes concatenate raw observation to shared features before the policy heads. |
 | `--alpha-lr 5e-3` | change value | Separate learning rate for knowledge-mixture parameters. |
-| `--alpha-warmup-steps 5000` | `0` | Early weight-delta phase learns historical mixing before the new residual/mass moves. |
+| `--alpha-warmup-steps 5000` | `0` | Early weight-delta phase learns historical mixing before the new residual/mass moves. It activates only when at least two historical slots exist. |
 | `--alpha-mass-reg 0.05` | `0` | Regularizes effective mass after warmup. |
 | `--drift-reg 1.0` | `0` | When `--train-shared` and distillation are both active, penalizes encoder drift on historical observations. |
+| `--distill-encoder-lr-mult 0.1` | `1.0` | Slows the shared encoder on later distillation tasks. |
+| `--alpha-entropy-reg 0.01` | `0` | Entropy bonus on the **actual scaled** historical mixture during effective weight-delta warmup. |
 | `--test-adapt-steps 5000` | `0` | Test-time adaptation of alpha-only mixture parameters for retention/final-row metrics. |
 
-`--test-adapt-steps 0` restores frozen-checkpoint evaluation. Forward transfer remains defined
-only on first encounters of previously unseen tasks; repeated encounters are relearning/savings.
+`--test-adapt-steps 0` restores frozen-checkpoint evaluation. FG/BWT now re-evaluate both the
+diagonal checkpoint and final checkpoint with the same adaptation protocol and common episode
+seeds. Forward transfer remains defined only on first encounters of previously unseen tasks;
+repeated encounters are relearning/savings.
 
 ## Small optimizations / legacy switches
 
@@ -77,10 +81,12 @@ only if its training configuration, training-source fingerprint, runtime package
 versions, pretrained encoder contents, and parent checkpoint identities still
 match. Old pre-manifest checkpoints are intentionally considered stale.
 
-Scratch baselines for Forward Transfer must use the same encoder architecture,
-pretrained encoder treatment, SAC entropy settings, and training budget as the
-continual run. `run_kaggle.sh` creates separate S0/S4 scratch/log/model roots to
-prevent accidental cross-use.
+Scratch baselines for Forward Transfer must use the same encoder treatment, SAC settings,
+evaluation cadence, training budget, and **actor-head architecture** as the continual run.
+`scratch_baselines.py` therefore caches two variants by default: `plain` for Baseline/Weight-Only
+and `distill_skip` for Distill-Only/Combined when observation skip is enabled. The default
+`run_kaggle.sh` follows the current no-pretraining `--train-shared` workflow; TD-JEPA remains
+available only as an explicit ablation.
 
 ## Diagnostics retained for upcoming TODOs
 

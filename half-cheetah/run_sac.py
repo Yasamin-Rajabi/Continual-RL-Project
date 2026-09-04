@@ -29,9 +29,7 @@ from tasks import get_task, get_task_name
 @dataclass
 class Args:
     model_type: Literal["cka-rl"] = "cka-rl"
-    task_suite: Literal[
-        "halfcheetah_vel", "halfcheetah_wind_vel", "ant_vel", "ant_wind_vel"
-    ] = "halfcheetah_vel"
+    task_suite: Literal["halfcheetah_vel", "halfcheetah_wind_vel"] = "halfcheetah_vel"
     fusion_mode: Literal["classic_cka", "weight_delta"] = "classic_cka"
     save_dir: Optional[str] = None
     prev_units: Tuple[pathlib.Path, ...] = ()
@@ -85,6 +83,12 @@ class Args:
     fix_alpha_scale: bool = False
     alpha_mass_reg: float = 0.05
     drift_reg: float = 1.0
+    distill_encoder_lr_mult: float = 0.1
+    """Multiplier on policy_lr for a trainable shared encoder on later
+    distillation tasks. Set to 1.0 to disable the slower-encoder optimization."""
+    alpha_entropy_reg: float = 0.01
+    """Entropy bonus on the historical knowledge-mixture during weight-delta
+    warmup. Set to 0 to disable it."""
     constrain_alpha_mass: bool = True
     """When alpha-mass is enabled, map its raw scalar through a positive
     softplus transform. Disable only for the legacy/unconstrained ablation."""
@@ -369,8 +373,10 @@ def _validate_args(args):
         raise ValueError("policy/q/alpha learning rates must be > 0")
     if args.alpha_warmup_steps < 0:
         raise ValueError("alpha_warmup_steps must be >= 0")
-    if args.alpha_mass_reg < 0 or args.drift_reg < 0:
-        raise ValueError("alpha_mass_reg and drift_reg must be >= 0")
+    if args.alpha_mass_reg < 0 or args.drift_reg < 0 or args.alpha_entropy_reg < 0:
+        raise ValueError("alpha_mass_reg, drift_reg and alpha_entropy_reg must be >= 0")
+    if args.distill_encoder_lr_mult <= 0:
+        raise ValueError("distill_encoder_lr_mult must be > 0")
     if args.pool_size < 2:
         raise ValueError("pool_size must be >= 2 for meaningful behavioral pair selection")
     if args.similarity_samples < 2:
@@ -515,7 +521,11 @@ if __name__ == "__main__":
 
     # Friend method: after task 0, a trainable shared encoder moves more slowly
     # in distillation modes; alpha parameters get their own faster learning rate.
-    encoder_lr = args.policy_lr * 0.1 if (args.distillation and args.seq_idx > 0) else args.policy_lr
+    encoder_lr = (
+        args.policy_lr * args.distill_encoder_lr_mult
+        if (args.distillation and args.seq_idx > 0)
+        else args.policy_lr
+    )
     param_groups = []
     if own_params:
         param_groups.append({"params": own_params, "lr": args.policy_lr})
@@ -650,15 +660,26 @@ if __name__ == "__main__":
                         actor_loss = actor_loss + drift_loss
 
                     in_warmup = global_step < (args.learning_starts + args.alpha_warmup_steps)
+                    # Warmup is meaningful only when there are at least two historical
+                    # slots to mix. With one slot softmax(alpha) is identically 1, so
+                    # freezing the new residual would make the first non-root actor
+                    # effectively untrainable for the entire warmup window.
+                    mixture_warmup = bool(
+                        args.fusion_mode == "weight_delta"
+                        and in_warmup
+                        and actor.model.alpha is not None
+                        and actor.model.alpha.numel() > 1
+                    )
                     alpha_entropy = None
-                    if in_warmup and actor.model.alpha is not None and actor.model.alpha.numel() > 1:
-                        probs = torch.softmax(actor.model.alpha, dim=-1)
+                    if mixture_warmup and args.alpha_entropy_reg > 0:
+                        scale = actor.model.alpha_scale if actor.model.alpha_scale is not None else 1.0
+                        probs = torch.softmax(actor.model.alpha * scale, dim=-1)
                         alpha_entropy = -(probs * torch.log(probs + 1e-8)).sum()
-                        actor_loss = actor_loss - 0.01 * alpha_entropy
+                        actor_loss = actor_loss - args.alpha_entropy_reg * alpha_entropy
 
                     mass_loss = None
                     if (
-                        not in_warmup and actor.model.alpha_mass is not None
+                        not mixture_warmup and actor.model.alpha_mass is not None
                         and actor.model.alpha_mass.requires_grad and args.alpha_mass_reg > 0
                     ):
                         eff_mass = actor.model.mean_pool.effective_alpha_mass()
@@ -670,7 +691,7 @@ if __name__ == "__main__":
 
                     # Friend method: weight-delta warmup first learns how to mix
                     # historical slots before allowing the new residual or mass to move.
-                    if args.fusion_mode == "weight_delta" and in_warmup and actor.model.alpha is not None:
+                    if mixture_warmup:
                         for p in own_params:
                             if p.grad is not None:
                                 p.grad.zero_()

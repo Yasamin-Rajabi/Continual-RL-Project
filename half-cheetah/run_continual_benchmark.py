@@ -87,7 +87,11 @@ def parse_args():
     p.add_argument("--alpha-lr", type=float, default=5e-3)
     p.add_argument("--alpha-mass-reg", type=float, default=0.05)
     p.add_argument("--alpha-warmup-steps", type=int, default=5_000)
+    p.add_argument("--alpha-entropy-reg", type=float, default=0.01,
+                   help="Knowledge-mixture entropy bonus during effective weight-delta warmup; 0 disables it.")
     p.add_argument("--drift-reg", type=float, default=1.0)
+    p.add_argument("--distill-encoder-lr-mult", type=float, default=0.1,
+                   help="Later-task encoder LR multiplier in distillation modes; 1 disables the slower-encoder optimization.")
     p.add_argument("--q-lr", type=float, default=3e-4)
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--tau", type=float, default=0.005)
@@ -96,7 +100,7 @@ def parse_args():
     p.add_argument("--num-evals", type=int, default=5)
     p.add_argument("--retention-eval-episodes", type=int, default=3)
     p.add_argument("--test-adapt-steps", type=int, default=5_000,
-                   help="Test-time alpha-only adaptation steps before retention/final-row evaluation; 0 disables it.")
+                   help="Test-time alpha-only adaptation steps for retention and FG/BWT checkpoint evaluation; 0 disables it.")
     p.add_argument("--test-adapt-lr", type=float, default=1e-2,
                    help="Learning rate for test-time alpha adaptation.")
     p.add_argument("--distill-observation-skip", action=argparse.BooleanOptionalAction, default=True,
@@ -162,10 +166,9 @@ def parse_args():
                    help="If enabled, entropy autotuning starts at --alpha instead of legacy 1.0.")
     p.add_argument("--cpu", action="store_true")
     p.add_argument(
-        "--condition-index", type=int, default=0, choices=[0, 1, 2, 3, 4],
-        help="0 = run all 4 CONDITIONS. 1-4 = run only that one condition, "
-             "by position in CONDITIONS' insertion order "
-             "(1=baseline, 2=distil_only, 3=weight_only, 4=combined).",
+        "--condition-index", nargs="+", type=int, default=[0], choices=[0, 1, 2, 3, 4],
+        help="0 = run all 4 CONDITIONS. Otherwise provide one or more of 1-4 "
+             "(1=baseline, 2=distil_only, 3=weight_only, 4=combined), e.g. --condition-index 1 4.",
     )
     p.add_argument("--quick-test", action="store_true")
     args = p.parse_args()
@@ -197,6 +200,12 @@ def parse_args():
         p.error("--use-alpha-scale and --fix-alpha-scale are mutually exclusive")
     if args.test_adapt_steps < 0 or args.test_adapt_lr <= 0:
         p.error("--test-adapt-steps must be >=0 and --test-adapt-lr must be >0")
+    if args.alpha_entropy_reg < 0:
+        p.error("--alpha-entropy-reg must be >= 0")
+    if args.distill_encoder_lr_mult <= 0:
+        p.error("--distill-encoder-lr-mult must be > 0")
+    if 0 in args.condition_index and len(args.condition_index) > 1:
+        p.error("--condition-index 0 means all conditions and cannot be combined with other indices")
 
     return args
 
@@ -233,11 +242,15 @@ def _expected_training_config(args, suite, task_id, seq_idx, seed, cfg):
         "policy_lr": float(args.policy_lr),
         "alpha_lr": float(args.alpha_lr),
         "alpha_warmup_steps": int(args.alpha_warmup_steps),
+        "alpha_entropy_reg": float(args.alpha_entropy_reg),
+        "distill_encoder_lr_mult": float(args.distill_encoder_lr_mult),
         "q_lr": float(args.q_lr),
         "alpha": float(args.alpha),
         "autotune": bool(args.autotune),
         "autotune_init_from_alpha": bool(args.autotune_init_from_alpha),
         "pool_size": int(args.pool_size),
+        "eval_every": int(args.eval_every),
+        "num_evals": int(args.num_evals),
         "encoder_from_base": bool(args.encoder_from_base),
         "freeze_root_encoder": bool(args.freeze_root_encoder),
         "distillation": bool(cfg["distillation"]),
@@ -327,7 +340,9 @@ def train_chain(args, suite, condition, cfg, seed):
             f"--alpha-lr={args.alpha_lr}",
             f"--alpha-mass-reg={args.alpha_mass_reg}",
             f"--alpha-warmup-steps={args.alpha_warmup_steps}",
+            f"--alpha-entropy-reg={args.alpha_entropy_reg}",
             f"--drift-reg={args.drift_reg}",
+            f"--distill-encoder-lr-mult={args.distill_encoder_lr_mult}",
             f"--q-lr={args.q_lr}",
             f"--gamma={args.gamma}",
             f"--tau={args.tau}",
@@ -402,10 +417,15 @@ def main():
     print(f"Sequence: {args.task_sequence}")
 
     all_condition_names = list(CONDITIONS.keys())
-    if args.condition_index == 0:
+    if 0 in args.condition_index:
         conditions = all_condition_names
     else:
-        conditions = [all_condition_names[args.condition_index - 1]]
+        # Preserve CLI order while removing accidental duplicates.
+        conditions = []
+        for idx in args.condition_index:
+            name = all_condition_names[idx - 1]
+            if name not in conditions:
+                conditions.append(name)
     selected_conditions = {name: CONDITIONS[name] for name in conditions}
     print(f"Conditions: {conditions}")
 
@@ -432,31 +452,44 @@ def main():
 
         if not args.skip_survey_metrics:
             used_task_ids = sorted(set(args.task_sequence))
+            required_variants = sorted({
+                scratch_baselines.variant_for_condition(
+                    condition, args.distill_observation_skip
+                )
+                for condition in conditions
+            })
             missing_baselines = []
             stale_baselines = []
-            for task_id in used_task_ids:
-                for scratch_seed in args.scratch_seeds:
-                    scratch_dir = scratch_baselines.scratch_checkpoint_dir(
-                        args.scratch_save_root, suite, task_id, args.total_timesteps, scratch_seed,
-                    )
-                    if not scratch_baselines.checkpoint_complete(scratch_dir):
-                        missing_baselines.append(task_id)
-                        continue
-                    matches, reason = scratch_baselines.checkpoint_matches(
-                        scratch_dir, suite, task_id, args.total_timesteps, scratch_seed, args
-                    )
-                    if not matches:
-                        stale_baselines.append((task_id, scratch_seed, reason))
+            for variant in required_variants:
+                for task_id in used_task_ids:
+                    for scratch_seed in args.scratch_seeds:
+                        scratch_dir = scratch_baselines.scratch_checkpoint_dir(
+                            args.scratch_save_root, suite, task_id, args.total_timesteps,
+                            scratch_seed, variant,
+                        )
+                        if not scratch_baselines.checkpoint_complete(scratch_dir):
+                            missing_baselines.append((variant, task_id))
+                            continue
+                        matches, reason = scratch_baselines.checkpoint_matches(
+                            scratch_dir, suite, task_id, args.total_timesteps,
+                            scratch_seed, args, variant,
+                        )
+                        if not matches:
+                            stale_baselines.append((variant, task_id, scratch_seed, reason))
             if stale_baselines:
                 print("\n!!! Scratch baseline identity mismatch(es):")
-                for task_id, scratch_seed, reason in stale_baselines:
-                    print(f"    task {task_id}, seed {scratch_seed}: {reason}")
-                missing_baselines.extend(task_id for task_id, _, _ in stale_baselines)
+                for variant, task_id, scratch_seed, reason in stale_baselines:
+                    print(f"    {variant}: task {task_id}, seed {scratch_seed}: {reason}")
+                missing_baselines.extend((variant, task_id) for variant, task_id, _, _ in stale_baselines)
             if missing_baselines:
+                missing_text = ", ".join(
+                    f"{variant}/task_{task_id}" for variant, task_id in sorted(set(missing_baselines))
+                )
                 print(
-                    f"\n!!! Skipping survey metrics for {suite}: missing scratch baselines for "
-                    f"task_id(s) {sorted(set(missing_baselines))}. Run:\n"
+                    f"\n!!! Skipping survey metrics for {suite}: missing/incompatible "
+                    f"scratch baselines: {missing_text}. Run:\n"
                     f"    {sys.executable} scratch_baselines.py --task-suites {suite} "
+                    f"--variants {' '.join(required_variants)} "
                     f"--total-timesteps {args.total_timesteps} --seeds {' '.join(map(str, args.scratch_seeds))} "
                     f"--save-root {args.scratch_save_root} --runs-root {args.runs_root}\n"
                 )

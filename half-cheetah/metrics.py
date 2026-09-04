@@ -33,13 +33,12 @@ begin with):
                     reduces to FT_i = 1 - R_i/R_i^b using RAW
                     charts/test_episodic_return integrals -- no [0,1]
                     normalization needed. Both p_i,i and p_N,i (for FG/BWT)
-                    and the FT baselines come from checkpoints/logs that
-                    already exist -- p_i,i is read directly from each
-                    position's own TensorBoard log (free), and p_N,i is
-                    evaluated ONCE per UNIQUE task_id against the FINAL
-                    checkpoint (not once per occurrence -- duplicate
-                    task_ids share the same environment, hence the same
-                    value).
+                    are re-evaluated from saved checkpoints with the same test
+                    adaptation protocol and episode seeds. FT learning curves
+                    and their scratch denominators come from TensorBoard logs
+                    that already exist. p_N,i is evaluated once per UNIQUE
+                    task_id against the final checkpoint (not once per
+                    occurrence -- duplicate task_ids share the same environment).
 """
 from __future__ import annotations
 
@@ -145,7 +144,7 @@ def checkpoint_matches(path, expected_mapping, *, parent_dirs=(), pretrained_enc
     )
 
 
-CACHE_SCHEMA_VERSION = 4
+CACHE_SCHEMA_VERSION = 5
 
 
 def _benchmark_cache_config(args):
@@ -153,7 +152,8 @@ def _benchmark_cache_config(args):
     keys = (
         "task_sequence", "save_root", "runs_root", "analysis_root",
         "total_timesteps", "learning_starts", "random_actions_end",
-        "batch_size", "policy_lr", "alpha_lr", "alpha_warmup_steps", "q_lr", "gamma", "tau", "alpha",
+        "batch_size", "policy_lr", "alpha_lr", "alpha_warmup_steps", "alpha_entropy_reg",
+        "distill_encoder_lr_mult", "q_lr", "gamma", "tau", "alpha",
         "autotune", "autotune_init_from_alpha", "pool_size", "eval_every",
         "num_evals", "test_adapt_steps", "test_adapt_lr", "distill_observation_skip",
         "distill_extra_steps", "collect_cosine_buffers",
@@ -186,19 +186,30 @@ def _continual_checkpoint_signatures(args, suite, condition, seed):
     return signatures
 
 
-def _scratch_checkpoint_signatures(args, suite, scratch_seeds, scratch_total_timesteps):
+def _scratch_variant(args, condition):
+    # Custom-model evaluation cannot infer architecture from an arbitrary label;
+    # expose one explicit choice there. Normal benchmark conditions are known.
+    if _CUSTOM_MODEL_MAP:
+        return getattr(args, "scratch_variant", "plain")
+    return scratch.variant_for_condition(
+        condition, bool(getattr(args, "distill_observation_skip", True))
+    )
+
+
+def _scratch_checkpoint_signatures(args, suite, condition, scratch_seeds, scratch_total_timesteps):
     save_root = getattr(args, "scratch_save_root", scratch.SCRATCH_SAVE_ROOT)
+    variant = _scratch_variant(args, condition)
     result = {}
     for task_id in sorted(set(args.task_sequence)):
         for seed in scratch_seeds:
             run_dir = scratch.scratch_checkpoint_dir(
-                save_root, suite, task_id, scratch_total_timesteps, seed
+                save_root, suite, task_id, scratch_total_timesteps, seed, variant
             )
-            result[f"task_{task_id}/seed_{seed}"] = checkpoint_signature(run_dir)
+            result[f"{variant}/task_{task_id}/seed_{seed}"] = checkpoint_signature(run_dir)
     return result
 
 
-def _validate_scratch_checkpoints(args, suite, scratch_seeds, scratch_total_timesteps):
+def _validate_scratch_checkpoints(args, suite, condition, scratch_seeds, scratch_total_timesteps):
     """Fail fast if FT would use missing or configuration-mismatched baselines.
 
     Cache signatures alone prevent stale JSON reuse, but direct metric calls must
@@ -210,14 +221,15 @@ def _validate_scratch_checkpoints(args, suite, scratch_seeds, scratch_total_time
     if _CUSTOM_MODEL_MAP:
         return
     save_root = getattr(args, "scratch_save_root", scratch.SCRATCH_SAVE_ROOT)
+    variant = _scratch_variant(args, condition)
     problems = []
     for task_id in sorted(set(args.task_sequence)):
         for seed in scratch_seeds:
             run_dir = scratch.scratch_checkpoint_dir(
-                save_root, suite, task_id, scratch_total_timesteps, seed
+                save_root, suite, task_id, scratch_total_timesteps, seed, variant
             )
             matches, reason = scratch.checkpoint_matches(
-                run_dir, suite, task_id, scratch_total_timesteps, seed, args
+                run_dir, suite, task_id, scratch_total_timesteps, seed, args, variant
             )
             if not matches:
                 problems.append(
@@ -492,7 +504,7 @@ def build_retention_matrix(args, suite, condition, seed, device):
         for eval_task in eval_task_ids:
             metrics = _evaluate_metric_checkpoint(
                 args, run_dir, suite, eval_task, args.retention_eval_episodes,
-                seed + seq_idx * 100_000, device,
+                seed, device,
             )
             for metric in rows:
                 rows[metric].append(metrics[metric])
@@ -510,19 +522,26 @@ def build_retention_matrix(args, suite, condition, seed, device):
 
 
 # ==========================================================================
-# Survey metrics: A_N, FG, BWT (cheap -- diagonal is free, last row is
-# evaluated once per UNIQUE task, not once per occurrence).
+# Survey metrics: A_N, FG, BWT. The diagonal and final row are both
+# re-evaluated from checkpoints under the same test-adaptation protocol.
 # ==========================================================================
-def compute_p_diagonal(args, suite, condition, seed):
-    """p_{i,i}: performance right when position i's own task just finished
-    training. Read directly from that position's TensorBoard log
-    (charts/test_success) -- no new evaluation, this is already logged.
-    Keys are strings (not int) so this survives a JSON cache round-trip
-    unchanged -- JSON always serializes dict keys as strings."""
+def compute_p_diagonal(args, suite, condition, seed, device):
+    """p_{i,i}: evaluate each just-trained checkpoint on its own task.
+
+    This uses the SAME test-time adaptation settings, deterministic policy
+    evaluation, episode count, and base episode seeds as p_{N,i}. Reading the
+    training-time TensorBoard scalar would compare an unadapted diagonal with an
+    adapted final row whenever --test-adapt-steps > 0.
+    """
     diagonal = {}
     for seq_idx, task_id in enumerate(args.task_sequence):
-        directory = event_dir(args.runs_root, suite, condition, seed, seq_idx, task_id)
-        diagonal[str(seq_idx)] = final_scalar(directory, "charts/test_success")
+        run_dir = checkpoint_dir(args.save_root, suite, condition, seed, seq_idx, task_id)
+        if not checkpoint_complete(run_dir):
+            raise FileNotFoundError(run_dir)
+        result = _evaluate_metric_checkpoint(
+            args, run_dir, suite, task_id, args.retention_eval_episodes, seed, device
+        )
+        diagonal[str(seq_idx)] = result["success"]
     return diagonal
 
 
@@ -542,7 +561,7 @@ def compute_p_final_row(args, suite, condition, seed, device):
     for task_id in sorted(set(args.task_sequence)):
         result = _evaluate_metric_checkpoint(
             args, final_run_dir, suite, task_id, args.retention_eval_episodes,
-            seed + 500_000, device,
+            seed, device,
         )
         row[str(task_id)] = result["success"]
     return row
@@ -616,6 +635,7 @@ def compute_forward_transfer_success(args, suite, condition, seed, scratch_seeds
     after sequence position 0. Repeated tasks measure relearning/savings, not FT."""
     per_position = []
     per_position_index = []
+    scratch_variant = _scratch_variant(args, condition)
     for seq_idx, task_id in _first_unseen_positions(args.task_sequence):
         run_steps, run_values = load_scalar(
             event_dir(args.runs_root, suite, condition, seed, seq_idx, task_id),
@@ -627,7 +647,9 @@ def compute_forward_transfer_success(args, suite, condition, seed, scratch_seeds
 
         baseline_aucs = []
         for b_seed in scratch_seeds:
-            b_dir = scratch.scratch_event_dir(args.runs_root, suite, task_id, scratch_total_timesteps, b_seed)
+            b_dir = scratch.scratch_event_dir(
+                args.runs_root, suite, task_id, scratch_total_timesteps, b_seed, scratch_variant
+            )
             b_steps, b_values = load_scalar(b_dir, "charts/test_success")
             b_auc = _auc(b_steps, b_values)
             if b_auc is not None:
@@ -654,6 +676,7 @@ def compute_forward_transfer_return(args, suite, condition, seed, scratch_seeds,
     same first-unseen-task positions as compute_forward_transfer_success."""
     per_position = []
     per_position_index = []
+    scratch_variant = _scratch_variant(args, condition)
     for seq_idx, task_id in _first_unseen_positions(args.task_sequence):
         run_steps, run_values = load_scalar(
             event_dir(args.runs_root, suite, condition, seed, seq_idx, task_id),
@@ -665,7 +688,9 @@ def compute_forward_transfer_return(args, suite, condition, seed, scratch_seeds,
 
         baseline_integrals = []
         for b_seed in scratch_seeds:
-            b_dir = scratch.scratch_event_dir(args.runs_root, suite, task_id, scratch_total_timesteps, b_seed)
+            b_dir = scratch.scratch_event_dir(
+                args.runs_root, suite, task_id, scratch_total_timesteps, b_seed, scratch_variant
+            )
             b_steps, b_values = load_scalar(b_dir, "charts/test_episodic_return")
             if b_steps.size >= 2:
                 baseline_integrals.append(float(_trapz(b_values, b_steps)))
@@ -698,7 +723,7 @@ def compute_survey_metrics(args, suite, condition, seed, device, scratch_seeds, 
     # considering a cached metric file so direct callers cannot silently mix
     # incompatible experiments.
     _validate_scratch_checkpoints(
-        args, suite, scratch_seeds, scratch_total_timesteps
+        args, suite, condition, scratch_seeds, scratch_total_timesteps
     )
 
     cache = survey_metrics_cache_path(args, suite, condition, seed)
@@ -714,7 +739,7 @@ def compute_survey_metrics(args, suite, condition, seed, device, scratch_seeds, 
         }
         expected_checkpoint_signatures = _continual_checkpoint_signatures(args, suite, condition, seed)
         expected_scratch_signatures = _scratch_checkpoint_signatures(
-            args, suite, scratch_seeds, scratch_total_timesteps
+            args, suite, condition, scratch_seeds, scratch_total_timesteps
         )
         if (
             cached.get("cache_schema_version") == CACHE_SCHEMA_VERSION
@@ -727,7 +752,7 @@ def compute_survey_metrics(args, suite, condition, seed, device, scratch_seeds, 
         ):
             return cached
 
-    diagonal = compute_p_diagonal(args, suite, condition, seed)
+    diagonal = compute_p_diagonal(args, suite, condition, seed, device)
     final_row = compute_p_final_row(args, suite, condition, seed, device)
     fg_bwt = compute_fg_bwt(diagonal, final_row, args.task_sequence)
     ft_success = compute_forward_transfer_success(args, suite, condition, seed, scratch_seeds, scratch_total_timesteps)
@@ -744,7 +769,7 @@ def compute_survey_metrics(args, suite, condition, seed, device, scratch_seeds, 
         },
         "checkpoint_signatures": _continual_checkpoint_signatures(args, suite, condition, seed),
         "scratch_checkpoint_signatures": _scratch_checkpoint_signatures(
-            args, suite, scratch_seeds, scratch_total_timesteps
+            args, suite, condition, scratch_seeds, scratch_total_timesteps
         ),
         "suite": suite,
         "condition": condition,
