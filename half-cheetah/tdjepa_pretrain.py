@@ -85,7 +85,8 @@ def make_pretrain_env(task_suite: str, velocity: float, wind: Tuple[float, float
     if task_suite.endswith("wind_vel"):
         kwargs["wind"] = tuple(wind)
 
-    env = TaskConditionedObservationWrapper(env_cls(**kwargs), task)
+    # Task conditioning disabled for pretraining as well.
+    env = env_cls(**kwargs)
     return gym.wrappers.TimeLimit(env, max_episode_steps=1000)
 
 

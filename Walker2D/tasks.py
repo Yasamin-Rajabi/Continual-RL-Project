@@ -1,13 +1,8 @@
-"""Deterministic continual Walker2D dynamics benchmark.
+"""Continual Walker2D dynamics tasks with NO appended task context.
 
-The primary suite, ``walker2d_dynamics``, keeps one target velocity and changes
-only the robot/contact dynamics.  This is intentional: each specialist solves
-the same semantic task, while different valid gaits make parameter averaging a
-meaningful consolidation stress test.
-
-Every task is wrapped with ``TaskConditionedObservationWrapper``.  Walker2d-v5
-has a 17-D raw observation; six task-conditioning values are appended, giving a
-23-D observation and 6-D continuous action space for every task.
+Task parameters still configure the environment and reward. They are not part
+of actor/critic observations. Metadata in info and replay lineage is used for
+logging only and is never concatenated to the network input.
 """
 from __future__ import annotations
 
@@ -116,7 +111,8 @@ def get_task(task_id: int, task_suite: str = "walker2d_dynamics", render: bool =
         actuator_strength_scale=task.actuator_strength_scale,
         render_mode="human" if render else None,
     )
-    env = TaskConditionedObservationWrapper(env, task)
+    # Disabled: dynamics/context must not be actor or critic inputs.
+    # env = TaskConditionedObservationWrapper(env, task)
 
     # Direct class construction bypasses gym.make's registry TimeLimit.
     return gym.wrappers.TimeLimit(env, max_episode_steps=1000)
@@ -145,13 +141,7 @@ if __name__ == "__main__":
                 assert np.all(np.isfinite(obs2)), (suite, idx, "step obs")
                 assert np.isfinite(reward), (suite, idx, reward)
                 assert "velocity_error" in step_info and "success" in step_info
-                tail = obs[-6:]
-                expected = np.asarray([
-                    spec.target_velocity, spec.right_mass_scale, spec.left_mass_scale,
-                    spec.foot_friction_scale, spec.joint_damping_scale,
-                    spec.actuator_strength_scale,
-                ], dtype=np.float32)
-                assert np.allclose(tail, expected), (suite, idx, tail, expected)
+                assert obs.shape == (17,), (suite, idx, obs.shape)
                 shapes.add((
                     int(np.prod(env.observation_space.shape)),
                     int(np.prod(env.action_space.shape)),
@@ -159,5 +149,5 @@ if __name__ == "__main__":
                 env.close()
             assert len(shapes) == 1, f"{suite}: inconsistent obs/action shapes {shapes}"
             obs_dim, act_dim = shapes.pop()
-            assert (obs_dim, act_dim) == (23, 6), (suite, obs_dim, act_dim)
+            assert (obs_dim, act_dim) == (17, 6), (suite, obs_dim, act_dim)
             print(f"[ok] {suite}: obs={obs_dim}, act={act_dim}")

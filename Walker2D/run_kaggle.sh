@@ -2,8 +2,9 @@
 # Kaggle entrypoint for the Walker2D continual-dynamics benchmark.
 #
 # Default workflow mirrors the revised HalfCheetah directory: no encoder
-# pretraining, --train-shared enabled, and Baseline + Combined run together.
+# pretraining, shared encoder frozen after the root task, and Baseline + Combined run together.
 set -euo pipefail
+COMPOSITION_SPACES="${COMPOSITION_SPACES:-parameter policy}"
 cd "$(dirname "$0")"
 
 OUT="${KAGGLE_WORKING:-/kaggle/working}"
@@ -45,23 +46,24 @@ step_baselines() {
     python3 scratch_baselines.py \
         --task-suites $SUITES \
         --seeds $SCRATCH_SEEDS \
-        --variants plain distill_skip \
+        --variants plain \
         --total-timesteps "$TOTAL_TIMESTEPS" \
         --save-root "$OUT/scratch_models" \
         --runs-root "$OUT/runs" \
         --analysis-root "$OUT/analysis_scratch" \
-        --train-shared \
+        --no-train-shared \
         2>&1 | tee -a "$OUT/logs/walker2d_baselines.log"
 }
 
 step_continual() {
     python3 run_continual_benchmark.py \
+        --composition-spaces $COMPOSITION_SPACES \
         --task-suites $SUITES \
         --seeds $SEEDS \
         --scratch-seeds $SCRATCH_SEEDS \
         --total-timesteps "$TOTAL_TIMESTEPS" \
         --condition-index 1 4 \
-        --train-shared \
+        --no-train-shared \
         --save-root "$OUT/agents" \
         --runs-root "$OUT/runs" \
         --analysis-root "$OUT/analysis" \
@@ -75,6 +77,7 @@ step_pilot() {
     # actual pool merge. This validates training/merging without committing to
     # the full 12-task paper sequence or scratch-baseline suite.
     python3 run_continual_benchmark.py \
+        --composition-spaces $COMPOSITION_SPACES \
         --task-suites walker2d_dynamics \
         --seeds 101 \
         --task-sequence 0 1 2 3 \
@@ -93,7 +96,7 @@ step_pilot() {
         --distill-epochs 2 \
         --analysis-log-every 2000 \
         --condition-index 1 4 \
-        --train-shared \
+        --no-train-shared \
         --skip-retention \
         --skip-survey-metrics \
         --save-root "$OUT/pilot_agents" \

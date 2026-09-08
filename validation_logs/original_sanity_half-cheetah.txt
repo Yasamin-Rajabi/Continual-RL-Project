@@ -1,0 +1,197 @@
+2026-09-08 13:57:22.003 | INFO     | cka_rl:__init__:159 - shared alpha: None
+2026-09-08 13:57:22.003 | INFO     | cka_rl:__init__:205 - Initializing root shared encoder from scratch
+2026-09-08 13:57:22.604 | INFO     | cka_rl:__init__:159 - shared alpha: Parameter containing:
+tensor([0.0010], requires_grad=True)
+2026-09-08 13:57:22.604 | INFO     | cka_rl:__init__:197 - Loading frozen encoder from base /tmp/cka_pool_sanity/classic_cka_False_False/task0
+2026-09-08 13:57:22.605 | INFO     | cka_rl:__init__:221 - Shared encoder frozen
+2026-09-08 13:57:22.615 | INFO     | cka_rl:__init__:159 - shared alpha: Parameter containing:
+tensor([-0.0168, -0.0902], requires_grad=True)
+2026-09-08 13:57:22.615 | INFO     | cka_rl:__init__:197 - Loading frozen encoder from base /tmp/cka_pool_sanity/classic_cka_False_False/task0
+2026-09-08 13:57:22.615 | INFO     | cka_rl:__init__:221 - Shared encoder frozen
+2026-09-08 13:57:22.624 | INFO     | cka_rl:_select_cosine_pair:393 - [cosine merge] pair=(0,1) cosine=0.053079
+2026-09-08 13:57:22.629 | INFO     | cka_rl:__init__:159 - shared alpha: Parameter containing:
+tensor([-0.3627, -0.4871], requires_grad=True)
+2026-09-08 13:57:22.629 | INFO     | cka_rl:__init__:197 - Loading frozen encoder from base /tmp/cka_pool_sanity/classic_cka_False_False/task0
+2026-09-08 13:57:22.630 | INFO     | cka_rl:__init__:221 - Shared encoder frozen
+2026-09-08 13:57:22.631 | INFO     | cka_rl:__init__:159 - shared alpha: None
+2026-09-08 13:57:22.631 | INFO     | cka_rl:__init__:205 - Initializing root shared encoder from scratch
+2026-09-08 13:57:22.640 | INFO     | cka_rl:__init__:159 - shared alpha: Parameter containing:
+tensor([0.0010], requires_grad=True)
+2026-09-08 13:57:22.640 | INFO     | cka_rl:__init__:197 - Loading frozen encoder from base /tmp/cka_pool_sanity/classic_cka_True_False/task0
+2026-09-08 13:57:22.640 | INFO     | cka_rl:__init__:221 - Shared encoder frozen
+2026-09-08 13:57:22.649 | INFO     | cka_rl:__init__:159 - shared alpha: Parameter containing:
+tensor([ 0.4081, -0.3746], requires_grad=True)
+2026-09-08 13:57:22.649 | INFO     | cka_rl:__init__:197 - Loading frozen encoder from base /tmp/cka_pool_sanity/classic_cka_True_False/task0
+2026-09-08 13:57:22.650 | INFO     | cka_rl:__init__:221 - Shared encoder frozen
+2026-09-08 13:57:22.660 | INFO     | cka_rl:_select_behavioral_pair:473 - [behavioral merge] pair=(0,2) symmetric_KL=0.029522 p95=0.077751 max=0.085611 over 64 parent-reference states
+2026-09-08 13:57:22.671 | INFO     | cka_rl:_distill_pair:688 - [policy distill] rows=128 best_epoch=0 selected_epoch=0 train_KL=0.007209 test_KL=0.007539135403931141 train_p95=0.016428 test_p95=0.01744415983557701
+2026-09-08 13:57:22.676 | INFO     | cka_rl:__init__:159 - shared alpha: Parameter containing:
+tensor([ 0.0232, -0.0776], requires_grad=True)
+2026-09-08 13:57:22.676 | INFO     | cka_rl:__init__:197 - Loading frozen encoder from base /tmp/cka_pool_sanity/classic_cka_True_False/task0
+2026-09-08 13:57:22.676 | INFO     | cka_rl:__init__:221 - Shared encoder frozen
+2026-09-08 13:57:22.678 | INFO     | cka_rl:__init__:159 - shared alpha: None
+2026-09-08 13:57:22.678 | INFO     | cka_rl:__init__:161 - shared alpha_mass: None
+2026-09-08 13:57:22.678 | INFO     | cka_rl:__init__:205 - Initializing root shared encoder from scratch
+2026-09-08 13:57:22.687 | INFO     | cka_rl:__init__:159 - shared alpha: Parameter containing:
+tensor([0.0010], requires_grad=True)
+2026-09-08 13:57:22.687 | INFO     | cka_rl:__init__:161 - shared alpha_mass: Parameter containing:
+tensor([2.9444], requires_grad=True)
+2026-09-08 13:57:22.687 | INFO     | cka_rl:__init__:197 - Loading frozen encoder from base /tmp/cka_pool_sanity/weight_delta_False_True/task0
+2026-09-08 13:57:22.687 | INFO     | cka_rl:__init__:221 - Shared encoder frozen
+2026-09-08 13:57:22.696 | INFO     | cka_rl:__init__:159 - shared alpha: Parameter containing:
+tensor([-0.0853,  0.4822], requires_grad=True)
+2026-09-08 13:57:22.697 | INFO     | cka_rl:__init__:161 - shared alpha_mass: Parameter containing:
+tensor([2.9444], requires_grad=True)
+2026-09-08 13:57:22.697 | INFO     | cka_rl:__init__:197 - Loading frozen encoder from base /tmp/cka_pool_sanity/weight_delta_False_True/task0
+2026-09-08 13:57:22.697 | INFO     | cka_rl:__init__:221 - Shared encoder frozen
+2026-09-08 13:57:22.705 | INFO     | cka_rl:_select_cosine_pair:393 - [cosine merge] pair=(0,1) cosine=0.996952
+2026-09-08 13:57:22.711 | INFO     | cka_rl:__init__:159 - shared alpha: Parameter containing:
+tensor([-0.4911, -0.1218], requires_grad=True)
+2026-09-08 13:57:22.711 | INFO     | cka_rl:__init__:161 - shared alpha_mass: Parameter containing:
+tensor([2.9444], requires_grad=True)
+2026-09-08 13:57:22.711 | INFO     | cka_rl:__init__:197 - Loading frozen encoder from base /tmp/cka_pool_sanity/weight_delta_False_True/task0
+2026-09-08 13:57:22.712 | INFO     | cka_rl:__init__:221 - Shared encoder frozen
+2026-09-08 13:57:22.713 | INFO     | cka_rl:__init__:159 - shared alpha: None
+2026-09-08 13:57:22.713 | INFO     | cka_rl:__init__:161 - shared alpha_mass: None
+2026-09-08 13:57:22.713 | INFO     | cka_rl:__init__:205 - Initializing root shared encoder from scratch
+2026-09-08 13:57:22.722 | INFO     | cka_rl:__init__:159 - shared alpha: Parameter containing:
+tensor([0.0010], requires_grad=True)
+2026-09-08 13:57:22.722 | INFO     | cka_rl:__init__:161 - shared alpha_mass: Parameter containing:
+tensor([2.9444], requires_grad=True)
+2026-09-08 13:57:22.722 | INFO     | cka_rl:__init__:197 - Loading frozen encoder from base /tmp/cka_pool_sanity/weight_delta_True_True/task0
+2026-09-08 13:57:22.722 | INFO     | cka_rl:__init__:221 - Shared encoder frozen
+2026-09-08 13:57:22.732 | INFO     | cka_rl:__init__:159 - shared alpha: Parameter containing:
+tensor([-0.7820,  0.1918], requires_grad=True)
+2026-09-08 13:57:22.732 | INFO     | cka_rl:__init__:161 - shared alpha_mass: Parameter containing:
+tensor([2.9444], requires_grad=True)
+2026-09-08 13:57:22.732 | INFO     | cka_rl:__init__:197 - Loading frozen encoder from base /tmp/cka_pool_sanity/weight_delta_True_True/task0
+2026-09-08 13:57:22.732 | INFO     | cka_rl:__init__:221 - Shared encoder frozen
+2026-09-08 13:57:22.744 | INFO     | cka_rl:_select_behavioral_pair:473 - [behavioral merge] pair=(0,1) symmetric_KL=0.041139 p95=0.112726 max=0.159190 over 64 parent-reference states
+2026-09-08 13:57:22.754 | INFO     | cka_rl:_distill_pair:688 - [policy distill] rows=128 best_epoch=0 selected_epoch=0 train_KL=0.009593 test_KL=0.007883645594120026 train_p95=0.023533 test_p95=0.014763460494577885
+2026-09-08 13:57:22.760 | INFO     | cka_rl:__init__:159 - shared alpha: Parameter containing:
+tensor([ 0.2670, -0.5435], requires_grad=True)
+2026-09-08 13:57:22.760 | INFO     | cka_rl:__init__:161 - shared alpha_mass: Parameter containing:
+tensor([2.9444], requires_grad=True)
+2026-09-08 13:57:22.760 | INFO     | cka_rl:__init__:197 - Loading frozen encoder from base /tmp/cka_pool_sanity/weight_delta_True_True/task0
+2026-09-08 13:57:22.761 | INFO     | cka_rl:__init__:221 - Shared encoder frozen
+2026-09-08 13:57:22.762 | INFO     | cka_rl:__init__:159 - shared alpha: None
+2026-09-08 13:57:22.763 | INFO     | cka_rl:__init__:205 - Initializing root shared encoder from scratch
+2026-09-08 13:57:22.767 | INFO     | cka_rl:_select_behavioral_pair:473 - [behavioral merge] pair=(0,1) symmetric_KL=0.000000 p95=0.000000 max=0.000000 over 96 parent-reference states
+2026-09-08 13:57:22.768 | INFO     | cka_rl:__init__:159 - shared alpha: None
+2026-09-08 13:57:22.768 | INFO     | cka_rl:__init__:161 - shared alpha_mass: None
+2026-09-08 13:57:22.768 | INFO     | cka_rl:__init__:205 - Initializing root shared encoder from scratch
+2026-09-08 13:57:22.777 | INFO     | cka_rl:__init__:159 - shared alpha: Parameter containing:
+tensor([0.0010], requires_grad=True)
+2026-09-08 13:57:22.777 | INFO     | cka_rl:__init__:161 - shared alpha_mass: Parameter containing:
+tensor([2.9444], requires_grad=True)
+2026-09-08 13:57:22.777 | INFO     | cka_rl:__init__:201 - Loading shared encoder from /tmp/cka_pool_sanity/alpha_mass_False/task0
+2026-09-08 13:57:22.778 | INFO     | cka_rl:__init__:221 - Shared encoder frozen
+2026-09-08 13:57:22.779 | INFO     | cka_rl:__init__:159 - shared alpha: Parameter containing:
+tensor([0.0010], requires_grad=True)
+2026-09-08 13:57:22.780 | INFO     | cka_rl:__init__:161 - shared alpha_mass: Parameter containing:
+tensor([1.], requires_grad=True)
+2026-09-08 13:57:22.780 | INFO     | cka_rl:__init__:201 - Loading shared encoder from /tmp/cka_pool_sanity/alpha_mass_False/task0
+2026-09-08 13:57:22.780 | INFO     | cka_rl:__init__:221 - Shared encoder frozen
+2026-09-08 13:57:22.781 | INFO     | cka_rl:__init__:159 - shared alpha: None
+2026-09-08 13:57:22.781 | INFO     | cka_rl:__init__:161 - shared alpha_mass: None
+2026-09-08 13:57:22.781 | INFO     | cka_rl:__init__:205 - Initializing root shared encoder from scratch
+2026-09-08 13:57:22.791 | INFO     | cka_rl:__init__:159 - shared alpha: Parameter containing:
+tensor([0.0010], requires_grad=True)
+2026-09-08 13:57:22.791 | INFO     | cka_rl:__init__:161 - shared alpha_mass: Parameter containing:
+tensor([2.9444], requires_grad=True)
+2026-09-08 13:57:22.791 | INFO     | cka_rl:__init__:201 - Loading shared encoder from /tmp/cka_pool_sanity/alpha_mass_True/task0
+2026-09-08 13:57:22.791 | INFO     | cka_rl:__init__:221 - Shared encoder frozen
+2026-09-08 13:57:22.797 | INFO     | cka_rl:__init__:159 - shared alpha: Parameter containing:
+tensor([0.0010], requires_grad=True)
+2026-09-08 13:57:22.797 | INFO     | cka_rl:__init__:161 - shared alpha_mass: Parameter containing:
+tensor([1.], requires_grad=True)
+2026-09-08 13:57:22.797 | INFO     | cka_rl:__init__:201 - Loading shared encoder from /tmp/cka_pool_sanity/alpha_mass_True/task0
+2026-09-08 13:57:22.797 | INFO     | cka_rl:__init__:221 - Shared encoder frozen
+2026-09-08 13:57:22.799 | INFO     | cka_rl:__init__:159 - shared alpha: None
+2026-09-08 13:57:22.800 | INFO     | cka_rl:__init__:205 - Initializing root shared encoder from scratch
+2026-09-08 13:57:22.812 | INFO     | cka_rl:__init__:159 - shared alpha: Parameter containing:
+tensor([0.0010], requires_grad=True)
+2026-09-08 13:57:22.812 | INFO     | cka_rl:__init__:189 - Loading latest trainable encoder from /tmp/cka_pool_sanity/encoder_latest_check/task0
+2026-09-08 13:57:22.819 | INFO     | cka_rl:__init__:159 - shared alpha: Parameter containing:
+tensor([0.0010], requires_grad=True)
+2026-09-08 13:57:22.819 | INFO     | cka_rl:__init__:189 - Loading latest trainable encoder from /tmp/cka_pool_sanity/encoder_latest_check/task1
+2026-09-08 13:57:22.822 | INFO     | cka_rl:__init__:159 - shared alpha: None
+2026-09-08 13:57:22.822 | INFO     | cka_rl:__init__:205 - Initializing root shared encoder from scratch
+2026-09-08 13:57:22.823 | INFO     | cka_rl:__init__:159 - shared alpha: None
+2026-09-08 13:57:22.823 | INFO     | cka_rl:__init__:205 - Initializing root shared encoder from scratch
+2026-09-08 13:57:22.823 | INFO     | cka_rl:__init__:221 - Shared encoder frozen
+2026-09-08 13:57:22.825 | INFO     | cka_rl:__init__:159 - shared alpha: None
+2026-09-08 13:57:22.825 | INFO     | cka_rl:__init__:193 - Loading pretrained encoder from /tmp/cka_pool_sanity/encoder_flags/linear_fc.pt
+2026-09-08 13:57:22.825 | INFO     | cka_rl:__init__:221 - Shared encoder frozen
+2026-09-08 13:57:22.826 | INFO     | cka_rl:__init__:159 - shared alpha: None
+2026-09-08 13:57:22.826 | INFO     | cka_rl:__init__:193 - Loading pretrained encoder from /tmp/cka_pool_sanity/encoder_flags/linear_fc.pt
+2026-09-08 13:57:22.827 | INFO     | cka_rl:__init__:159 - shared alpha: None
+2026-09-08 13:57:22.827 | INFO     | cka_rl:__init__:205 - Initializing root shared encoder from scratch
+2026-09-08 13:57:22.838 | INFO     | cka_rl:__init__:159 - shared alpha: Parameter containing:
+tensor([0.0010], requires_grad=True)
+2026-09-08 13:57:22.838 | INFO     | cka_rl:__init__:197 - Loading frozen encoder from base /tmp/cka_pool_sanity/distill_last_epoch/task0
+2026-09-08 13:57:22.839 | INFO     | cka_rl:__init__:221 - Shared encoder frozen
+2026-09-08 13:57:22.846 | INFO     | cka_rl:__init__:159 - shared alpha: Parameter containing:
+tensor([ 0.3521, -0.0536], requires_grad=True)
+2026-09-08 13:57:22.846 | INFO     | cka_rl:__init__:197 - Loading frozen encoder from base /tmp/cka_pool_sanity/distill_last_epoch/task0
+2026-09-08 13:57:22.847 | INFO     | cka_rl:__init__:221 - Shared encoder frozen
+2026-09-08 13:57:22.852 | INFO     | cka_rl:_select_behavioral_pair:473 - [behavioral merge] pair=(0,2) symmetric_KL=0.412938 p95=0.753461 max=1.296996 over 32 parent-reference states
+2026-09-08 13:57:22.860 | INFO     | cka_rl:_distill_pair:688 - [policy distill] rows=64 best_epoch=1 selected_epoch=2 train_KL=0.082064 test_KL=0.09503369778394699 train_p95=0.188467 test_p95=0.23508243262767792
+2026-09-08 13:57:22.862 | INFO     | cka_rl:__init__:159 - shared alpha: None
+2026-09-08 13:57:22.862 | INFO     | cka_rl:__init__:205 - Initializing root shared encoder from scratch
+2026-09-08 13:57:22.863 | INFO     | cka_rl:__init__:159 - shared alpha: None
+2026-09-08 13:57:22.863 | INFO     | cka_rl:__init__:205 - Initializing root shared encoder from scratch
+2026-09-08 13:57:22.864 | INFO     | cka_rl:__init__:159 - shared alpha: None
+2026-09-08 13:57:22.864 | INFO     | cka_rl:__init__:205 - Initializing root shared encoder from scratch
+2026-09-08 13:57:22.875 | INFO     | cka_rl:__init__:159 - shared alpha: Parameter containing:
+tensor([0.0010], requires_grad=True)
+2026-09-08 13:57:22.875 | INFO     | cka_rl:__init__:201 - Loading shared encoder from /tmp/cka_pool_sanity/friend_scale_modes/task0
+2026-09-08 13:57:22.875 | INFO     | cka_rl:__init__:221 - Shared encoder frozen
+2026-09-08 13:57:22.878 | INFO     | cka_rl:__init__:159 - shared alpha: Parameter containing:
+tensor([0.0010], requires_grad=True)
+2026-09-08 13:57:22.878 | INFO     | cka_rl:__init__:201 - Loading shared encoder from /tmp/cka_pool_sanity/friend_scale_modes/task0
+2026-09-08 13:57:22.879 | INFO     | cka_rl:__init__:221 - Shared encoder frozen
+
+=== chain fusion=classic_cka distillation=False alpha_mass=False ===
+  root base + v1 seeded OK
+  shared alpha + frozen encoder + no-merge finalize OK
+  aligned merge OK: pair=(0,1), cosine=0.0530792
+  post-merge inheritance and forward shapes OK
+
+=== chain fusion=classic_cka distillation=True alpha_mass=False ===
+  root base + v1 seeded OK
+  shared alpha + frozen encoder + no-merge finalize OK
+  aligned merge OK: pair=(0,2), SKL=0.0295219
+  post-merge inheritance and forward shapes OK
+
+=== chain fusion=weight_delta distillation=False alpha_mass=True ===
+  root base + v1 seeded OK
+  shared alpha + frozen encoder + no-merge finalize OK
+  aligned merge OK: pair=(0,1), cosine=0.996952
+  post-merge inheritance and forward shapes OK
+
+=== chain fusion=weight_delta distillation=True alpha_mass=True ===
+  root base + v1 seeded OK
+  shared alpha + frozen encoder + no-merge finalize OK
+  aligned merge OK: pair=(0,1), SKL=0.0411385
+  post-merge inheritance and forward shapes OK
+
+=== explicit output-space pair-selection check ===
+  lowest output KL selects functionally identical pair despite different weights OK
+
+=== four-case alpha-mass restriction check ===
+  alpha_mass restriction + positive/default and legacy/unconstrained ablations OK
+
+=== explicit trainable-encoder continuation check ===
+  train_shared=True loads latest encoder instead of resetting to root OK
+
+=== shared-encoder policy/architecture checks ===
+  root/frozen/pretrained policies + architecture mismatch guard OK
+
+=== distillation model-selection ablation check ===
+  --no-distill-select-best-val keeps final epoch OK
+
+=== friend-method policy-control checks ===
+  observation-skip + learned/fixed alpha-scale modes OK
+
+*** ALL CHECKS PASSED ***

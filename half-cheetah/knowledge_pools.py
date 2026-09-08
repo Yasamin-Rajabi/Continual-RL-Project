@@ -44,7 +44,9 @@ class HeadPool(nn.Module):
                 "available with fusion_mode='weight_delta'."
             )
 
-        self.format_version = 2
+        self.format_version = 3
+        self.force_unit_mass = False
+        self.composition_space = "parameter"
         self.head_type = head_type
         self.act_dim = int(act_dim)
         self.hidden_dim = int(hidden_dim)
@@ -108,20 +110,21 @@ class HeadPool(nn.Module):
         self.alpha_scale = alpha_scale
         # alpha_mass is stored as an unconstrained RAW parameter.  Use
         # effective_alpha_mass() whenever it participates in the policy so the
-        # semantic mass is strictly positive while still initializing at 1.0.
+        # semantic mass is bounded to [0, 1] (initialized at 0.95).
         self.alpha_mass = alpha_mass
 
     def effective_alpha_mass(self):
         if self.alpha_mass is None:
             return None
+        if getattr(self, "force_unit_mass", False):
+            return torch.ones_like(self.alpha_mass)
         if not self.constrain_alpha_mass:
             # Legacy/ablation behaviour: the learned scalar may become zero or
             # negative. Kept behind a flag so the stabilization can be isolated.
             return self.alpha_mass
-        # softplus(raw) is strictly positive. Dividing by softplus(1) keeps
-        # raw=1 (the existing initialization) exactly equivalent to mass=1.
-        normalizer = F.softplus(torch.ones_like(self.alpha_mass))
-        return F.softplus(self.alpha_mass) / normalizer
+        # A finite logit keeps the gate differentiable; warmup uses an exact
+        # value of one without setting the parameter to +infinity.
+        return torch.sigmoid(self.alpha_mass)
 
     def _historical(self):
         if not self.pool:
@@ -186,9 +189,9 @@ class HeadPool(nn.Module):
     def inherit_pool_from(self, latest_pool: "HeadPool"):
         if getattr(latest_pool, "format_version", 1) != self.format_version:
             raise RuntimeError(
-                "Checkpoint uses the legacy independent-head pool format. "
-                "Start a fresh continual chain with this version so behavioral-KL "
-                "pair alignment is guaranteed."
+                "Checkpoint predates task-blind observations and sigmoid/policy-space support. "
+                "Start a fresh continual chain with this version; do not reuse older weights. "
+                "Pool alignment and gate semantics must match."
             )
         self.pool = []
         for entry in latest_pool.pool:

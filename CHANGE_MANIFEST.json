@@ -1,0 +1,578 @@
+[
+  {
+    "file": ".gitattributes",
+    "status": "added"
+  },
+  {
+    "file": "EVALUATION_GUIDE.md",
+    "status": "added"
+  },
+  {
+    "file": "Hopper/README.md",
+    "status": "added"
+  },
+  {
+    "file": "Hopper/analysis_logging.py",
+    "status": "added"
+  },
+  {
+    "file": "Hopper/checkpoint_evaluation.py",
+    "status": "added"
+  },
+  {
+    "file": "Hopper/cka_rl.py",
+    "status": "added"
+  },
+  {
+    "file": "Hopper/experiment_identity.py",
+    "status": "added"
+  },
+  {
+    "file": "Hopper/hopper_envs.py",
+    "status": "added"
+  },
+  {
+    "file": "Hopper/knowledge_pools.py",
+    "status": "added"
+  },
+  {
+    "file": "Hopper/metrics.py",
+    "status": "added"
+  },
+  {
+    "file": "Hopper/plots.py",
+    "status": "added"
+  },
+  {
+    "file": "Hopper/policy_composition.py",
+    "status": "added"
+  },
+  {
+    "file": "Hopper/policy_space.py",
+    "status": "added"
+  },
+  {
+    "file": "Hopper/policy_utils.py",
+    "status": "added"
+  },
+  {
+    "file": "Hopper/requirements-dev.txt",
+    "status": "added"
+  },
+  {
+    "file": "Hopper/requirements.txt",
+    "status": "added"
+  },
+  {
+    "file": "Hopper/run_comparison.sh",
+    "status": "added"
+  },
+  {
+    "file": "Hopper/run_continual_benchmark.py",
+    "status": "added"
+  },
+  {
+    "file": "Hopper/run_eval_custom.py",
+    "status": "added"
+  },
+  {
+    "file": "Hopper/run_sac.py",
+    "status": "added"
+  },
+  {
+    "file": "Hopper/sanity_check_pool.py",
+    "status": "added"
+  },
+  {
+    "file": "Hopper/scratch_baselines.py",
+    "status": "added"
+  },
+  {
+    "file": "Hopper/shared_arch.py",
+    "status": "added"
+  },
+  {
+    "file": "Hopper/tasks.py",
+    "status": "added"
+  },
+  {
+    "file": "Hopper/training_protocol.py",
+    "status": "added"
+  },
+  {
+    "file": "IMPLEMENTATION_NOTES.md",
+    "status": "added"
+  },
+  {
+    "file": "README_ORIGINAL.md",
+    "status": "added"
+  },
+  {
+    "file": "Readme.md",
+    "status": "modified"
+  },
+  {
+    "file": "VALIDATION_REPORT.md",
+    "status": "added"
+  },
+  {
+    "file": "Walker2D/EXPERIMENT_FLAGS.md",
+    "status": "modified"
+  },
+  {
+    "file": "Walker2D/README.md",
+    "status": "modified"
+  },
+  {
+    "file": "Walker2D/analysis_logging.py",
+    "status": "modified"
+  },
+  {
+    "file": "Walker2D/checkpoint_evaluation.py",
+    "status": "added"
+  },
+  {
+    "file": "Walker2D/cka_rl.py",
+    "status": "modified"
+  },
+  {
+    "file": "Walker2D/experiment_identity.py",
+    "status": "modified"
+  },
+  {
+    "file": "Walker2D/job.sh",
+    "status": "modified"
+  },
+  {
+    "file": "Walker2D/knowledge_pools.py",
+    "status": "modified"
+  },
+  {
+    "file": "Walker2D/local_smoke_test.sh",
+    "status": "modified"
+  },
+  {
+    "file": "Walker2D/metrics.py",
+    "status": "modified"
+  },
+  {
+    "file": "Walker2D/policy_composition.py",
+    "status": "added"
+  },
+  {
+    "file": "Walker2D/policy_space.py",
+    "status": "added"
+  },
+  {
+    "file": "Walker2D/requirements-dev.txt",
+    "status": "added"
+  },
+  {
+    "file": "Walker2D/run_comparison.sh",
+    "status": "added"
+  },
+  {
+    "file": "Walker2D/run_continual_benchmark.py",
+    "status": "modified"
+  },
+  {
+    "file": "Walker2D/run_eval_custom.py",
+    "status": "modified"
+  },
+  {
+    "file": "Walker2D/run_kaggle.sh",
+    "status": "modified"
+  },
+  {
+    "file": "Walker2D/run_recommended.sh",
+    "status": "modified"
+  },
+  {
+    "file": "Walker2D/run_sac.py",
+    "status": "modified"
+  },
+  {
+    "file": "Walker2D/scratch_baselines.py",
+    "status": "modified"
+  },
+  {
+    "file": "Walker2D/tasks.py",
+    "status": "modified"
+  },
+  {
+    "file": "Walker2D/tdjepa_pretrain.py",
+    "status": "modified"
+  },
+  {
+    "file": "Walker2D/training_protocol.py",
+    "status": "added"
+  },
+  {
+    "file": "Walker2D/walker2d_envs.py",
+    "status": "modified"
+  },
+  {
+    "file": "Walker2D/walker2d_smoke.py",
+    "status": "modified"
+  },
+  {
+    "file": "ant/run_kaggle.sh",
+    "status": "modified"
+  },
+  {
+    "file": "half-cheetah/EXPERIMENT_FLAGS.md",
+    "status": "modified"
+  },
+  {
+    "file": "half-cheetah/analysis_logging.py",
+    "status": "modified"
+  },
+  {
+    "file": "half-cheetah/checkpoint_evaluation.py",
+    "status": "added"
+  },
+  {
+    "file": "half-cheetah/cka_rl.py",
+    "status": "modified"
+  },
+  {
+    "file": "half-cheetah/experiment_identity.py",
+    "status": "modified"
+  },
+  {
+    "file": "half-cheetah/halfcheetah_envs.py",
+    "status": "modified"
+  },
+  {
+    "file": "half-cheetah/job.sh",
+    "status": "modified"
+  },
+  {
+    "file": "half-cheetah/knowledge_pools.py",
+    "status": "modified"
+  },
+  {
+    "file": "half-cheetah/metrics.py",
+    "status": "modified"
+  },
+  {
+    "file": "half-cheetah/policy_composition.py",
+    "status": "added"
+  },
+  {
+    "file": "half-cheetah/policy_space.py",
+    "status": "added"
+  },
+  {
+    "file": "half-cheetah/requirements-dev.txt",
+    "status": "added"
+  },
+  {
+    "file": "half-cheetah/run_comparison.sh",
+    "status": "added"
+  },
+  {
+    "file": "half-cheetah/run_continual_benchmark.py",
+    "status": "modified"
+  },
+  {
+    "file": "half-cheetah/run_eval_custom.py",
+    "status": "modified"
+  },
+  {
+    "file": "half-cheetah/run_kaggle.sh",
+    "status": "modified"
+  },
+  {
+    "file": "half-cheetah/run_recommended.sh",
+    "status": "modified"
+  },
+  {
+    "file": "half-cheetah/run_sac.py",
+    "status": "modified"
+  },
+  {
+    "file": "half-cheetah/scratch_baselines.py",
+    "status": "modified"
+  },
+  {
+    "file": "half-cheetah/tasks.py",
+    "status": "modified"
+  },
+  {
+    "file": "half-cheetah/tdjepa_pretrain.py",
+    "status": "modified"
+  },
+  {
+    "file": "half-cheetah/training_protocol.py",
+    "status": "added"
+  },
+  {
+    "file": "meta-world/EXPERIMENT_FLAGS.md",
+    "status": "added"
+  },
+  {
+    "file": "meta-world/LEGACY_ENTRYPOINT.md",
+    "status": "added"
+  },
+  {
+    "file": "meta-world/README.md",
+    "status": "added"
+  },
+  {
+    "file": "meta-world/analysis_logging.py",
+    "status": "modified"
+  },
+  {
+    "file": "meta-world/checkpoint_evaluation.py",
+    "status": "added"
+  },
+  {
+    "file": "meta-world/cka_rl.py",
+    "status": "modified"
+  },
+  {
+    "file": "meta-world/estimate_timing.py",
+    "status": "modified"
+  },
+  {
+    "file": "meta-world/experiment_identity.py",
+    "status": "added"
+  },
+  {
+    "file": "meta-world/knowledge_pools.py",
+    "status": "modified"
+  },
+  {
+    "file": "meta-world/metaworld_envs.py",
+    "status": "added"
+  },
+  {
+    "file": "meta-world/metrics.py",
+    "status": "added"
+  },
+  {
+    "file": "meta-world/pilot_check.py",
+    "status": "added"
+  },
+  {
+    "file": "meta-world/plots.py",
+    "status": "added"
+  },
+  {
+    "file": "meta-world/policy_composition.py",
+    "status": "added"
+  },
+  {
+    "file": "meta-world/policy_space.py",
+    "status": "added"
+  },
+  {
+    "file": "meta-world/policy_utils.py",
+    "status": "added"
+  },
+  {
+    "file": "meta-world/requirements-dev.txt",
+    "status": "added"
+  },
+  {
+    "file": "meta-world/requirements.txt",
+    "status": "added"
+  },
+  {
+    "file": "meta-world/run_comparison.sh",
+    "status": "added"
+  },
+  {
+    "file": "meta-world/run_continual_benchmark.py",
+    "status": "modified"
+  },
+  {
+    "file": "meta-world/run_eval_custom.py",
+    "status": "added"
+  },
+  {
+    "file": "meta-world/run_kaggle.sh",
+    "status": "added"
+  },
+  {
+    "file": "meta-world/run_sac.py",
+    "status": "modified"
+  },
+  {
+    "file": "meta-world/sanity_check_pool.py",
+    "status": "modified"
+  },
+  {
+    "file": "meta-world/scratch_baselines.py",
+    "status": "added"
+  },
+  {
+    "file": "meta-world/shared_arch.py",
+    "status": "modified"
+  },
+  {
+    "file": "meta-world/tasks.py",
+    "status": "modified"
+  },
+  {
+    "file": "meta-world/td_jepa.py",
+    "status": "added"
+  },
+  {
+    "file": "meta-world/tdjepa_pretrain.py",
+    "status": "added"
+  },
+  {
+    "file": "meta-world/training_protocol.py",
+    "status": "added"
+  },
+  {
+    "file": "metaworld/EXPERIMENT_FLAGS.md",
+    "status": "modified"
+  },
+  {
+    "file": "metaworld/README.md",
+    "status": "modified"
+  },
+  {
+    "file": "metaworld/analysis_logging.py",
+    "status": "modified"
+  },
+  {
+    "file": "metaworld/checkpoint_evaluation.py",
+    "status": "added"
+  },
+  {
+    "file": "metaworld/cka_rl.py",
+    "status": "modified"
+  },
+  {
+    "file": "metaworld/experiment_identity.py",
+    "status": "modified"
+  },
+  {
+    "file": "metaworld/knowledge_pools.py",
+    "status": "modified"
+  },
+  {
+    "file": "metaworld/metaworld_envs.py",
+    "status": "modified"
+  },
+  {
+    "file": "metaworld/metrics.py",
+    "status": "modified"
+  },
+  {
+    "file": "metaworld/policy_composition.py",
+    "status": "added"
+  },
+  {
+    "file": "metaworld/policy_space.py",
+    "status": "added"
+  },
+  {
+    "file": "metaworld/requirements-dev.txt",
+    "status": "added"
+  },
+  {
+    "file": "metaworld/run_comparison.sh",
+    "status": "added"
+  },
+  {
+    "file": "metaworld/run_continual_benchmark.py",
+    "status": "modified"
+  },
+  {
+    "file": "metaworld/run_eval_custom.py",
+    "status": "modified"
+  },
+  {
+    "file": "metaworld/run_kaggle.sh",
+    "status": "modified"
+  },
+  {
+    "file": "metaworld/run_sac.py",
+    "status": "modified"
+  },
+  {
+    "file": "metaworld/scratch_baselines.py",
+    "status": "modified"
+  },
+  {
+    "file": "metaworld/tasks.py",
+    "status": "modified"
+  },
+  {
+    "file": "metaworld/training_protocol.py",
+    "status": "added"
+  },
+  {
+    "file": "minigrid/run_kaggle.sh",
+    "status": "modified"
+  },
+  {
+    "file": "tests/synthetic_smoke.py",
+    "status": "added"
+  },
+  {
+    "file": "tests/test_policy_space.py",
+    "status": "added"
+  },
+  {
+    "file": "validation_logs/original_sanity_Walker2D.txt",
+    "status": "added"
+  },
+  {
+    "file": "validation_logs/original_sanity_half-cheetah.txt",
+    "status": "added"
+  },
+  {
+    "file": "validation_logs/summary.json",
+    "status": "added"
+  },
+  {
+    "file": "validation_logs/synthetic_Hopper.json",
+    "status": "added"
+  },
+  {
+    "file": "validation_logs/synthetic_Walker2D.json",
+    "status": "added"
+  },
+  {
+    "file": "validation_logs/synthetic_half-cheetah.json",
+    "status": "added"
+  },
+  {
+    "file": "validation_logs/synthetic_halfcheetah_wind_vel.json",
+    "status": "added"
+  },
+  {
+    "file": "validation_logs/synthetic_meta-world.json",
+    "status": "added"
+  },
+  {
+    "file": "validation_logs/synthetic_metaworld.json",
+    "status": "added"
+  },
+  {
+    "file": "validation_logs/unit_Hopper.txt",
+    "status": "added"
+  },
+  {
+    "file": "validation_logs/unit_Walker2D.txt",
+    "status": "added"
+  },
+  {
+    "file": "validation_logs/unit_half-cheetah.txt",
+    "status": "added"
+  },
+  {
+    "file": "validation_logs/unit_meta-world.txt",
+    "status": "added"
+  },
+  {
+    "file": "validation_logs/unit_metaworld.txt",
+    "status": "added"
+  }
+]

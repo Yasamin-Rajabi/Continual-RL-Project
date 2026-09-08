@@ -1,3 +1,9 @@
+> **Updated implementation:** read `../IMPLEMENTATION_NOTES.md` and
+> `../EVALUATION_GUIDE.md` first. The material below describes the uploaded
+> project's older presets; its old defaults and performance claims do not
+> validate this revised task-blind/policy-space implementation. Use
+> `run_comparison.sh` for the new defaults and train fresh checkpoints.
+
 # Experiment / ablation flags
 
 The default code favors a stable final implementation, but every small optimization

@@ -24,7 +24,11 @@ from shared_arch import shared, validate_shared_encoder
 _HEAD_KEYS = ("l0_weight", "l0_bias", "l2_weight", "l2_bias")
 
 
-class CkaRlAgent(nn.Module):
+from policy_space import PolicySpaceMixin
+from policy_composition import gaussian_summary, stacked_head_forward
+
+
+class CkaRlAgent(PolicySpaceMixin, nn.Module):
     """Shared encoder + an aligned pool of Gaussian policy heads.
 
     Pool slots are policy-level objects: the mean and log-std tensors at index i
@@ -50,7 +54,7 @@ class CkaRlAgent(nn.Module):
         constrain_alpha_mass=True,
         encoder_from_base=False,
         distillation=True,
-        distill_observation_skip=True,
+        distill_observation_skip=False,
         fusion_mode=BASE_FUSION_MODE,
         max_distill_buffer=50_000,
         distill_test_frac=0.2,
@@ -66,8 +70,23 @@ class CkaRlAgent(nn.Module):
         freeze_root_encoder=False,
         pretrained_encoder=None,
         encoder_linear_out=False,
+        composition_space="parameter",
+        projection_epochs=16,
+        projection_max_samples=20000,
     ):
         super().__init__()
+        if composition_space not in ("parameter", "policy"):
+            raise ValueError("composition_space must be 'parameter' or 'policy'")
+        if composition_space == "policy" and use_alpha_mass and not constrain_alpha_mass:
+            raise ValueError("A probability mixture requires a bounded sigmoid alpha-mass")
+        self.composition_space = composition_space
+        self.projection_epochs = int(projection_epochs)
+        self.projection_max_samples = int(projection_max_samples)
+        if self.projection_epochs < 1 or self.projection_max_samples < 2:
+            raise ValueError("projection_epochs >= 1 and projection_max_samples >= 2 are required")
+        self.mixture_warmup = False
+        self.pool_only = False
+        self.last_projection_metrics = {}
         self.encoder_linear_out = bool(encoder_linear_out)
         self.obs_dim = int(obs_dim)
         self.act_dim = int(act_dim)
@@ -116,9 +135,13 @@ class CkaRlAgent(nn.Module):
             distill_test_frac=distill_test_frac,
         )
 
+        self.mean_pool.composition_space = composition_space
+        self.logstd_pool.composition_space = composition_space
         if latest_dir is not None:
             latest_mean_pool = _torch_load(f"{latest_dir}/mean_pool.pt", map_location="cpu")
             latest_logstd_pool = _torch_load(f"{latest_dir}/logstd_pool.pt", map_location="cpu")
+            if getattr(latest_mean_pool, "composition_space", "parameter") != composition_space:
+                raise ValueError("Cannot continue a chain with a different composition space; start a fresh run")
             self.mean_pool.inherit_pool_from(latest_mean_pool)
             self.logstd_pool.inherit_pool_from(latest_logstd_pool)
             self._assert_pool_alignment()
@@ -132,6 +155,7 @@ class CkaRlAgent(nn.Module):
         )
         self.mean_pool.set_alpha(self.alpha, self.alpha_scale, self.alpha_mass)
         self.logstd_pool.set_alpha(self.alpha, self.alpha_scale, self.alpha_mass)
+        self.initialize_policy_space_own()
         logger.info(f"shared alpha: {self.alpha}")
         if use_alpha_mass:
             logger.info(f"shared alpha_mass: {self.alpha_mass}")
@@ -235,13 +259,16 @@ class CkaRlAgent(nn.Module):
         )
 
         alpha_mass = (
-            nn.Parameter(torch.ones(1), requires_grad=not fix_alpha)
+            nn.Parameter(torch.full((1,), (float(np.log(0.95 / 0.05)) if self.constrain_alpha_mass else 1.0)), requires_grad=not fix_alpha)
             if use_alpha_mass else None
         )
         return alpha, alpha_scale, alpha_mass
 
 
     def forward(self, x):
+        if self.composition_space == "policy":
+            # Compatibility summary; inference and SAC use policy_components.
+            return gaussian_summary(*self.policy_components(x))
         features = self.fc(x)
         z = (
             torch.cat([features, x], dim=-1)
@@ -670,8 +697,11 @@ class CkaRlAgent(nn.Module):
         """Insert the new slot, then (if needed) merge one policy-level pair."""
         self.last_merge_info = None
         self.last_distill_metrics = {}
-        self.mean_pool.finalize_own_contribution()
-        self.logstd_pool.finalize_own_contribution()
+        if self.composition_space == "policy":
+            self.project_policy_for_storage()
+        else:
+            self.mean_pool.finalize_own_contribution()
+            self.logstd_pool.finalize_own_contribution()
         self._assert_pool_alignment()
 
         if not self.mean_pool.needs_merge():
@@ -733,10 +763,14 @@ class CkaRlAgent(nn.Module):
         return {key: value.detach().cpu().clone() for key, value in d.items()}
 
     def export_effective_policy(self):
+        if self.composition_space == "policy":
+            with torch.no_grad():
+                return self.export_policy_ensemble()
         with torch.no_grad():
             mean_w0, mean_b0, mean_w2, mean_b2 = self.mean_pool._effective()
             log_w0, log_b0, log_w2, log_b2 = self.logstd_pool._effective()
             return {
+                "composition_space": self.composition_space,
                 "obs_dim": self.obs_dim,
                 "act_dim": self.act_dim,
                 "distillation": self.distillation,
@@ -797,6 +831,7 @@ class FrozenCkaPolicy(nn.Module):
 
     def __init__(self, snapshot):
         super().__init__()
+        self.composition_space = snapshot.get("composition_space", "parameter")
         self.obs_dim = int(snapshot["obs_dim"])
         self.act_dim = int(snapshot["act_dim"])
         self.distillation = bool(snapshot.get("distillation", False))
@@ -806,9 +841,15 @@ class FrozenCkaPolicy(nn.Module):
         self.encoder_linear_out = bool(snapshot.get("encoder_linear_out", False))
         self.fc = shared(input_dim=self.obs_dim, linear_out=self.encoder_linear_out)
         self.fc.load_state_dict(snapshot["fc_state_dict"])
-        for head_name in ("mean", "logstd"):
-            for tensor_name, tensor in snapshot[head_name].items():
-                self.register_buffer(f"{head_name}_{tensor_name}", tensor.clone())
+        if self.composition_space == "policy":
+            self.register_buffer("mixture_weights", snapshot["mixture_weights"].clone())
+            for head_name in ("mean", "logstd"):
+                for tensor_name, tensor in snapshot[head_name + "_components"].items():
+                    self.register_buffer(f"{head_name}_{tensor_name}", tensor.clone())
+        else:
+            for head_name in ("mean", "logstd"):
+                for tensor_name, tensor in snapshot[head_name].items():
+                    self.register_buffer(f"{head_name}_{tensor_name}", tensor.clone())
 
     def _head(self, x, head_name):
         w0 = getattr(self, f"{head_name}_l0_weight")
@@ -818,7 +859,19 @@ class FrozenCkaPolicy(nn.Module):
         h = F.relu(F.linear(x, w0, b0))
         return F.linear(h, w2, b2)
 
+    def policy_components(self, obs):
+        features = self.fc(obs)
+        z = torch.cat((features, obs), -1) if self.distillation and self.distill_observation_skip else features
+        if self.composition_space == "policy":
+            heads = [{k: getattr(self, head + "_" + k) for k in _HEAD_KEYS} for head in ("mean", "logstd")]
+            return (stacked_head_forward(z, heads[0]),
+                    bound_log_std(stacked_head_forward(z, heads[1])), self.mixture_weights)
+        mean, raw = self._head(z, "mean"), self._head(z, "logstd")
+        return mean[:, None, :], bound_log_std(raw)[:, None, :], mean.new_ones(1)
+
     def forward(self, obs):
+        if self.composition_space == "policy":
+            return gaussian_summary(*self.policy_components(obs))
         features = self.fc(obs)
         z = (
             torch.cat([features, obs], dim=-1)

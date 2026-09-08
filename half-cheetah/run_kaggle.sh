@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Kaggle entrypoint for the CURRENT HalfCheetah workflow.
 #
-# The default experiment follows the friend-merged setup: no encoder pretraining,
-# --train-shared enabled, and Baseline + Combined selected together. Optional
+# The default experiment follows the task-blind comparison setup: no encoder pretraining,
+# shared encoder frozen after the root task, and Baseline + Combined selected together. Optional
 # TD-JEPA pretraining remains available through tdjepa_pretrain.py as an explicit
 # ablation, but is not part of this default pipeline.
 set -euo pipefail
+COMPOSITION_SPACES="${COMPOSITION_SPACES:-parameter policy}"
 cd "$(dirname "$0")"
 
 OUT="${KAGGLE_WORKING:-/kaggle/working}"
@@ -47,23 +48,24 @@ step_baselines() {
     python3 scratch_baselines.py \
         --task-suites $SUITES \
         --seeds $SCRATCH_SEEDS \
-        --variants plain distill_skip \
+        --variants plain \
         --total-timesteps "$TOTAL_TIMESTEPS" \
         --save-root "$OUT/scratch_models" \
         --runs-root "$OUT/runs" \
         --analysis-root "$OUT/analysis_scratch" \
-        --train-shared \
+        --no-train-shared \
         2>&1 | tee -a "$OUT/logs/hc_baselines.log"
 }
 
 step_continual() {
     python3 run_continual_benchmark.py \
+        --composition-spaces $COMPOSITION_SPACES \
         --task-suites $SUITES \
         --seeds $SEEDS \
         --scratch-seeds $SCRATCH_SEEDS \
         --total-timesteps "$TOTAL_TIMESTEPS" \
         --condition-index 1 4 \
-        --train-shared \
+        --no-train-shared \
         --save-root "$OUT/agents" \
         --runs-root "$OUT/runs" \
         --analysis-root "$OUT/analysis" \

@@ -22,6 +22,8 @@ from analysis_logging import effective_theta_vector, log_training_state, save_ta
 from cka_rl import CkaRlAgent
 from experiment_identity import write_manifest
 from policy_utils import bound_log_std
+from policy_composition import sample_action, representative_action, sac_actor_objective
+from training_protocol import TaskBudget, mixture_warmup_active, bounded_buffer
 from shared_arch import shared
 from tasks import get_task, get_task_name
 
@@ -29,8 +31,14 @@ from tasks import get_task, get_task_name
 @dataclass
 class Args:
     model_type: Literal["cka-rl"] = "cka-rl"
-    task_suite: Literal["mw_easy4", "mw_easy6", "mw_smoke2"] = "mw_easy4"
+    task_suite: Literal["mw_easy4", "mw_easy6", "mw_smoke2", "mw_paper10", "mw_legacy7"] = "mw_easy4"
     fusion_mode: Literal["classic_cka", "weight_delta"] = "classic_cka"
+    eval_action_mode: Literal["deterministic", "stochastic"] = "deterministic"
+    composition_space: Literal["parameter", "policy"] = "parameter"
+    projection_epochs: int = 16
+    projection_max_samples: int = 20_000
+    distill_buffer_steps: Optional[int] = None
+    """Alias for distill_extra_steps. B is INCLUDED in total_timesteps, not added."""
     save_dir: Optional[str] = None
     prev_units: Tuple[pathlib.Path, ...] = ()
 
@@ -56,7 +64,7 @@ class Args:
     tau: float = 0.005
     batch_size: int = 256
     learning_starts: int = 5_000
-    random_actions_end: int = 10_000
+    random_actions_end: int = 5_000
     policy_lr: float = 3e-4
     alpha_lr: float = 5e-3
     alpha_warmup_steps: int = 5_000
@@ -83,9 +91,15 @@ class Args:
     fix_alpha_scale: bool = False
     alpha_mass_reg: float = 0.05
     drift_reg: float = 1.0
+    distill_encoder_lr_mult: float = 0.1
+    """Multiplier on policy_lr for a trainable shared encoder on later
+    distillation tasks. Set to 1.0 to disable the slower-encoder optimization."""
+    alpha_entropy_reg: float = 0.01
+    """Entropy bonus on the historical knowledge-mixture during weight-delta
+    warmup. Set to 0 to disable it."""
     constrain_alpha_mass: bool = True
     """When alpha-mass is enabled, map its raw scalar through a positive
-    softplus transform. Disable only for the legacy/unconstrained ablation."""
+    sigmoid transform into [0,1]. Disable only for the legacy/unconstrained ablation."""
     # Was True, which contradicted both cka_rl.py's own docstring ("train_shared=False
     # (default)") and run_continual_benchmark.py, which always passes --no-train-shared.
     # Running run_sac.py directly (as the README examples do) therefore used a
@@ -108,12 +122,13 @@ class Args:
 
     # Distillation modes require rollout states for behavioral KL.
     # Cosine modes do not; collect_cosine_buffers=True is available when an
-    # equal post-training interaction budget is desired for an ablation.
-    distill_observation_skip: bool = True
+    # equal retained-buffer ablation is desired for an ablation.
+    distill_observation_skip: bool = False
     """Friend-method skip connection: in distillation modes concatenate raw
     observations to shared features before the policy heads. Disable for the
     pre-merge architecture ablation."""
     distill_extra_steps: int = 10_000
+    """Legacy flag name: the final B steps INSIDE Delta; never extra interactions."""
     collect_cosine_buffers: bool = False
     max_distill_buffer: int = 50_000
     similarity_samples: int = 2_048
@@ -184,21 +199,25 @@ class Actor(nn.Module):
         return mean, bound_log_std(raw_log_std)
 
     def get_action(self, x):
-        mean, log_std = self(x)
-        std = log_std.exp()
-        normal = torch.distributions.Normal(mean, std)
-        x_t = normal.rsample()
-        y_t = torch.tanh(x_t)
-        action = y_t * self.action_scale + self.action_bias
-        log_prob = normal.log_prob(x_t)
-        log_prob -= torch.log(self.action_scale * (1.0 - y_t.pow(2)) + 1e-6)
-        log_prob = log_prob.sum(dim=1, keepdim=True)
-        mean_action = torch.tanh(mean) * self.action_scale + self.action_bias
-        return action, log_prob, mean_action
+        return sample_action(self.model, x, self.action_scale, self.action_bias)
+
+    def deterministic_action(self, x):
+        return representative_action(self.model, x, self.action_scale, self.action_bias)
+
+    def actor_objective(self, obs, q1, q2, temperature):
+        return sac_actor_objective(self.model, obs, q1, q2, temperature,
+                                   self.action_scale, self.action_bias)
 
 
 @torch.no_grad()
 def eval_agent(agent, test_env, num_evals, global_step, writer, device):
+    cuda_devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type == "cuda" else []
+    with torch.random.fork_rng(devices=cuda_devices):
+        torch.manual_seed(10_000)
+        return _eval_agent_impl(agent, test_env, num_evals, global_step, writer, device)
+
+
+def _eval_agent_impl(agent, test_env, num_evals, global_step, writer, device):
     returns, success_rates, mean_task_errors, mean_x_velocities = [], [], [], []
     for ep in range(num_evals):
         obs, _ = test_env.reset(seed=10_000 + ep)
@@ -208,8 +227,9 @@ def eval_agent(agent, test_env, num_evals, global_step, writer, device):
         ep_x_velocity = []
         while True:
             obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-            mean, _ = agent(obs_t)
-            action = torch.tanh(mean) * agent.action_scale + agent.action_bias
+            action = (agent.get_action(obs_t)[0] if getattr(agent, "evaluation_action_mode", "deterministic") == "stochastic"
+                      else agent.deterministic_action(obs_t))
+            agent.evaluation_env_steps = getattr(agent, "evaluation_env_steps", 0) + 1
             obs, reward, terminated, truncated, info = test_env.step(action[0].cpu().numpy())
             ep_return += float(reward)
             if "success" in info:
@@ -221,7 +241,7 @@ def eval_agent(agent, test_env, num_evals, global_step, writer, device):
             if terminated or truncated:
                 break
         returns.append(ep_return)
-        success_rates.append(float(np.mean(ep_success)) if ep_success else np.nan)
+        success_rates.append(float(np.max(ep_success)) if ep_success else np.nan)
         mean_task_errors.append(float(np.mean(ep_task_error)) if ep_task_error else np.nan)
         mean_x_velocities.append(float(np.mean(ep_x_velocity)) if ep_x_velocity else np.nan)
 
@@ -359,6 +379,18 @@ def collect_merge_buffer(actor, envs, steps, task_id, seq_idx, device, seed):
 
 
 def _validate_args(args):
+    if args.distill_buffer_steps is not None:
+        args.distill_extra_steps = int(args.distill_buffer_steps)
+    budget = TaskBudget(args.total_timesteps, args.distill_extra_steps)
+    if args.learning_starts < 0 or args.random_actions_end < 0:
+        raise ValueError("learning_starts and random_actions_end must be nonnegative")
+    if budget.training <= args.learning_starts + 1:
+        raise ValueError("Delta - B must exceed learning_starts + 1 so SAC can update")
+    if args.composition_space == "policy":
+        if args.distill_extra_steps < 2 or args.projection_epochs < 1 or args.projection_max_samples < 2:
+            raise ValueError("Policy composition requires B >= 2 and a nonempty projection budget")
+        if args.use_alpha_mass and not args.constrain_alpha_mass:
+            raise ValueError("Policy mixtures require --constrain-alpha-mass")
     if args.fusion_mode == "classic_cka" and args.use_alpha_mass:
         raise ValueError("--use-alpha-mass is only valid with --fusion-mode=weight_delta")
     if args.use_alpha_scale and args.fix_alpha_scale:
@@ -367,8 +399,10 @@ def _validate_args(args):
         raise ValueError("policy/q/alpha learning rates must be > 0")
     if args.alpha_warmup_steps < 0:
         raise ValueError("alpha_warmup_steps must be >= 0")
-    if args.alpha_mass_reg < 0 or args.drift_reg < 0:
-        raise ValueError("alpha_mass_reg and drift_reg must be >= 0")
+    if args.alpha_mass_reg < 0 or args.drift_reg < 0 or args.alpha_entropy_reg < 0:
+        raise ValueError("alpha_mass_reg, drift_reg and alpha_entropy_reg must be >= 0")
+    if args.distill_encoder_lr_mult <= 0:
+        raise ValueError("distill_encoder_lr_mult must be > 0")
     if args.pool_size < 2:
         raise ValueError("pool_size must be >= 2 for meaningful behavioral pair selection")
     if args.similarity_samples < 2:
@@ -446,6 +480,9 @@ if __name__ == "__main__":
         distill_observation_skip=args.distill_observation_skip,
         max_distill_buffer=args.max_distill_buffer,
         fusion_mode=args.fusion_mode,
+        composition_space=args.composition_space,
+        projection_epochs=args.projection_epochs,
+        projection_max_samples=args.projection_max_samples,
         use_alpha_mass=args.use_alpha_mass,
         use_alpha_scale=args.use_alpha_scale,
         fix_alpha_scale=args.fix_alpha_scale,
@@ -464,6 +501,7 @@ if __name__ == "__main__":
     )
 
     actor = Actor(envs, model).to(device)
+    actor.evaluation_action_mode = args.eval_action_mode
 
     # Friend-method continual encoder stabilization. When the shared encoder is
     # explicitly trainable in a distillation condition, keep a frozen copy of
@@ -513,7 +551,11 @@ if __name__ == "__main__":
 
     # Friend method: after task 0, a trainable shared encoder moves more slowly
     # in distillation modes; alpha parameters get their own faster learning rate.
-    encoder_lr = args.policy_lr * 0.1 if (args.distillation and args.seq_idx > 0) else args.policy_lr
+    encoder_lr = (
+        args.policy_lr * args.distill_encoder_lr_mult
+        if (args.distillation and args.seq_idx > 0)
+        else args.policy_lr
+    )
     param_groups = []
     if own_params:
         param_groups.append({"params": own_params, "lr": args.policy_lr})
@@ -566,6 +608,9 @@ if __name__ == "__main__":
         handle_timeout_termination=False,
     )
 
+    actor.model.set_mixture_warmup(mixture_warmup_active(
+        0, args.learning_starts, args.alpha_warmup_steps, args.fusion_mode,
+        actor.model.mean_pool.pool_length()))
     theta_task_start = effective_theta_vector(actor.model).detach().clone()
     analysis_dir = f"{args.analysis_root}/{args.tag}/{run_name}"
     if args.save_analysis_snapshots:
@@ -577,6 +622,9 @@ if __name__ == "__main__":
     log_training_state(writer, 0, actor.model, qf1, qf2, qf1_target, qf2_target, theta_task_start)
     # Zero-shot performance before any update on this task is a useful
     # continual-transfer diagnostic and is plotted by run_continual_benchmark.py.
+    actor.model.set_mixture_warmup(mixture_warmup_active(
+        0, args.learning_starts, args.alpha_warmup_steps, args.fusion_mode,
+        actor.model.mean_pool.pool_length()))
     eval_agent(actor, eval_env, args.num_evals, 0, writer, device)
 
     obs, _ = envs.reset(seed=args.seed)
@@ -587,7 +635,12 @@ if __name__ == "__main__":
     mass_loss = None
     start_time = time.time()
 
-    for global_step in tqdm(range(args.total_timesteps)):
+    budget = TaskBudget(args.total_timesteps, args.distill_extra_steps)
+    for global_step in tqdm(range(budget.training)):
+        mixture_warmup = mixture_warmup_active(
+            global_step, args.learning_starts, args.alpha_warmup_steps,
+            args.fusion_mode, actor.model.mean_pool.pool_length())
+        actor.model.set_mixture_warmup(mixture_warmup)
         if global_step < args.random_actions_end:
             actions = np.asarray([envs.single_action_space.sample() for _ in range(envs.num_envs)])
         else:
@@ -628,9 +681,7 @@ if __name__ == "__main__":
 
             if global_step % args.policy_frequency == 0:
                 for _ in range(args.policy_frequency):
-                    pi, log_pi, _ = actor.get_action(data.observations)
-                    min_q_pi = torch.min(qf1(data.observations, pi), qf2(data.observations, pi))
-                    actor_loss = (alpha * log_pi - min_q_pi).mean()
+                    actor_loss = actor.actor_objective(data.observations, qf1, qf2, alpha)
 
                     drift_loss = None
                     if (
@@ -647,16 +698,19 @@ if __name__ == "__main__":
                         drift_loss = args.drift_reg * F.mse_loss(phi_curr, phi_old)
                         actor_loss = actor_loss + drift_loss
 
-                    in_warmup = global_step < (args.learning_starts + args.alpha_warmup_steps)
+                    # mixture_warmup was set before choosing this step's action.
+                    # A singleton pool still gets a historical-only phase;
+                    # its alpha gradient is correctly zero (there is no choice).
                     alpha_entropy = None
-                    if in_warmup and actor.model.alpha is not None and actor.model.alpha.numel() > 1:
-                        probs = torch.softmax(actor.model.alpha, dim=-1)
+                    if mixture_warmup and args.alpha_entropy_reg > 0:
+                        scale = actor.model.alpha_scale if actor.model.alpha_scale is not None else 1.0
+                        probs = torch.softmax(actor.model.alpha * scale, dim=-1)
                         alpha_entropy = -(probs * torch.log(probs + 1e-8)).sum()
-                        actor_loss = actor_loss - 0.01 * alpha_entropy
+                        actor_loss = actor_loss - args.alpha_entropy_reg * alpha_entropy
 
                     mass_loss = None
                     if (
-                        not in_warmup and actor.model.alpha_mass is not None
+                        not mixture_warmup and actor.model.alpha_mass is not None
                         and actor.model.alpha_mass.requires_grad and args.alpha_mass_reg > 0
                     ):
                         eff_mass = actor.model.mean_pool.effective_alpha_mass()
@@ -668,12 +722,13 @@ if __name__ == "__main__":
 
                     # Friend method: weight-delta warmup first learns how to mix
                     # historical slots before allowing the new residual or mass to move.
-                    if args.fusion_mode == "weight_delta" and in_warmup and actor.model.alpha is not None:
-                        for p in own_params:
-                            if p.grad is not None:
-                                p.grad.zero_()
-                        if actor.model.alpha_mass is not None and actor.model.alpha_mass.grad is not None:
-                            actor.model.alpha_mass.grad.zero_()
+                    if mixture_warmup:
+                        # None also prevents Adam momentum from moving a frozen
+                        # parameter. Freeze a trainable encoder during search too.
+                        for p in own_params + fc_params:
+                            p.grad = None
+                        if actor.model.alpha_mass is not None:
+                            actor.model.alpha_mass.grad = None
 
                     actor_optimizer.step()
 
@@ -736,27 +791,31 @@ if __name__ == "__main__":
     train_loop_seconds = time.time() - start_time
     writer.add_scalar("timing/train_loop_seconds", train_loop_seconds, global_step)
     print(
-        f"*** TRAIN_LOOP_SECONDS: {train_loop_seconds:.2f} for {args.total_timesteps} steps "
-        f"({args.total_timesteps / max(train_loop_seconds, 1e-9):.2f} steps/sec) ***"
+        f"*** TRAIN_LOOP_SECONDS: {train_loop_seconds:.2f} for {budget.training} optimization-phase steps "
+        f"({budget.training / max(train_loop_seconds, 1e-9):.2f} steps/sec) ***"
     )
 
-    needs_merge_buffer = bool(args.distillation or args.collect_cosine_buffers)
-    if needs_merge_buffer:
-        print(f"*** Collecting {args.distill_extra_steps} post-training states for merge diagnostics/distillation ***")
-        merge_buffer, buffer_seconds = collect_merge_buffer(
-            actor, envs, args.distill_extra_steps, args.task_id, args.seq_idx, device,
+    eval_agent(actor, eval_env, args.num_evals, budget.training, writer, device)
+
+    # Every condition receives the SAME Delta-B training steps and B frozen
+    # policy-controlled tail interactions. No optimizer is called in the tail.
+    needs_merge_buffer = bool(args.distillation or args.collect_cosine_buffers
+                              or args.composition_space == "policy")
+    if budget.frozen_tail:
+        print(f"*** Frozen tail: {budget.frozen_tail} steps INSIDE Delta={budget.total} ***")
+        tail_buffer, buffer_seconds = collect_merge_buffer(
+            actor, envs, budget.frozen_tail, args.task_id, args.seq_idx, device,
             seed=args.seed + 123_456,
         )
+        merge_buffer = bounded_buffer(tail_buffer, args.max_distill_buffer) if needs_merge_buffer else None
         writer.add_scalar("timing/merge_buffer_seconds", buffer_seconds, global_step)
-        writer.add_scalar("analysis/buffer/rows", len(merge_buffer["obs"]), global_step)
-        finite_errors = np.asarray(merge_buffer["task_error"]).reshape(-1)
-        finite_errors = finite_errors[np.isfinite(finite_errors)]
-        if finite_errors.size:
-            writer.add_scalar("analysis/buffer/mean_task_error", float(finite_errors.mean()), global_step)
+        writer.add_scalar("analysis/buffer/rows", 0 if merge_buffer is None else len(merge_buffer["obs"]), global_step)
     else:
         merge_buffer = None
         writer.add_scalar("timing/merge_buffer_seconds", 0.0, global_step)
-        print("*** Skipping merge-buffer collection (cosine mode; --no-collect-cosine-buffers) ***")
+    writer.add_scalar("budget/optimization_phase_env_steps", budget.training, global_step)
+    writer.add_scalar("budget/frozen_tail_env_steps", budget.frozen_tail, global_step)
+    writer.add_scalar("budget/total_learning_env_steps", budget.total, global_step)
 
     final_eval = eval_agent(actor, eval_env, args.num_evals, global_step, writer, device)
     actor.model.set_own_buffer(merge_buffer)
@@ -765,6 +824,11 @@ if __name__ == "__main__":
         print(f"Saving trained agent in `{args.save_dir}` with name `{run_name}`")
         run_dir = f"{args.save_dir}/{run_name}"
         actor.model.save_policy_snapshot(run_dir)
+        with open(pathlib.Path(run_dir) / "interaction_budget.json", "w") as f:
+            json.dump({"Delta": budget.total, "optimization_phase_steps": budget.training,
+                       "frozen_tail_steps": budget.frozen_tail,
+                       "monitor_evaluation_steps": getattr(actor, "evaluation_env_steps", 0),
+                       "evaluation_updates_policy": False}, f, indent=2)
 
         if args.save_analysis_snapshots:
             save_task_snapshot(
@@ -778,6 +842,10 @@ if __name__ == "__main__":
             actor.model.set_base()
         else:
             actor.model.finalize()
+        for key, value in actor.model.last_projection_metrics.items():
+            writer.add_scalar(key, value, global_step)
+        with open(pathlib.Path(run_dir) / "projection_metrics.json", "w") as f:
+            json.dump(actor.model.last_projection_metrics, f, indent=2)
         finalize_seconds = time.time() - merge_start
         writer.add_scalar("timing/finalize_seconds", finalize_seconds, global_step)
         print(f"*** FINALIZE_SECONDS: {finalize_seconds:.4f} ***")

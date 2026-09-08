@@ -18,7 +18,7 @@ import pathlib
 from typing import Any, Mapping, Sequence
 
 MANIFEST_NAME = "run_manifest.json"
-MANIFEST_SCHEMA_VERSION = 1
+MANIFEST_SCHEMA_VERSION = 2
 
 # Only knobs that can change the learned policy/pool are part of the training
 # signature. Logging/output-path settings are intentionally excluded so moving
@@ -32,6 +32,10 @@ TRAINING_KEYS = (
     "torch_deterministic",
     "cuda",
     "fusion_mode",
+    "composition_space",
+    "projection_epochs",
+    "projection_max_samples",
+    "eval_action_mode",
     "total_timesteps",
     "buffer_size",
     "gamma",
@@ -85,11 +89,14 @@ TRAINING_KEYS = (
 SOURCE_CANDIDATES = (
     "run_sac.py",
     "cka_rl.py",
+    "policy_composition.py",
+    "policy_space.py",
+    "training_protocol.py",
     "knowledge_pools.py",
     "shared_arch.py",
     "policy_utils.py",
     "tasks.py",
-    "walker2d_envs.py",
+    'walker2d_envs.py',
     "analysis_logging.py",
 )
 

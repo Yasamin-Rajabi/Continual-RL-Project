@@ -60,9 +60,9 @@ def main():
     nominal_env = get_task(0, suite)
     obs0, _ = nominal_env.reset(seed=123)
     nominal = snapshot(nominal_env)
-    assert nominal_env.observation_space.shape == (23,)
+    assert nominal_env.observation_space.shape == (17,)
     assert nominal_env.action_space.shape == (6,)
-    assert np.allclose(obs0[-6:], [1.5, 1, 1, 1, 1, 1])
+    assert obs0.shape == (17,)  # native observation, no appended context
     nominal_env.close()
 
     for task_id, spec in enumerate(specs):
@@ -77,12 +77,7 @@ def main():
             snap[4], nominal[4] * spec.actuator_strength_scale, rtol=2e-5, atol=1e-9
         ), f"task {task_id} actuator gear scale mismatch"
 
-        expected_tail = np.asarray([
-            spec.target_velocity, spec.right_mass_scale, spec.left_mass_scale,
-            spec.foot_friction_scale, spec.joint_damping_scale,
-            spec.actuator_strength_scale,
-        ], dtype=np.float32)
-        assert np.allclose(obs[-6:], expected_tail)
+        assert obs.shape == (17,)
 
         # A short stochastic rollout catches NaNs, invalid contacts, bad action
         # shapes, and termination/reset problems without asking SAC to learn.

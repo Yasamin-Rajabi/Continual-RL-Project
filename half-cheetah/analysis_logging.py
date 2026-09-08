@@ -36,7 +36,11 @@ def _module_vector(module):
 
 
 def effective_theta_vector(model):
-    """Flatten the actual actor theta used by forward(): encoder + both heads."""
+    """Parameter-mode effective theta; policy-mode parameter proxy, NOT one policy."""
+    if getattr(model, "composition_space", "parameter") == "policy":
+        # There is no single effective MLP for an exact mixture. Parameter count
+        # is stable through warmup, unlike the number of active components.
+        return torch.cat([p.detach().reshape(-1) for p in model.parameters()])
     with torch.no_grad():
         mean_eff = model.mean_pool._effective()
         log_eff = model.logstd_pool._effective()
@@ -122,7 +126,7 @@ def _head_pool_snapshot(pool, include_effective: bool):
     # After finalize(), alpha refers to the pre-finalize composition and can no
     # longer be interpreted as the exact current policy.  Therefore callers set
     # include_effective=False for post-finalize snapshots.
-    if include_effective:
+    if include_effective and getattr(pool, "composition_space", "parameter") == "parameter":
         w0, b0, w2, b2 = pool._effective()
         result["historical"] = None
         if pool.pool:
@@ -169,6 +173,7 @@ def save_task_snapshot(
             "seed": int(args.seed),
             "tag": str(args.tag),
             "fusion_mode": str(args.fusion_mode),
+            "composition_space": str(getattr(args, "composition_space", "parameter")),
             "distillation": bool(args.distillation),
             "pool_size": int(args.pool_size),
             "similarity_samples": int(args.similarity_samples),
@@ -229,7 +234,8 @@ def _log_head(writer, prefix, pool, step):
         _head_tensor_norm((pool.base_l0_weight, pool.base_l0_bias, pool.base_l2_weight, pool.base_l2_bias)),
         step,
     )
-    writer.add_scalar(f"analysis/{prefix}/effective_norm", _head_tensor_norm(pool._effective()), step)
+    if getattr(pool, "composition_space", "parameter") == "parameter":
+        writer.add_scalar(f"analysis/{prefix}/effective_norm", _head_tensor_norm(pool._effective()), step)
 
     for i, entry in enumerate(pool.pool):
         writer.add_scalar(
@@ -269,10 +275,11 @@ def log_training_state(writer, step, actor_model, qf1, qf2, qf1_target, qf2_targ
     with torch.no_grad():
         theta = effective_theta_vector(actor_model)
         start = theta_task_start.to(theta.device)
-        writer.add_scalar("analysis/theta/l2_norm", theta.norm().item(), step)
-        writer.add_scalar("analysis/theta/drift_from_task_start_l2", (theta - start).norm().item(), step)
+        theta_label = "parameter_proxy" if getattr(actor_model, "composition_space", "parameter") == "policy" else "theta"
+        writer.add_scalar(f"analysis/{theta_label}/l2_norm", theta.norm().item(), step)
+        writer.add_scalar(f"analysis/{theta_label}/drift_from_task_start_l2", (theta - start).norm().item(), step)
         writer.add_scalar(
-            "analysis/theta/cosine_to_task_start",
+            f"analysis/{theta_label}/cosine_to_task_start",
             F.cosine_similarity(theta, start, dim=0).item(),
             step,
         )

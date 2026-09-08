@@ -1,0 +1,38 @@
+{
+  "type": "SYNTHETIC adapters, NOT real simulators",
+  "passed": true,
+  "runs": [
+    {
+      "family": "Walker2D",
+      "condition": "baseline",
+      "trained_tasks": 3,
+      "exact_Delta": 40,
+      "evaluations_checked": 4,
+      "adaptation_checked": true
+    },
+    {
+      "family": "Walker2D",
+      "condition": "combined",
+      "trained_tasks": 3,
+      "exact_Delta": 40,
+      "evaluations_checked": 4,
+      "adaptation_checked": true
+    },
+    {
+      "family": "Walker2D",
+      "condition": "baseline_policy",
+      "trained_tasks": 3,
+      "exact_Delta": 40,
+      "evaluations_checked": 4,
+      "adaptation_checked": true
+    },
+    {
+      "family": "Walker2D",
+      "condition": "combined_policy",
+      "trained_tasks": 3,
+      "exact_Delta": 40,
+      "evaluations_checked": 4,
+      "adaptation_checked": true
+    }
+  ]
+}
