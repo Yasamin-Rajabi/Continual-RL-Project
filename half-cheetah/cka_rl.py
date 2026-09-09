@@ -73,6 +73,7 @@ class CkaRlAgent(PolicySpaceMixin, nn.Module):
         composition_space="parameter",
         projection_epochs=16,
         projection_max_samples=20000,
+        policy_student_replay=False,
     ):
         super().__init__()
         if composition_space not in ("parameter", "policy"):
@@ -80,6 +81,9 @@ class CkaRlAgent(PolicySpaceMixin, nn.Module):
         if composition_space == "policy" and use_alpha_mass and not constrain_alpha_mass:
             raise ValueError("A probability mixture requires a bounded sigmoid alpha-mass")
         self.composition_space = composition_space
+        self.policy_student_replay = bool(policy_student_replay)
+        if self.policy_student_replay and (composition_space != "policy" or not use_alpha_mass or fusion_mode != "weight_delta"):
+            raise ValueError("policy_student_replay requires policy composition, weight_delta, and alpha-mass")
         self.projection_epochs = int(projection_epochs)
         self.projection_max_samples = int(projection_max_samples)
         if self.projection_epochs < 1 or self.projection_max_samples < 2:
@@ -698,7 +702,10 @@ class CkaRlAgent(PolicySpaceMixin, nn.Module):
         self.last_merge_info = None
         self.last_distill_metrics = {}
         if self.composition_space == "policy":
-            self.project_policy_for_storage()
+            if self.policy_student_replay:
+                self.store_novel_policy_for_storage()
+            else:
+                self.project_policy_for_storage()
         else:
             self.mean_pool.finalize_own_contribution()
             self.logstd_pool.finalize_own_contribution()

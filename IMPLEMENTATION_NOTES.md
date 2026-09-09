@@ -275,3 +275,7 @@ Primary references used to inspect interfaces and the supplied baseline:
 - https://arxiv.org/abs/2510.19314
 - https://arxiv.org/html/2510.19314v2 (Appendices C.1 and D)
 - https://gymnasium.farama.org/environments/mujoco/hopper/
+
+## Replay-trained policy student variant
+
+The updated code adds `--policy-student-replay` for the combined policy-space condition. The execution Gaussian mixture controls the environment, while the standalone current expert is optimized from replay with SAC; alpha and alpha-mass are then optimized in a separate routing step. The new condition is labeled `combined_policy_student`, stores the standalone novel expert directly, and leaves ordinary `combined_policy` unchanged. See `POLICY_STUDENT_REPLAY.md` for the precise update order and equations.

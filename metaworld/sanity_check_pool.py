@@ -432,6 +432,65 @@ def check_friend_policy_controls():
     shutil.rmtree(root, ignore_errors=True)
     print("  observation-skip + learned/fixed alpha-scale modes OK")
 
+
+def check_policy_student_replay_mode():
+    print("\n=== replay-trained standalone policy-student check ===")
+    from policy_composition import novel_sac_actor_objective, mixture_weight_sac_actor_objective
+
+    root = f"{TMP_ROOT}/policy_student"
+    shutil.rmtree(root, ignore_errors=True)
+    d0 = f"{root}/task0"
+    m0 = CkaRlAgent(
+        OBS_DIM, ACT_DIM, None, None, pool_size=3, distillation=True,
+        fusion_mode="weight_delta", use_alpha_mass=True,
+        composition_space="policy", policy_student_replay=True,
+    )
+    train_a_bit(m0, steps=1)
+    m0.set_own_buffer(fake_buffer(32, task_id=0, source_id=0))
+    m0.set_base(); m0.save(d0)
+
+    m1 = CkaRlAgent(
+        OBS_DIM, ACT_DIM, d0, d0, pool_size=3, distillation=True,
+        fusion_mode="weight_delta", use_alpha_mass=True,
+        composition_space="policy", policy_student_replay=True,
+        encoder_from_base=True,
+    )
+    x = torch.randn(16, OBS_DIM)
+    action_scale = torch.ones(ACT_DIM)
+    action_bias = torch.zeros(ACT_DIM)
+
+    class Q(torch.nn.Module):
+        def forward(self, obs, action):
+            return -(action.square().sum(-1, keepdim=True))
+    q1 = Q(); q2 = Q()
+
+    for p in m1.parameters():
+        p.grad = None
+    loss = novel_sac_actor_objective(m1, x, q1, q2, 0.2, action_scale, action_bias)
+    loss.backward()
+    own = [getattr(pool, "own_" + key) for pool in (m1.mean_pool, m1.logstd_pool) for key in
+           ("l0_weight", "l0_bias", "l2_weight", "l2_bias")]
+    assert any(p.grad is not None and torch.count_nonzero(p.grad) for p in own)
+    assert m1.alpha.grad is None and m1.alpha_mass.grad is None
+
+    for p in m1.parameters():
+        p.grad = None
+    routing = mixture_weight_sac_actor_objective(m1, x, q1, q2, 0.2, action_scale, action_bias)
+    routing.backward()
+    assert m1.alpha.grad is not None
+    assert m1.alpha_mass.grad is not None
+    assert all(p.grad is None for p in own), "routing loss leaked gradient into novel expert"
+
+    before = {key: getattr(m1.mean_pool, "own_" + key).detach().clone()
+              for key in ("l0_weight", "l0_bias", "l2_weight", "l2_bias")}
+    m1.set_own_buffer(fake_buffer(32, task_id=1, source_id=1))
+    m1.finalize()
+    assert m1.last_projection_metrics.get("policy/storage_used_novel_expert") == 1.0
+    for key, value in before.items():
+        assert torch.equal(m1.mean_pool.pool[0][key], value)
+    shutil.rmtree(root, ignore_errors=True)
+    print("  novel SAC gradient / alpha-only gradient / direct novel storage OK")
+
 def main():
     torch.manual_seed(0)
     np.random.seed(0)
@@ -447,6 +506,7 @@ def main():
     check_encoder_policy_flags()
     check_distill_selection_ablation()
     check_friend_policy_controls()
+    check_policy_student_replay_mode()
 
     shutil.rmtree(TMP_ROOT, ignore_errors=True)
     print("\n*** ALL CHECKS PASSED ***")

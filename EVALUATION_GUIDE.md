@@ -250,3 +250,7 @@ projection cost: equal environment interactions do not imply equal compute.
 A meaningful claim of better consolidation needs more than low KL: check
 post-consolidation retention under the same evaluation rule. Do not reuse the
 draft's earlier performance tables as evidence for this revised implementation.
+
+## Replay-trained policy student variant
+
+The updated code adds `--policy-student-replay` for the combined policy-space condition. The execution Gaussian mixture controls the environment, while the standalone current expert is optimized from replay with SAC; alpha and alpha-mass are then optimized in a separate routing step. The new condition is labeled `combined_policy_student`, stores the standalone novel expert directly, and leaves ordinary `combined_policy` unchanged. See `POLICY_STUDENT_REPLAY.md` for the precise update order and equations.

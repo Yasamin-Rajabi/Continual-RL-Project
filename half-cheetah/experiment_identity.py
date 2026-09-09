@@ -33,6 +33,7 @@ TRAINING_KEYS = (
     "cuda",
     "fusion_mode",
     "composition_space",
+    "policy_student_replay",
     "projection_epochs",
     "projection_max_samples",
     "eval_action_mode",

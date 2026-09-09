@@ -249,7 +249,3 @@ gym_tmp/
 
 # results directories
 _walker2d_*
-
-
-artifacts/
-half-cheetah/artifacts/

@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=causal
-#SBATCH --output=logs/mw-main_%j.out
-#SBATCH --error=logs/mw-main_%j.err
+#SBATCH --output=logs/mw-scratch_%j.out
+#SBATCH --error=logs/mw-scratch_%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
@@ -18,15 +18,13 @@ cd "$SCRIPT_DIR"
 
 EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-artifacts/ethos_student_metaworld_paper10_150k}"
 SCRATCH_ROOT_BASE="$EXPERIMENT_ROOT/scratch"
-SCRATCH_JOB_ID_FILE="$SCRATCH_ROOT_BASE/job_ids.env"
+JOB_ID_FILE="$SCRATCH_ROOT_BASE/job_ids.env"
 SCRATCH_SEEDS=(101 102 103)
-
-VARIANTS=(baseline combined combined_policy combined_policy_student)
 EVAL_MODES=(deterministic stochastic)
 
-COMMON_ARGS=(
+SCRATCH_ARGS=(
     --task-suites mw_paper10
-    --seeds 1 2 3
+    --variants plain
     --total-timesteps 1000000
     --pool-size 8
     --batch-size 128
@@ -47,9 +45,6 @@ COMMON_ARGS=(
     --random-actions-end 5000
     --eval-every 10000
     --num-evals 5
-    --retention-eval-episodes 5
-    --test-adapt-steps 0
-    --frozen-eval-policy pool
     --no-distill-observation-skip
     --distill-buffer-steps 10000
     --similarity-samples 2048
@@ -65,86 +60,57 @@ COMMON_ARGS=(
     --no-freeze-root-encoder
     --encoder-from-base
     --no-encoder-linear-out
-    --no-condition-alpha-scale
-    --no-use-alpha-scale
-    --no-fix-alpha-scale
-    --weight-use-alpha-mass
     --constrain-alpha-mass
 )
 
 
-COMBINED_POLICY_ARGS=(
-    --projection-epochs 32
-    --projection-max-samples 50000
-)
-
-COMBINED_POLICY_STUDENT_ARGS=(
-    --policy-student-replay
-)
-
-variant_mapping() {
-    local variant="$1"
-    case "$variant" in
-        baseline)        echo "1 parameter" ;;
-        combined)        echo "4 parameter" ;;
-        combined_policy)         echo "4 policy" ;;
-        combined_policy_student) echo "4 policy" ;;
-        *) return 1 ;;
-    esac
-}
-
 if [[ "${1:-}" != "--worker" ]]; then
-    mkdir -p logs "$EXPERIMENT_ROOT/main"
-    if [[ ! -f "$SCRATCH_JOB_ID_FILE" ]]; then
-        echo "ERROR: missing $SCRATCH_JOB_ID_FILE" >&2
-        echo "Run 'bash job_scratch.sh' first. You do not need to wait for it to finish." >&2
-        exit 2
-    fi
-    source "$SCRATCH_JOB_ID_FILE"
-    : "${SCRATCH_DETERMINISTIC_JOB_IDS:?Missing deterministic scratch IDs}"
-    : "${SCRATCH_STOCHASTIC_JOB_IDS:?Missing stochastic scratch IDs}"
-
+    mkdir -p logs "$SCRATCH_ROOT_BASE"
     SCRIPT_PATH="$(realpath "$0")"
+    : > "$JOB_ID_FILE"
+
     echo "============================================================"
-    echo "Submitting MetaWorld paper10 main runs"
-    echo "Methods: ${VARIANTS[*]}"
+    echo "Submitting MetaWorld paper10 FT scratch baselines"
     echo "Modes: ${EVAL_MODES[*]}"
-    echo "FT: enabled"
+    echo "Scratch seeds: ${SCRATCH_SEEDS[*]}"
+    echo "Root: $SCRATCH_ROOT_BASE"
     echo "============================================================"
 
     for mode in "${EVAL_MODES[@]}"; do
-        if [[ "$mode" == "deterministic" ]]; then
-            dep_ids="$SCRATCH_DETERMINISTIC_JOB_IDS"
-        else
-            dep_ids="$SCRATCH_STOCHASTIC_JOB_IDS"
-        fi
-        for variant in "${VARIANTS[@]}"; do
-            safe_variant="${variant//_/-}"
+        ids=()
+        for seed in "${SCRATCH_SEEDS[@]}"; do
             job_id="$(
-                sbatch --parsable                     --dependency="afterok:${dep_ids}"                     --job-name="causal"                     --output="logs/${variant}_${mode}_%j.out"                     --error="logs/${variant}_${mode}_%j.err"                     "$SCRIPT_PATH" --worker "$variant" "$mode"
+                sbatch --parsable                     --job-name="causal"                     --output="logs/scratch_${mode}_seed${seed}_%j.out"                     --error="logs/scratch_${mode}_seed${seed}_%j.err"                     "$SCRIPT_PATH" --worker "$mode" "$seed"
             )"
             job_id="${job_id%%;*}"
-            echo "[submitted] $variant / $mode -> $job_id (afterok:$dep_ids)"
+            ids+=("$job_id")
+            echo "[submitted] $mode seed $seed -> $job_id"
         done
+        joined="$(IFS=:; echo "${ids[*]}")"
+        if [[ "$mode" == "deterministic" ]]; then
+            printf 'SCRATCH_DETERMINISTIC_JOB_IDS="%s"
+' "$joined" >> "$JOB_ID_FILE"
+        else
+            printf 'SCRATCH_STOCHASTIC_JOB_IDS="%s"
+' "$joined" >> "$JOB_ID_FILE"
+        fi
     done
-    echo "All eight main jobs submitted. They wait for matching scratch jobs."
+
+    echo "[saved] dependency IDs -> $JOB_ID_FILE"
+    echo "Now run: bash job.sh"
+    echo "No manual wait is needed; the main jobs use SLURM dependencies."
     exit 0
 fi
 
-VARIANT="${2:?Missing variant}"
-EVAL_MODE="${3:?Missing evaluation mode}"
-read -r CONDITION_INDEX COMPOSITION_SPACE <<<"$(variant_mapping "$VARIANT")" || {
-    echo "ERROR: unsupported variant: $VARIANT" >&2
-    exit 2
-}
+EVAL_MODE="${2:?Missing evaluation mode}"
+SCRATCH_SEED="${3:?Missing scratch seed}"
 if [[ "$EVAL_MODE" != "deterministic" && "$EVAL_MODE" != "stochastic" ]]; then
     echo "ERROR: evaluation mode must be deterministic or stochastic" >&2
     exit 2
 fi
 
-RUN_ROOT="$EXPERIMENT_ROOT/main/${VARIANT}_${EVAL_MODE}"
 SCRATCH_MODE_ROOT="$SCRATCH_ROOT_BASE/$EVAL_MODE"
-mkdir -p "$RUN_ROOT/agents" "$RUN_ROOT/runs" "$RUN_ROOT/plots" "$RUN_ROOT/analysis"
+mkdir -p "$SCRATCH_MODE_ROOT/models" "$SCRATCH_MODE_ROOT/runs" "$SCRATCH_MODE_ROOT/analysis"
 
 
 module purge
@@ -234,43 +200,14 @@ VERIFY
 python -m pip check
 
 
-if [[ ! -d "$SCRATCH_MODE_ROOT/runs/scratch" ]]; then
-    echo "ERROR: scratch TensorBoard logs are missing: $SCRATCH_MODE_ROOT/runs/scratch" >&2
-    exit 3
-fi
-if [[ -e "$RUN_ROOT/runs/scratch" && ! -L "$RUN_ROOT/runs/scratch" ]]; then
-    echo "ERROR: $RUN_ROOT/runs/scratch exists and is not a symlink" >&2
-    exit 3
-fi
-rm -f "$RUN_ROOT/runs/scratch"
-ln -s "$(realpath "$SCRATCH_MODE_ROOT/runs/scratch")" "$RUN_ROOT/runs/scratch"
-
-VARIANT_ARGS=()
-case "$VARIANT" in
-    combined_policy)
-        VARIANT_ARGS=("${COMBINED_POLICY_ARGS[@]}")
-        ;;
-    combined_policy_student)
-        VARIANT_ARGS=("${COMBINED_POLICY_STUDENT_ARGS[@]}")
-        ;;
-esac
-
 echo "============================================================"
-echo "[main] environment:  MetaWorld paper10"
-echo "[main] variant:      $VARIANT"
-echo "[main] evaluation:   $EVAL_MODE"
-echo "[main] condition:    $CONDITION_INDEX"
-echo "[main] composition:  $COMPOSITION_SPACE"
-echo "[main] FT scratch:   $SCRATCH_MODE_ROOT"
-echo "[main] output:       $RUN_ROOT"
+echo "[scratch] environment: MetaWorld paper10"
+echo "[scratch] mode:        $EVAL_MODE"
+echo "[scratch] seed:        $SCRATCH_SEED"
+echo "[scratch] suite:       mw_paper10"
+echo "[scratch] root:        $SCRATCH_MODE_ROOT"
 echo "============================================================"
 
-python -u sanity_check_pool.py
+python -u scratch_baselines.py     "${SCRATCH_ARGS[@]}"     --seeds "$SCRATCH_SEED"     --eval-action-mode "$EVAL_MODE"     --save-root "$SCRATCH_MODE_ROOT/models"     --runs-root "$SCRATCH_MODE_ROOT/runs"     --analysis-root "$SCRATCH_MODE_ROOT/analysis"
 
-srun python -u run_continual_benchmark.py     "${COMMON_ARGS[@]}"     "${VARIANT_ARGS[@]}"     --eval-action-mode "$EVAL_MODE"     --condition-index "$CONDITION_INDEX"     --composition-spaces "$COMPOSITION_SPACE"     --scratch-seeds "${SCRATCH_SEEDS[@]}"     --scratch-save-root "$SCRATCH_MODE_ROOT/models"     --save-root "$RUN_ROOT/agents"     --runs-root "$RUN_ROOT/runs"     --plots-root "$RUN_ROOT/plots"     --analysis-root "$RUN_ROOT/analysis"
-
-echo "============================================================"
-echo "[done] $VARIANT / $EVAL_MODE"
-echo "[done] survey metrics (including FT): $RUN_ROOT/plots/mw_paper10/survey_metrics.csv"
-echo "[done] plots: $RUN_ROOT/plots"
-echo "============================================================"
+echo "[done] scratch $EVAL_MODE seed $SCRATCH_SEED"

@@ -22,7 +22,10 @@ from analysis_logging import effective_theta_vector, log_training_state, save_ta
 from cka_rl import CkaRlAgent
 from experiment_identity import write_manifest
 from policy_utils import bound_log_std
-from policy_composition import sample_action, representative_action, sac_actor_objective
+from policy_composition import (
+    sample_action, representative_action, sac_actor_objective,
+    novel_sac_actor_objective, mixture_weight_sac_actor_objective,
+)
 from training_protocol import TaskBudget, mixture_warmup_active, bounded_buffer
 from shared_arch import shared
 from tasks import get_task, get_task_name
@@ -35,6 +38,10 @@ class Args:
     fusion_mode: Literal["classic_cka", "weight_delta"] = "classic_cka"
     eval_action_mode: Literal["deterministic", "stochastic"] = "deterministic"
     composition_space: Literal["parameter", "policy"] = "parameter"
+    policy_student_replay: bool = False
+    """Policy-space student variant: execute the full mixture, train only the
+    standalone novel expert from replay, then update alpha/alpha-mass in a
+    separate routing step. Historical expert heads remain frozen."""
     projection_epochs: int = 16
     projection_max_samples: int = 20_000
     distill_buffer_steps: Optional[int] = None
@@ -207,6 +214,16 @@ class Actor(nn.Module):
     def actor_objective(self, obs, q1, q2, temperature):
         return sac_actor_objective(self.model, obs, q1, q2, temperature,
                                    self.action_scale, self.action_bias)
+
+    def novel_actor_objective(self, obs, q1, q2, temperature):
+        return novel_sac_actor_objective(
+            self.model, obs, q1, q2, temperature, self.action_scale, self.action_bias
+        )
+
+    def mixture_weight_objective(self, obs, q1, q2, temperature):
+        return mixture_weight_sac_actor_objective(
+            self.model, obs, q1, q2, temperature, self.action_scale, self.action_bias
+        )
 
 
 @torch.no_grad()
@@ -391,6 +408,13 @@ def _validate_args(args):
             raise ValueError("Policy composition requires B >= 2 and a nonempty projection budget")
         if args.use_alpha_mass and not args.constrain_alpha_mass:
             raise ValueError("Policy mixtures require --constrain-alpha-mass")
+    if args.policy_student_replay:
+        if args.composition_space != "policy":
+            raise ValueError("--policy-student-replay requires --composition-space=policy")
+        if args.fusion_mode != "weight_delta" or not args.use_alpha_mass:
+            raise ValueError("--policy-student-replay requires weight_delta with alpha-mass")
+        if not args.distillation:
+            raise ValueError("--policy-student-replay is the combined behavioral-distillation variant")
     if args.fusion_mode == "classic_cka" and args.use_alpha_mass:
         raise ValueError("--use-alpha-mass is only valid with --fusion-mode=weight_delta")
     if args.use_alpha_scale and args.fix_alpha_scale:
@@ -483,6 +507,7 @@ if __name__ == "__main__":
         composition_space=args.composition_space,
         projection_epochs=args.projection_epochs,
         projection_max_samples=args.projection_max_samples,
+        policy_student_replay=args.policy_student_replay,
         use_alpha_mass=args.use_alpha_mass,
         use_alpha_scale=args.use_alpha_scale,
         fix_alpha_scale=args.fix_alpha_scale,
@@ -563,7 +588,23 @@ if __name__ == "__main__":
         param_groups.append({"params": fc_params, "lr": encoder_lr})
     if alpha_param_objs:
         param_groups.append({"params": alpha_param_objs, "lr": args.alpha_lr})
-    actor_optimizer = optim.Adam(param_groups)
+
+    actor_optimizer = None
+    novel_optimizer = None
+    mixture_optimizer = None
+    if args.policy_student_replay:
+        novel_groups = []
+        if own_params:
+            novel_groups.append({"params": own_params, "lr": args.policy_lr})
+        if fc_params:
+            novel_groups.append({"params": fc_params, "lr": encoder_lr})
+        if not novel_groups:
+            raise RuntimeError("Policy-student mode has no trainable novel-expert parameters")
+        novel_optimizer = optim.Adam(novel_groups)
+        if alpha_param_objs:
+            mixture_optimizer = optim.Adam([{"params": alpha_param_objs, "lr": args.alpha_lr}])
+    else:
+        actor_optimizer = optim.Adam(param_groups)
 
     # The whole knowledge-vector formulation assumes a FIXED basis: every stored
     # pool entry was learned relative to one particular encoder. If the encoder
@@ -629,6 +670,8 @@ if __name__ == "__main__":
 
     obs, _ = envs.reset(seed=args.seed)
     actor_loss = None
+    novel_actor_loss = None
+    mixture_actor_loss = None
     alpha_loss = None
     drift_loss = None
     alpha_entropy = None
@@ -681,56 +724,108 @@ if __name__ == "__main__":
 
             if global_step % args.policy_frequency == 0:
                 for _ in range(args.policy_frequency):
-                    actor_loss = actor.actor_objective(data.observations, qf1, qf2, alpha)
-
                     drift_loss = None
-                    if (
-                        args.distillation and old_fc is not None and past_obs_pool is not None
-                        and args.drift_reg > 0
-                    ):
-                        drift_idx = np.random.randint(0, len(past_obs_pool), size=args.batch_size)
-                        s_past = torch.as_tensor(
-                            past_obs_pool[drift_idx], dtype=torch.float32, device=device
-                        )
-                        with torch.no_grad():
-                            phi_old = old_fc(s_past)
-                        phi_curr = actor.model.fc(s_past)
-                        drift_loss = args.drift_reg * F.mse_loss(phi_curr, phi_old)
-                        actor_loss = actor_loss + drift_loss
-
-                    # mixture_warmup was set before choosing this step's action.
-                    # A singleton pool still gets a historical-only phase;
-                    # its alpha gradient is correctly zero (there is no choice).
                     alpha_entropy = None
-                    if mixture_warmup and args.alpha_entropy_reg > 0:
-                        scale = actor.model.alpha_scale if actor.model.alpha_scale is not None else 1.0
-                        probs = torch.softmax(actor.model.alpha * scale, dim=-1)
-                        alpha_entropy = -(probs * torch.log(probs + 1e-8)).sum()
-                        actor_loss = actor_loss - args.alpha_entropy_reg * alpha_entropy
-
                     mass_loss = None
-                    if (
-                        not mixture_warmup and actor.model.alpha_mass is not None
-                        and actor.model.alpha_mass.requires_grad and args.alpha_mass_reg > 0
-                    ):
-                        eff_mass = actor.model.mean_pool.effective_alpha_mass()
-                        mass_loss = args.alpha_mass_reg * (eff_mass ** 2) * ((eff_mass - 1.0) ** 2)
-                        actor_loss = actor_loss + mass_loss.mean()
+                    novel_actor_loss = None
+                    mixture_actor_loss = None
 
-                    actor_optimizer.zero_grad()
-                    actor_loss.backward()
+                    if args.policy_student_replay:
+                        # Alternating policy-student update. The replay buffer is
+                        # generated by the execution mixture. During warmup only
+                        # routing coefficients move. Afterwards: (1) update the
+                        # standalone novel expert from replay states using SAC;
+                        # then (2) update alpha/alpha-mass against the freshly
+                        # updated execution mixture, with all expert functions
+                        # detached in the routing objective.
+                        if not mixture_warmup:
+                            novel_actor_loss = actor.novel_actor_objective(
+                                data.observations, qf1, qf2, alpha
+                            )
+                            if (
+                                args.distillation and old_fc is not None and past_obs_pool is not None
+                                and args.drift_reg > 0
+                            ):
+                                drift_idx = np.random.randint(0, len(past_obs_pool), size=args.batch_size)
+                                s_past = torch.as_tensor(
+                                    past_obs_pool[drift_idx], dtype=torch.float32, device=device
+                                )
+                                with torch.no_grad():
+                                    phi_old = old_fc(s_past)
+                                phi_curr = actor.model.fc(s_past)
+                                drift_loss = args.drift_reg * F.mse_loss(phi_curr, phi_old)
+                                novel_actor_loss = novel_actor_loss + drift_loss
+                            novel_optimizer.zero_grad()
+                            novel_actor_loss.backward()
+                            novel_optimizer.step()
 
-                    # Friend method: weight-delta warmup first learns how to mix
-                    # historical slots before allowing the new residual or mass to move.
-                    if mixture_warmup:
-                        # None also prevents Adam momentum from moving a frozen
-                        # parameter. Freeze a trainable encoder during search too.
-                        for p in own_params + fc_params:
-                            p.grad = None
-                        if actor.model.alpha_mass is not None:
-                            actor.model.alpha_mass.grad = None
+                        if mixture_optimizer is not None:
+                            mixture_actor_loss = actor.mixture_weight_objective(
+                                data.observations, qf1, qf2, alpha
+                            )
+                            if mixture_warmup and args.alpha_entropy_reg > 0:
+                                scale = actor.model.alpha_scale if actor.model.alpha_scale is not None else 1.0
+                                probs = torch.softmax(actor.model.alpha * scale, dim=-1)
+                                alpha_entropy = -(probs * torch.log(probs + 1e-8)).sum()
+                                mixture_actor_loss = mixture_actor_loss - args.alpha_entropy_reg * alpha_entropy
+                            if (
+                                not mixture_warmup and actor.model.alpha_mass is not None
+                                and actor.model.alpha_mass.requires_grad and args.alpha_mass_reg > 0
+                            ):
+                                eff_mass = actor.model.mean_pool.effective_alpha_mass()
+                                mass_loss = args.alpha_mass_reg * (eff_mass ** 2) * ((eff_mass - 1.0) ** 2)
+                                mixture_actor_loss = mixture_actor_loss + mass_loss.mean()
+                            mixture_optimizer.zero_grad()
+                            mixture_actor_loss.backward()
+                            mixture_optimizer.step()
 
-                    actor_optimizer.step()
+                        actor_loss = novel_actor_loss if novel_actor_loss is not None else mixture_actor_loss
+                    else:
+                        actor_loss = actor.actor_objective(data.observations, qf1, qf2, alpha)
+
+                        if (
+                            args.distillation and old_fc is not None and past_obs_pool is not None
+                            and args.drift_reg > 0
+                        ):
+                            drift_idx = np.random.randint(0, len(past_obs_pool), size=args.batch_size)
+                            s_past = torch.as_tensor(
+                                past_obs_pool[drift_idx], dtype=torch.float32, device=device
+                            )
+                            with torch.no_grad():
+                                phi_old = old_fc(s_past)
+                            phi_curr = actor.model.fc(s_past)
+                            drift_loss = args.drift_reg * F.mse_loss(phi_curr, phi_old)
+                            actor_loss = actor_loss + drift_loss
+
+                        # mixture_warmup was set before choosing this step's action.
+                        # A singleton pool still gets a historical-only phase;
+                        # its alpha gradient is correctly zero (there is no choice).
+                        if mixture_warmup and args.alpha_entropy_reg > 0:
+                            scale = actor.model.alpha_scale if actor.model.alpha_scale is not None else 1.0
+                            probs = torch.softmax(actor.model.alpha * scale, dim=-1)
+                            alpha_entropy = -(probs * torch.log(probs + 1e-8)).sum()
+                            actor_loss = actor_loss - args.alpha_entropy_reg * alpha_entropy
+
+                        if (
+                            not mixture_warmup and actor.model.alpha_mass is not None
+                            and actor.model.alpha_mass.requires_grad and args.alpha_mass_reg > 0
+                        ):
+                            eff_mass = actor.model.mean_pool.effective_alpha_mass()
+                            mass_loss = args.alpha_mass_reg * (eff_mass ** 2) * ((eff_mass - 1.0) ** 2)
+                            actor_loss = actor_loss + mass_loss.mean()
+
+                        actor_optimizer.zero_grad()
+                        actor_loss.backward()
+
+                        # Weight-delta warmup first learns how to mix historical
+                        # slots before allowing the new residual or mass to move.
+                        if mixture_warmup:
+                            for p in own_params + fc_params:
+                                p.grad = None
+                            if actor.model.alpha_mass is not None:
+                                actor.model.alpha_mass.grad = None
+
+                        actor_optimizer.step()
 
                     if args.autotune:
                         with torch.no_grad():
@@ -755,6 +850,10 @@ if __name__ == "__main__":
                 writer.add_scalar("losses/qf_loss", 0.5 * qf_loss.item(), global_step)
                 if actor_loss is not None:
                     writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
+                if novel_actor_loss is not None:
+                    writer.add_scalar("losses/novel_actor_loss", novel_actor_loss.item(), global_step)
+                if mixture_actor_loss is not None:
+                    writer.add_scalar("losses/mixture_weight_actor_loss", mixture_actor_loss.item(), global_step)
                 if drift_loss is not None:
                     writer.add_scalar("losses/encoder_drift_reg", float(drift_loss.item()), global_step)
                 if alpha_entropy is not None:

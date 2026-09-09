@@ -80,6 +80,20 @@ class PolicySpaceMixin:
     def policy_components(self, obs):
         return self._components_at_features(self._head_features(obs))
 
+    def novel_policy_components(self, obs):
+        """Return the standalone current expert, independent of alpha/gating.
+
+        In the policy-student mode this is the policy optimized from replay and
+        ultimately inserted into the bounded pool.  Historical slots are not
+        included in these logits.
+        """
+        z = self._head_features(obs)
+        values = []
+        for pool in (self.mean_pool, self.logstd_pool):
+            own = tuple(getattr(pool, "own_" + key) for key in KEYS)
+            values.append(pool._forward_with_weights(z, own))
+        return values[0], bound_log_std(values[1])
+
     def export_policy_ensemble(self):
         heads, weights = self._ensemble_heads()
         return {
@@ -94,6 +108,31 @@ class PolicySpaceMixin:
             "mixture_weights": weights.detach().cpu().clone(),
             "mean_components": {k: v.detach().cpu().clone() for k, v in heads[0].items()},
             "logstd_components": {k: v.detach().cpu().clone() for k, v in heads[1].items()},
+        }
+
+    def store_novel_policy_for_storage(self):
+        """Insert the learned standalone novel expert without mixture projection.
+
+        This is used only by the replay-trained policy-student variant.  It is
+        intentionally different from ``project_policy_for_storage``: the point
+        of the variant is to test whether the current expert itself becomes
+        sufficient (alpha-mass -> 0), rather than hiding residual dependence on
+        history by projecting the final execution ensemble.
+        """
+        if self.composition_space != "policy" or not self.use_alpha_mass:
+            raise RuntimeError("novel-policy storage requires gated policy-space composition")
+        if self.fusion_mode != "weight_delta":
+            raise RuntimeError("novel-policy storage is defined for full-weight/weight_delta entries")
+        buffer = self.mean_pool.own_buffer
+        for pool in (self.mean_pool, self.logstd_pool):
+            entry = {key: getattr(pool, "own_" + key).detach().clone() for key in KEYS}
+            entry["buffer"] = buffer if pool is self.mean_pool else None
+            pool.pool = [entry] + pool.pool
+            pool.reset_own_to_zero()
+        self.last_projection_metrics = {
+            "policy/storage_used_novel_expert": 1.0,
+            "policy/projection_components": 0,
+            "policy/projection_rows": 0 if buffer is None else int(len(buffer.get("obs", ()))),
         }
 
     def project_policy_for_storage(self):

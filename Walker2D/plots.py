@@ -39,6 +39,8 @@ TRAIN_METRICS = {
     "charts/test_episode_length": ("Evaluation episode length", "eval_episode_length"),
     "charts/test_fall_rate": ("Evaluation fall rate", "eval_fall_rate"),
     "losses/actor_loss": ("SAC actor loss", "actor_loss"),
+    "losses/novel_actor_loss": ("Standalone novel-expert SAC loss", "novel_actor_loss"),
+    "losses/mixture_weight_actor_loss": ("Execution-mixture routing loss", "mixture_weight_actor_loss"),
     "losses/qf_loss": ("SAC critic loss", "critic_loss"),
     "losses/alpha": ("SAC entropy coefficient", "entropy_alpha"),
     "analysis/theta/drift_from_task_start_l2": ("Actor drift from task start", "theta_drift"),

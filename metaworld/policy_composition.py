@@ -80,6 +80,48 @@ def sac_actor_objective(model, obs, q1, q2, temperature, action_scale, action_bi
     return ((temperature * lp - q) * weights[None, :]).sum(-1).mean()
 
 
+def novel_sac_actor_objective(model, obs, q1, q2, temperature, action_scale, action_bias):
+    """Standard SAC actor loss for the standalone current/novel Gaussian expert.
+
+    Replay states may have been collected by the execution mixture.  Only the
+    novel expert is sampled here, so gradients do not update historical experts
+    or the mixture weights/gate.
+    """
+    if not hasattr(model, "novel_policy_components"):
+        raise TypeError("model does not expose a standalone novel policy")
+    mean, log_std = model.novel_policy_components(obs)
+    normal = torch.distributions.Normal(mean, log_std.exp())
+    pre = normal.rsample()
+    action = pre.tanh() * action_scale + action_bias
+    log_prob = normal.log_prob(pre).sum(-1) - squash_log_det(pre, action_scale)
+    q = torch.minimum(q1(obs, action), q2(obs, action)).view(-1)
+    return (temperature * log_prob - q).mean()
+
+
+def mixture_weight_sac_actor_objective(model, obs, q1, q2, temperature, action_scale, action_bias):
+    """SAC objective for alpha/alpha-mass with expert functions held fixed.
+
+    This is the same stratified expectation used by ``sac_actor_objective``,
+    except component Gaussian parameters are detached.  The outer mixture
+    weights and the mixture log density remain differentiable, so this update
+    changes only the routing coefficients when paired with an alpha-only
+    optimizer.
+    """
+    means, log_stds, weights = components(model, obs)
+    means = means.detach()
+    log_stds = log_stds.detach()
+    # No pathwise expert gradient is wanted in the routing step.
+    pre = torch.distributions.Normal(means, log_stds.exp()).sample()
+    actions = pre.tanh() * action_scale + action_bias
+    lp = normal_mixture_log_prob(pre, means, log_stds, weights) - squash_log_det(pre, action_scale)
+    batch, count, act_dim = actions.shape
+    repeated_obs = obs[:, None, :].expand(-1, count, -1).reshape(batch * count, -1)
+    flat_actions = actions.reshape(batch * count, act_dim)
+    with torch.no_grad():
+        q = torch.minimum(q1(repeated_obs, flat_actions), q2(repeated_obs, flat_actions)).reshape(batch, count)
+    return ((temperature * lp - q) * weights[None, :]).sum(-1).mean()
+
+
 def gaussian_summary(means, log_stds, weights):
     """Compatibility/diagnostic moment summary ONLY, never an inference policy."""
     mean = (means * weights[None, :, None]).sum(1)

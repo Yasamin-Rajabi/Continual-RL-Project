@@ -114,6 +114,8 @@ def parse_args():
                    type=int, default=10_000, help="Frozen final B interactions INSIDE total-timesteps.")
     p.add_argument("--composition-spaces", nargs="+", choices=["parameter", "policy"],
                    default=["parameter", "policy"], help="Use parameter alone to disable policy-space runs.")
+    p.add_argument("--policy-student-replay", action=argparse.BooleanOptionalAction, default=False,
+                   help="Policy-space combined variant: execution mixture acts; novel expert learns from replay; then alpha/gate update separately.")
     p.add_argument("--projection-epochs", type=int, default=16)
     p.add_argument("--projection-max-samples", type=int, default=20_000)
     p.add_argument("--frozen-eval-policy", choices=["pool", "snapshot"], default="pool")
@@ -220,6 +222,11 @@ def parse_args():
         p.error("--distill-encoder-lr-mult must be > 0")
     if 0 in args.condition_index and len(args.condition_index) > 1:
         p.error("--condition-index 0 means all conditions and cannot be combined with other indices")
+    if args.policy_student_replay:
+        if args.composition_spaces != ["policy"]:
+            p.error("--policy-student-replay must be run with --composition-spaces policy only")
+        if args.condition_index != [4]:
+            p.error("--policy-student-replay is defined for --condition-index 4 (combined) only")
 
     if not 0 <= args.distill_extra_steps < args.total_timesteps:
         p.error("Require 0 <= B < Delta")
@@ -252,6 +259,7 @@ def _expected_training_config(args, suite, task_id, seq_idx, seed, cfg):
         "cuda": not bool(args.cpu),
         "fusion_mode": cfg["fusion_mode"],
         "composition_space": cfg.get("composition_space", "parameter"),
+        "policy_student_replay": bool(args.policy_student_replay),
         "projection_epochs": int(args.projection_epochs),
         "projection_max_samples": int(args.projection_max_samples),
         "eval_action_mode": args.eval_action_mode,
@@ -383,6 +391,7 @@ def train_chain(args, suite, condition, cfg, seed):
             f"--analysis-log-every={args.analysis_log_every}",
             f"--fusion-mode={cfg['fusion_mode']}",
             f"--composition-space={cfg.get('composition_space', 'parameter')}",
+            "--policy-student-replay" if args.policy_student_replay else "--no-policy-student-replay",
             f"--projection-epochs={args.projection_epochs}",
             f"--projection-max-samples={args.projection_max_samples}",
             f"--eval-action-mode={args.eval_action_mode}",
@@ -453,11 +462,17 @@ def main():
             if name not in conditions:
                 conditions.append(name)
     # Cross selected methods with composition space without changing the legacy
-    # ablation indices. Only output labels gain a _policy suffix.
+    # ablation indices. The replay-trained standalone-expert variant gets its own
+    # label so it never reuses/overwrites ordinary combined_policy checkpoints.
     selected_conditions = {}
     for name in conditions:
         for space in dict.fromkeys(args.composition_spaces):
-            label = name if space == "parameter" else name + "_policy"
+            if space == "parameter":
+                label = name
+            elif args.policy_student_replay:
+                label = name + "_policy_student"
+            else:
+                label = name + "_policy"
             selected_conditions[label] = {**CONDITIONS[name], "composition_space": space}
     conditions = list(selected_conditions)
     print(f"Conditions: {conditions}")
