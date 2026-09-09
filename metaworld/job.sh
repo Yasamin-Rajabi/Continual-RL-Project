@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=causal
-#SBATCH --output=logs/cka_hc_50k_%j.out
-#SBATCH --error=logs/cka_hc_50k_%j.err
+#SBATCH --output=logs/cka_mw_%j.out
+#SBATCH --error=logs/cka_mw_%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=8G
+#SBATCH --mem=16G
 #SBATCH --time=24:00:00
 #SBATCH --gres=gpu:1
 #SBATCH --partition=h100
@@ -13,37 +13,81 @@
 
 set -euo pipefail
 
+# Always run relative to the canonical metaworld/ directory containing this file.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
 # ============================================================
 # EDIT YOUR EXPERIMENTS HERE
 # ============================================================
 
-# Each entry is submitted as its own SLURM job / H100.
-# Default requested comparison:
 VARIANTS=(
     baseline
     combined
     combined_policy
 )
 
-# All variant outputs live below this root in separate directories.
-RUN_ROOT_BASE="artifacts/cka_halfcheetah_50k"
+# Canonical suite from the fixed code:
+#   mw_paper10 = the 10 CKA-RL Appendix C.1 tasks, repeated twice.
+TASK_SUITE="${TASK_SUITE:-mw_paper10}"
 
-# Hyperparameters shared by every job.
-# Add/remove any run_continual_benchmark.py option here.
+# 150k is a practical first run.
+# For the CKA-RL paper's 1M steps PER TASK:
+#   TOTAL_TIMESTEPS=1000000 bash job_metaworld.sh
+TOTAL_TIMESTEPS="${TOTAL_TIMESTEPS:-1000000}"
+
+# CKA-RL reports K_max=8 for Meta-World.
+POOL_SIZE="${POOL_SIZE:-8}"
+
+# Our preferred pool-search experiment:
+# learning begins at 5k and the historical mixture controls collection from 5k.
+# For the CKA-RL paper's original 10k random-action exploration:
+#   RANDOM_ACTIONS_END=10000 bash job_metaworld.sh
+RANDOM_ACTIONS_END="${RANDOM_ACTIONS_END:-5000}"
+
+DISTILL_BUFFER_STEPS="${DISTILL_BUFFER_STEPS:-10000}"
+
+RUN_ROOT_BASE="${RUN_ROOT_BASE:-artifacts/cka_metaworld_paper10_1000k}"
+
+# Pinned Meta-World commit used by the fixed project.
+--skip-forward-transfer="${MW_COMMIT:-c822f28f582ba1ad49eb5dcf61016566f28003ba}"
+
 COMMON_ARGS=(
-    --task-suites halfcheetah_wind_vel
+    --task-suites "$TASK_SUITE"
     --seeds 1 2 3
-    --total-timesteps 80000
-    --pool-size 5
-    --batch-size 256
-    --policy-lr 3e-4
-    --q-lr 3e-4
+    --total-timesteps "$TOTAL_TIMESTEPS"
+
+    --pool-size "$POOL_SIZE"
+
+    # Meta-World / CKA-RL SAC settings.
+    --batch-size 128
+    --policy-lr 1e-3
+    --q-lr 1e-3
+    --gamma 0.99
+    --tau 0.005
+    --alpha 0.2
+    --autotune
+
+    # Pool-search / exploration schedule.
     --learning-starts 5000
-    --random-actions-end 5000
+    --random-actions-end "$RANDOM_ACTIONS_END"
     --alpha-warmup-steps 5000
-    --eval-every 5000
+
+    # Evaluation.
+    --eval-every 10000
     --num-evals 5
-    --distill-buffer-steps 5000
+    --retention-eval-episodes 5
+    --test-adapt-steps 0
+    --frozen-eval-policy pool
+    --eval-action-mode deterministic
+
+    # Keep every method on the same actor architecture.
+    --no-distill-observation-skip
+
+    # Frozen final B interactions are INSIDE total_timesteps.
+    --distill-buffer-steps "$DISTILL_BUFFER_STEPS"
+
+    # Merge / distillation diagnostics.
     --similarity-samples 2048
     --max-distill-buffer 50000
     --distill-max-samples 20000
@@ -51,10 +95,12 @@ COMMON_ARGS=(
     --distill-lr 5e-4
     --distill-batch-size 256
     --distill-test-frac 0.2
+
+    # Do A_N / FG / BWT now without requiring scratch FT baselines.
+    # Remove this only after matched Meta-World scratch baselines are cached.
+    # --skip-forward-transfer
 )
 
-# Optional per-variant additions or overrides.
-# If a flag also appears in COMMON_ARGS, argparse uses the later value below.
 BASELINE_ARGS=(
 )
 
@@ -62,13 +108,11 @@ COMBINED_ARGS=(
 )
 
 COMBINED_POLICY_ARGS=(
-    # Examples:
     --projection-epochs 32
     --projection-max-samples 50000
-    --eval-action-mode stochastic
 )
 
-# Kept available for later ablations. They do not run unless added to VARIANTS.
+# Kept available for later ablations.
 DISTIL_ONLY_ARGS=(
 )
 WEIGHT_ONLY_ARGS=(
@@ -84,9 +128,6 @@ WEIGHT_ONLY_POLICY_ARGS=(
 # END EXPERIMENT CONFIGURATION
 # ============================================================
 
-# ------------------------------------------------------------
-# Variant -> benchmark mapping
-# ------------------------------------------------------------
 variant_mapping() {
     local variant="$1"
     case "$variant" in
@@ -102,26 +143,8 @@ variant_mapping() {
     esac
 }
 
-variant_extra_args() {
-    local variant="$1"
-    case "$variant" in
-        baseline)             printf '%s\0' "${BASELINE_ARGS[@]}" ;;
-        distil_only)          printf '%s\0' "${DISTIL_ONLY_ARGS[@]}" ;;
-        weight_only)          printf '%s\0' "${WEIGHT_ONLY_ARGS[@]}" ;;
-        combined)             printf '%s\0' "${COMBINED_ARGS[@]}" ;;
-        baseline_policy)      printf '%s\0' "${BASELINE_POLICY_ARGS[@]}" ;;
-        distil_only_policy)   printf '%s\0' "${DISTIL_ONLY_POLICY_ARGS[@]}" ;;
-        weight_only_policy)   printf '%s\0' "${WEIGHT_ONLY_POLICY_ARGS[@]}" ;;
-        combined_policy)      printf '%s\0' "${COMBINED_POLICY_ARGS[@]}" ;;
-        *) return 1 ;;
-    esac
-}
-
 # ------------------------------------------------------------
 # Submission mode
-# Run locally as:
-#     bash submit_slurm_variants.sh
-# It submits this same file once per VARIANT, then exits.
 # ------------------------------------------------------------
 if [[ "${1:-}" != "--worker" ]]; then
     mkdir -p logs "$RUN_ROOT_BASE"
@@ -129,8 +152,12 @@ if [[ "${1:-}" != "--worker" ]]; then
     SCRIPT_PATH="$(realpath "$0")"
 
     echo "============================================================"
-    echo "Submitting variants: ${VARIANTS[*]}"
-    echo "Worker script: $SCRIPT_PATH"
+    echo "Submitting Meta-World variants: ${VARIANTS[*]}"
+    echo "Folder: $SCRIPT_DIR"
+    echo "Suite: $TASK_SUITE"
+    echo "Steps/task: $TOTAL_TIMESTEPS"
+    echo "Pool size: $POOL_SIZE"
+    echo "Random actions end: $RANDOM_ACTIONS_END"
     echo "Run root: $RUN_ROOT_BASE"
     echo "============================================================"
 
@@ -141,8 +168,7 @@ if [[ "${1:-}" != "--worker" ]]; then
         fi
 
         safe_variant="${variant//_/-}"
-        # job_name="cka-${safe_variant}"
-        job_name="causal"
+        job_name="mw-${safe_variant}"
         out_file="logs/${variant}_%j.out"
         err_file="logs/${variant}_%j.err"
 
@@ -165,7 +191,7 @@ if [[ "${1:-}" != "--worker" ]]; then
 fi
 
 # ------------------------------------------------------------
-# Worker mode: entered by SLURM after submission above.
+# Worker mode
 # ------------------------------------------------------------
 VARIANT="${2:?Missing worker variant}"
 read -r CONDITION_INDEX COMPOSITION_SPACE <<<"$(variant_mapping "$VARIANT")" || {
@@ -173,9 +199,7 @@ read -r CONDITION_INDEX COMPOSITION_SPACE <<<"$(variant_mapping "$VARIANT")" || 
     exit 2
 }
 
-# Load optional variant-specific CLI flags into an array without eval.
 VARIANT_ARGS=()
-
 case "$VARIANT" in
     baseline)
         VARIANT_ARGS=("${BASELINE_ARGS[@]}")
@@ -215,17 +239,19 @@ RUN_ROOT="$RUN_ROOT_BASE/$VARIANT"
 module purge
 module load gcc/13.2.0 python/3.9.18 py-virtualenv/20.24.5
 
-cd "${SLURM_SUBMIT_DIR:-$PWD}"
+# Separate Meta-World venv by default.
+VENV="${CKA_VENV:-$HOME/.venvs/cka_metaworld}"
+VENV_LOCK="${VENV}.setup.lock"
 
-# ------------------------------------------------------------
-# Existing virtual environment
-# ------------------------------------------------------------
-VENV="${CKA_VENV:-$HOME/.venvs/cka_halfcheetah}"
+mkdir -p "$(dirname "$VENV")"
+
+# Multiple variants may start simultaneously. Serialize shared-venv setup.
+exec 9>"$VENV_LOCK"
+flock 9
 
 if [[ ! -x "$VENV/bin/python" ]]; then
-    echo "ERROR: virtual environment does not exist:"
-    echo "  $VENV"
-    exit 1
+    echo "[setup] creating virtual environment: $VENV"
+    python -m venv "$VENV"
 fi
 
 source "$VENV/bin/activate"
@@ -233,70 +259,18 @@ source "$VENV/bin/activate"
 export PYTHONNOUSERSITE=1
 export PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Headless MuJoCo
-export MUJOCO_GL=egl
-export PYOPENGL_PLATFORM=egl
-export EGL_DEVICE_ID=0
-export MUJOCO_EGL_DEVICE_ID=0
-export MPLBACKEND=Agg
-
-export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
-export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
+python -m pip install -q --upgrade pip
 
 # ------------------------------------------------------------
-# Output directories
-# ------------------------------------------------------------
-mkdir -p \
-    "$RUN_ROOT/agents" \
-    "$RUN_ROOT/runs" \
-    "$RUN_ROOT/plots" \
-    "$RUN_ROOT/analysis"
-
-echo "============================================================"
-echo "[job] CKA-RL HalfCheetah benchmark"
-echo "[job] ID: ${SLURM_JOB_ID:-unknown}"
-echo "[job] variant: $VARIANT"
-echo "[job] condition-index: $CONDITION_INDEX"
-echo "[job] composition-space: $COMPOSITION_SPACE"
-echo "[job] directory: $PWD"
-echo "[job] venv: $VENV"
-echo "[job] output: $RUN_ROOT"
-echo "============================================================"
-
-python --version
-nvidia-smi
-
-# ------------------------------------------------------------
-# Verify H100
-# ------------------------------------------------------------
-GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1)"
-
-if [[ "$GPU_NAME" != *H100* ]]; then
-    echo "ERROR: expected H100, got: $GPU_NAME" >&2
-    exit 1
-fi
-
-echo "[gpu] $GPU_NAME"
-
-# ------------------------------------------------------------
-# Ensure compatible PyTorch
-#
-# SB3 2.9.0 requires torch >= 2.8.
-# Use official PyTorch 2.8 CUDA 12.6 wheel.
-#
-# We are NOT installing a system CUDA toolkit.
-# The cluster provides the NVIDIA driver.
-# PyTorch brings its CUDA runtime libraries.
+# PyTorch CUDA build
 # ------------------------------------------------------------
 TORCH_VERSION="2.8.0"
 TORCH_CUDA="12.6"
 TORCH_INDEX="https://download.pytorch.org/whl/cu126"
 
 NEED_TORCH=1
-
 if python - <<PY >/dev/null 2>&1
 import torch
-
 assert torch.__version__.split("+")[0] == "$TORCH_VERSION"
 assert torch.version.cuda == "$TORCH_CUDA"
 PY
@@ -306,32 +280,92 @@ fi
 
 if (( NEED_TORCH )); then
     echo "[setup] installing torch $TORCH_VERSION + CUDA $TORCH_CUDA"
-
-    python -m pip uninstall -y \
-        torch torchvision torchaudio triton \
-        >/dev/null 2>&1 || true
-
-    python -m pip install \
-        "torch==$TORCH_VERSION" \
-        --index-url "$TORCH_INDEX"
-else
-    echo "[setup] correct PyTorch build already installed"
+    python -m pip uninstall -y torch torchvision torchaudio triton >/dev/null 2>&1 || true
+    python -m pip install "torch==$TORCH_VERSION" --index-url "$TORCH_INDEX"
 fi
 
 # ------------------------------------------------------------
-# Verify versions
+# Meta-World + remaining Python dependencies
+# ------------------------------------------------------------
+python -m pip install -q "mujoco>=3.0,<4"
+
+MW_MARKER="$VENV/.metaworld_commit"
+CURRENT_MW_COMMIT=""
+if [[ -f "$MW_MARKER" ]]; then
+    CURRENT_MW_COMMIT="$(cat "$MW_MARKER")"
+fi
+
+if [[ "$CURRENT_MW_COMMIT" != "$MW_COMMIT" ]] || ! python -c "import metaworld" >/dev/null 2>&1; then
+    echo "[setup] installing pinned Meta-World commit: $MW_COMMIT"
+    python -m pip uninstall -y metaworld >/dev/null 2>&1 || true
+    python -m pip install --no-deps \
+        "git+https://github.com/Farama-Foundation/Metaworld.git@$MW_COMMIT"
+    printf '%s\n' "$MW_COMMIT" > "$MW_MARKER"
+fi
+
+python -m pip install -q -r requirements.txt
+
+# Shared environment is ready; allow other jobs through.
+flock -u 9
+
+# ------------------------------------------------------------
+# Headless MuJoCo
+# ------------------------------------------------------------
+export MUJOCO_GL=egl
+export PYOPENGL_PLATFORM=egl
+export EGL_DEVICE_ID=0
+export MUJOCO_EGL_DEVICE_ID=0
+export MPLBACKEND=Agg
+
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
+export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
+
+mkdir -p \
+    "$RUN_ROOT/agents" \
+    "$RUN_ROOT/runs" \
+    "$RUN_ROOT/plots" \
+    "$RUN_ROOT/analysis"
+
+echo "============================================================"
+echo "[job] CKA-RL / Ethos Meta-World benchmark"
+echo "[job] ID: ${SLURM_JOB_ID:-unknown}"
+echo "[job] variant: $VARIANT"
+echo "[job] suite: $TASK_SUITE"
+echo "[job] condition-index: $CONDITION_INDEX"
+echo "[job] composition-space: $COMPOSITION_SPACE"
+echo "[job] steps/task: $TOTAL_TIMESTEPS"
+echo "[job] pool size: $POOL_SIZE"
+echo "[job] directory: $PWD"
+echo "[job] venv: $VENV"
+echo "[job] output: $RUN_ROOT"
+echo "============================================================"
+
+python --version
+nvidia-smi
+
+GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1)"
+if [[ "$GPU_NAME" != *H100* ]]; then
+    echo "ERROR: expected H100, got: $GPU_NAME" >&2
+    exit 1
+fi
+echo "[gpu] $GPU_NAME"
+
+# ------------------------------------------------------------
+# Verify versions and CUDA
 # ------------------------------------------------------------
 python - <<'PY'
 import torch
 import stable_baselines3
 import gymnasium
 import mujoco
+import metaworld
 
 print("PyTorch:", torch.__version__)
 print("PyTorch CUDA:", torch.version.cuda)
 print("Stable-Baselines3:", stable_baselines3.__version__)
 print("Gymnasium:", gymnasium.__version__)
 print("MuJoCo:", mujoco.__version__)
+print("Meta-World import:", metaworld.__file__)
 
 if not torch.cuda.is_available():
     raise RuntimeError("CUDA unavailable inside H100 allocation")
@@ -339,21 +373,58 @@ if not torch.cuda.is_available():
 print("GPU:", torch.cuda.get_device_name(0))
 print("Compute capability:", torch.cuda.get_device_capability(0))
 
-# Actual CUDA computation
 a = torch.randn(2048, 2048, device="cuda")
 b = torch.randn(2048, 2048, device="cuda")
 c = a @ b
 torch.cuda.synchronize()
-
-print("CUDA matrix multiplication: OK")
-print("Result device:", c.device)
+print("CUDA matrix multiplication: OK", c.device)
 PY
 
-# Check that pip sees no dependency conflicts
 python -m pip check
 
 # ------------------------------------------------------------
-# CKA structural tests
+# Verify the actual mw_paper10 environments
+# ------------------------------------------------------------
+echo
+echo "============================================================"
+echo "[test] Meta-World task/API check"
+echo "============================================================"
+
+python - <<'PY'
+import numpy as np
+from tasks import TASK_SUITES, default_sequence, get_task
+
+suite = "mw_paper10"
+print("suite:", suite)
+print("tasks:", len(TASK_SUITES[suite]))
+print("sequence:", default_sequence(suite))
+
+shapes = set()
+for task_id, spec in enumerate(TASK_SUITES[suite]):
+    env = get_task(task_id, task_suite=suite)
+    obs, info = env.reset(seed=0)
+    out = env.step(env.action_space.sample())
+    _, _, _, _, step_info = out
+    shape = (
+        int(np.prod(env.observation_space.shape)),
+        int(np.prod(env.action_space.shape)),
+    )
+    shapes.add(shape)
+    print(
+        f"  {task_id:2d}: {spec.name:28s} "
+        f"obs={shape[0]} act={shape[1]} api={getattr(env.env, 'metaworld_api', '?')} "
+        f"success_key={'success' in step_info}"
+    )
+    env.close()
+
+if len(shapes) != 1:
+    raise RuntimeError(f"Inconsistent Meta-World shapes: {shapes}")
+
+print("[ok] common shape:", shapes.pop())
+PY
+
+# ------------------------------------------------------------
+# Pool structural tests
 # ------------------------------------------------------------
 echo
 echo "============================================================"
