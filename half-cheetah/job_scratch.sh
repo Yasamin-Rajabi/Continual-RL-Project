@@ -105,8 +105,6 @@ if [[ ! -f scratch_baselines.py ]]; then
     exit 2
 fi
 
-JOB_ID_FILE="$SCRATCH_ROOT_BASE/job_ids.env"
-
 SCRATCH_ARGS=(
     --task-suites halfcheetah_wind_vel
     --seeds 1 2 3
@@ -151,8 +149,6 @@ SCRATCH_ARGS=(
 if [[ "$MODE" != "--worker" ]]; then
     mkdir -p "$LOG_ROOT" "$SCRATCH_ROOT_BASE"
     SCRIPT_PATH="$(realpath "$0")"
-    : > "$JOB_ID_FILE"
-
     echo "============================================================"
     echo "Submitting HalfCheetah-WindVel FT scratch baselines"
     echo "Modes: ${EVAL_MODES[*]}"
@@ -162,7 +158,6 @@ if [[ "$MODE" != "--worker" ]]; then
     echo "============================================================"
 
     for mode in "${EVAL_MODES[@]}"; do
-        ids=()
         for seed in "${SCRATCH_SEEDS[@]}"; do
             job_id="$(
                 sbatch --parsable \
@@ -172,23 +167,13 @@ if [[ "$MODE" != "--worker" ]]; then
                     "$SCRIPT_PATH" --worker "$mode" "$seed"
             )"
             job_id="${job_id%%;*}"
-            ids+=("$job_id")
             echo "[submitted] $mode seed $seed -> $job_id"
         done
 
-        joined="$(IFS=:; echo "${ids[*]}")"
-        if [[ "$mode" == "deterministic" ]]; then
-            printf 'SCRATCH_DETERMINISTIC_JOB_IDS="%s"
-' "$joined" >> "$JOB_ID_FILE"
-        else
-            printf 'SCRATCH_STOCHASTIC_JOB_IDS="%s"
-' "$joined" >> "$JOB_ID_FILE"
-        fi
     done
 
-    echo "[saved] dependency IDs -> $JOB_ID_FILE"
-    echo "Now run: bash job.sh"
-    echo "No manual wait is needed; main jobs use afterok dependencies."
+    echo "All six scratch jobs submitted."
+    echo "Wait for them to finish successfully before running: bash job.sh"
     exit 0
 fi
 
