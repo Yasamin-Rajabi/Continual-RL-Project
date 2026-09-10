@@ -109,7 +109,6 @@ if [[ ! -f sanity_check_pool.py ]]; then
     exit 2
 fi
 
-SCRATCH_JOB_ID_FILE="$SCRATCH_ROOT_BASE/job_ids.env"
 VARIANTS=(baseline combined combined_policy combined_policy_student)
 
 COMMON_ARGS=(
@@ -182,16 +181,6 @@ variant_mapping() {
 
 if [[ "$MODE" != "--worker" ]]; then
     mkdir -p "$LOG_ROOT" "$EXPERIMENT_ROOT/main"
-    if [[ ! -f "$SCRATCH_JOB_ID_FILE" ]]; then
-        echo "ERROR: missing $SCRATCH_JOB_ID_FILE" >&2
-        echo "Run 'bash job_scratch.sh' first. You do not need to wait for it to finish." >&2
-        exit 2
-    fi
-
-    source "$SCRATCH_JOB_ID_FILE"
-    : "${SCRATCH_DETERMINISTIC_JOB_IDS:?Missing deterministic scratch IDs}"
-    : "${SCRATCH_STOCHASTIC_JOB_IDS:?Missing stochastic scratch IDs}"
-
     SCRIPT_PATH="$(realpath "$0")"
     echo "============================================================"
     echo "Submitting MetaWorld paper10 main runs"
@@ -202,27 +191,21 @@ if [[ "$MODE" != "--worker" ]]; then
     echo "============================================================"
 
     for mode in "${EVAL_MODES[@]}"; do
-        if [[ "$mode" == "deterministic" ]]; then
-            dep_ids="$SCRATCH_DETERMINISTIC_JOB_IDS"
-        else
-            dep_ids="$SCRATCH_STOCHASTIC_JOB_IDS"
-        fi
-
         for variant in "${VARIANTS[@]}"; do
             job_id="$(
                 sbatch --parsable \
-                    --dependency="afterok:${dep_ids}" \
                     --job-name="causal" \
                     --output="$LOG_ROOT/${variant}_${mode}_%j.out" \
                     --error="$LOG_ROOT/${variant}_${mode}_%j.err" \
                     "$SCRIPT_PATH" --worker "$variant" "$mode"
             )"
             job_id="${job_id%%;*}"
-            echo "[submitted] $variant / $mode -> $job_id (afterok:$dep_ids)"
+            echo "[submitted] $variant / $mode -> $job_id"
         done
     done
 
-    echo "All eight main jobs submitted. They wait for the matching scratch jobs."
+    echo "All eight main jobs submitted. job.sh does not create SLURM dependencies on scratch jobs."
+    echo "Make sure the matching scratch baselines are complete before submitting job.sh."
     exit 0
 fi
 
