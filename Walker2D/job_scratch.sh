@@ -1,7 +1,5 @@
 #!/bin/bash
 #SBATCH --job-name=causal
-#SBATCH --output=logs/w2d-scratch_%j.out
-#SBATCH --error=logs/w2d-scratch_%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
@@ -13,19 +11,106 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+MODE="${1:-}"
+if [[ "$MODE" == "--worker" ]]; then
+    REPO_DIR="${SLURM_SUBMIT_DIR:?SLURM_SUBMIT_DIR is not set}"
+else
+    REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
+cd "$REPO_DIR"
 
-EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-artifacts/ethos_student_walker2d_150k}"
+PROJECT_ROOT="${PROJECT_ROOT:-$HOME/Cont/Continual-RL-Project}"
+IMAGE="${ETHOS_IMAGE:-$HOME/containers/ethos_crl_torch280.sif}"
+BASE_STORAGE="${BASE_STORAGE:-$PROJECT_ROOT/crl_experiments}"
+EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-$BASE_STORAGE/ethos_student_walker2d_150k}"
+LOG_ROOT="$EXPERIMENT_ROOT/logs"
 SCRATCH_ROOT_BASE="$EXPERIMENT_ROOT/scratch"
-JOB_ID_FILE="$SCRATCH_ROOT_BASE/job_ids.env"
 SCRATCH_SEEDS=(101 102 103)
 EVAL_MODES=(deterministic stochastic)
 
+clean_host_python_env() {
+    if [[ -n "${VIRTUAL_ENV:-}" ]]; then
+        local inherited_bin="${VIRTUAL_ENV%/}/bin"
+        PATH=":$PATH:"
+        PATH="${PATH//:$inherited_bin:/:}"
+        PATH="${PATH#:}"
+        PATH="${PATH%:}"
+        export PATH
+        unset VIRTUAL_ENV
+    fi
+    unset PYTHONHOME || true
+    hash -r
+}
+
+prepare_container_runtime() {
+    clean_host_python_env
+    if ! command -v apptainer >/dev/null 2>&1; then
+        echo "ERROR: apptainer is not available on this node." >&2
+        exit 3
+    fi
+    if [[ ! -r "$IMAGE" ]]; then
+        echo "ERROR: container image not found/readable: $IMAGE" >&2
+        exit 3
+    fi
+
+    export APPTAINERENV_MUJOCO_GL=egl
+    export APPTAINERENV_PYOPENGL_PLATFORM=egl
+    export APPTAINERENV_EGL_DEVICE_ID=0
+    export APPTAINERENV_MUJOCO_EGL_DEVICE_ID=0
+    export APPTAINERENV_MPLBACKEND=Agg
+    export APPTAINERENV_OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
+    export APPTAINERENV_MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
+    export APPTAINERENV_PYTHONNOUSERSITE=1
+}
+
+verify_container_runtime() {
+    local gpu_name
+    gpu_name="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1)"
+    if [[ "$gpu_name" != *H100* ]]; then
+        echo "ERROR: expected H100, got: $gpu_name" >&2
+        exit 1
+    fi
+    echo "[gpu] $gpu_name"
+    echo "[container] $IMAGE"
+
+    apptainer exec --nv --bind "$PROJECT_ROOT:$PROJECT_ROOT" "$IMAGE" python - <<'PYVERIFY'
+import torch
+import stable_baselines3
+import gymnasium
+import mujoco
+import metaworld
+
+print("PyTorch:", torch.__version__)
+print("PyTorch CUDA:", torch.version.cuda)
+print("Stable-Baselines3:", stable_baselines3.__version__)
+print("Gymnasium:", gymnasium.__version__)
+print("MuJoCo:", mujoco.__version__)
+print("MetaWorld:", metaworld.__file__)
+if not torch.cuda.is_available():
+    raise RuntimeError("CUDA unavailable inside H100 allocation")
+if "H100" not in torch.cuda.get_device_name(0):
+    raise RuntimeError(f"Expected H100 inside container, got {torch.cuda.get_device_name(0)}")
+print("GPU:", torch.cuda.get_device_name(0))
+PYVERIFY
+}
+
+run_in_container() {
+    apptainer exec --nv \
+        --bind "$PROJECT_ROOT:$PROJECT_ROOT" \
+        "$IMAGE" "$@"
+}
+
+if [[ ! -f scratch_baselines.py ]]; then
+    echo "ERROR: scratch_baselines.py not found in repo directory: $PWD" >&2
+    exit 2
+fi
+
+JOB_ID_FILE="$SCRATCH_ROOT_BASE/job_ids.env"
+
 SCRATCH_ARGS=(
     --task-suites walker2d_dynamics
-    --variants plain
-    --total-timesteps 320000
+    --seeds 1 2 3
+    --total-timesteps 150000
     --pool-size 5
     --batch-size 256
     --policy-lr 3e-4
@@ -40,7 +125,7 @@ SCRATCH_ARGS=(
     --tau 0.005
     --alpha 0.2
     --autotune
-    --autotune-init-from-alpha
+    --no-autotune-init-from-alpha
     --learning-starts 5000
     --random-actions-end 5000
     --eval-every 5000
@@ -63,9 +148,8 @@ SCRATCH_ARGS=(
     --constrain-alpha-mass
 )
 
-
-if [[ "${1:-}" != "--worker" ]]; then
-    mkdir -p logs "$SCRATCH_ROOT_BASE"
+if [[ "$MODE" != "--worker" ]]; then
+    mkdir -p "$LOG_ROOT" "$SCRATCH_ROOT_BASE"
     SCRIPT_PATH="$(realpath "$0")"
     : > "$JOB_ID_FILE"
 
@@ -73,6 +157,7 @@ if [[ "${1:-}" != "--worker" ]]; then
     echo "Submitting Walker2D FT scratch baselines"
     echo "Modes: ${EVAL_MODES[*]}"
     echo "Scratch seeds: ${SCRATCH_SEEDS[*]}"
+    echo "Container: $IMAGE"
     echo "Root: $SCRATCH_ROOT_BASE"
     echo "============================================================"
 
@@ -80,12 +165,17 @@ if [[ "${1:-}" != "--worker" ]]; then
         ids=()
         for seed in "${SCRATCH_SEEDS[@]}"; do
             job_id="$(
-                sbatch --parsable                     --job-name="causal"                     --output="logs/scratch_${mode}_seed${seed}_%j.out"                     --error="logs/scratch_${mode}_seed${seed}_%j.err"                     "$SCRIPT_PATH" --worker "$mode" "$seed"
+                sbatch --parsable \
+                    --job-name="causal" \
+                    --output="$LOG_ROOT/scratch_${mode}_seed${seed}_%j.out" \
+                    --error="$LOG_ROOT/scratch_${mode}_seed${seed}_%j.err" \
+                    "$SCRIPT_PATH" --worker "$mode" "$seed"
             )"
             job_id="${job_id%%;*}"
             ids+=("$job_id")
             echo "[submitted] $mode seed $seed -> $job_id"
         done
+
         joined="$(IFS=:; echo "${ids[*]}")"
         if [[ "$mode" == "deterministic" ]]; then
             printf 'SCRATCH_DETERMINISTIC_JOB_IDS="%s"
@@ -98,7 +188,7 @@ if [[ "${1:-}" != "--worker" ]]; then
 
     echo "[saved] dependency IDs -> $JOB_ID_FILE"
     echo "Now run: bash job.sh"
-    echo "No manual wait is needed; the main jobs use SLURM dependencies."
+    echo "No manual wait is needed; main jobs use afterok dependencies."
     exit 0
 fi
 
@@ -112,77 +202,8 @@ fi
 SCRATCH_MODE_ROOT="$SCRATCH_ROOT_BASE/$EVAL_MODE"
 mkdir -p "$SCRATCH_MODE_ROOT/models" "$SCRATCH_MODE_ROOT/runs" "$SCRATCH_MODE_ROOT/analysis"
 
-
-module purge
-module load gcc/13.2.0 python/3.9.18 py-virtualenv/20.24.5
-
-VENV="${CKA_VENV:-$HOME/.venvs/cka_walker2d}"
-VENV_LOCK="${VENV}.setup.lock"
-mkdir -p "$(dirname "$VENV")"
-exec 9>"$VENV_LOCK"
-flock 9
-
-if [[ ! -x "$VENV/bin/python" ]]; then
-    echo "[setup] creating virtual environment: $VENV"
-    python -m venv "$VENV"
-fi
-source "$VENV/bin/activate"
-export PYTHONNOUSERSITE=1
-export PIP_DISABLE_PIP_VERSION_CHECK=1
-python -m pip install -q --upgrade pip
-
-TORCH_VERSION="2.8.0"
-TORCH_CUDA="12.6"
-TORCH_INDEX="https://download.pytorch.org/whl/cu126"
-NEED_TORCH=1
-if python - <<'TORCHCHECK' >/dev/null 2>&1
-import torch
-assert torch.__version__.split("+")[0] == "2.8.0"
-assert torch.version.cuda == "12.6"
-TORCHCHECK
-then
-    NEED_TORCH=0
-fi
-if (( NEED_TORCH )); then
-    echo "[setup] installing torch $TORCH_VERSION + CUDA $TORCH_CUDA"
-    python -m pip uninstall -y torch torchvision torchaudio triton >/dev/null 2>&1 || true
-    python -m pip install "torch==$TORCH_VERSION" --index-url "$TORCH_INDEX"
-fi
-
-flock -u 9
-
-export MUJOCO_GL=egl
-export PYOPENGL_PLATFORM=egl
-export EGL_DEVICE_ID=0
-export MUJOCO_EGL_DEVICE_ID=0
-export MPLBACKEND=Agg
-export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
-export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
-
-GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1)"
-if [[ "$GPU_NAME" != *H100* ]]; then
-    echo "ERROR: expected H100, got: $GPU_NAME" >&2
-    exit 1
-fi
-
-echo "[gpu] $GPU_NAME"
-python - <<'VERIFY'
-import torch
-import stable_baselines3
-import gymnasium
-import mujoco
-
-print("PyTorch:", torch.__version__)
-print("PyTorch CUDA:", torch.version.cuda)
-print("Stable-Baselines3:", stable_baselines3.__version__)
-print("Gymnasium:", gymnasium.__version__)
-print("MuJoCo:", mujoco.__version__)
-if not torch.cuda.is_available():
-    raise RuntimeError("CUDA unavailable inside H100 allocation")
-print("GPU:", torch.cuda.get_device_name(0))
-VERIFY
-python -m pip check
-
+prepare_container_runtime
+verify_container_runtime
 
 echo "============================================================"
 echo "[scratch] environment: Walker2D"
@@ -190,8 +211,15 @@ echo "[scratch] mode:        $EVAL_MODE"
 echo "[scratch] seed:        $SCRATCH_SEED"
 echo "[scratch] suite:       walker2d_dynamics"
 echo "[scratch] root:        $SCRATCH_MODE_ROOT"
+echo "[scratch] container:   $IMAGE"
 echo "============================================================"
 
-python -u scratch_baselines.py     "${SCRATCH_ARGS[@]}"     --seeds "$SCRATCH_SEED"     --eval-action-mode "$EVAL_MODE"     --save-root "$SCRATCH_MODE_ROOT/models"     --runs-root "$SCRATCH_MODE_ROOT/runs"     --analysis-root "$SCRATCH_MODE_ROOT/analysis"
+run_in_container python -u "$REPO_DIR/scratch_baselines.py" \
+    "${SCRATCH_ARGS[@]}" \
+    --seeds "$SCRATCH_SEED" \
+    --eval-action-mode "$EVAL_MODE" \
+    --save-root "$SCRATCH_MODE_ROOT/models" \
+    --runs-root "$SCRATCH_MODE_ROOT/runs" \
+    --analysis-root "$SCRATCH_MODE_ROOT/analysis"
 
 echo "[done] scratch $EVAL_MODE seed $SCRATCH_SEED"
