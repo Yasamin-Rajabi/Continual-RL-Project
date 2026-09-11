@@ -15,7 +15,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import tyro
 from stable_baselines3.common.buffers import ReplayBuffer
-from torch.utils.tensorboard import SummaryWriter
+from csv_summary_writer import CsvSummaryWriter
 from tqdm import tqdm
 
 from analysis_logging import effective_theta_vector, log_training_state, save_task_snapshot
@@ -478,7 +478,7 @@ if __name__ == "__main__":
     task_name = get_task_name(args.task_id, args.task_suite)
     print(f"\n*** Run name: {run_name} | {task_name} ***\n")
 
-    writer = SummaryWriter(str(pathlib.Path(args.runs_root) / args.tag / run_name))
+    writer = CsvSummaryWriter(str(pathlib.Path(args.runs_root) / args.tag / run_name))
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n%s" % "\n".join(f"|{k}|{v}|" for k, v in vars(args).items()),
