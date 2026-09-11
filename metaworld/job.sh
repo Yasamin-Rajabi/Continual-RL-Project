@@ -22,7 +22,7 @@ cd "$REPO_DIR"
 PROJECT_ROOT="${PROJECT_ROOT:-$HOME/Cont/Continual-RL-Project}"
 IMAGE="${ETHOS_IMAGE:-$HOME/containers/ethos_crl_torch280.sif}"
 BASE_STORAGE="${BASE_STORAGE:-$PROJECT_ROOT/crl_experiments}"
-EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-$BASE_STORAGE/ethos_student_metaworld_paper10_1m}"
+EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-$BASE_STORAGE/ethos_student_metaworld_paper10_500k}"
 LOG_ROOT="$EXPERIMENT_ROOT/logs"
 SCRATCH_ROOT_BASE="$EXPERIMENT_ROOT/scratch"
 SCRATCH_SEEDS=(101 102 103)
@@ -114,7 +114,7 @@ VARIANTS=(baseline combined combined_policy combined_policy_student)
 COMMON_ARGS=(
     --task-suites mw_paper10
     --seeds 1 2 3
-    --total-timesteps 1000000
+    --total-timesteps 500000
     --pool-size 8
     --batch-size 128
     --policy-lr 1e-3
@@ -135,7 +135,7 @@ COMMON_ARGS=(
     --eval-every 10000
     --num-evals 5
     --retention-eval-episodes 5
-    --test-adapt-steps 0
+    --test-adapt-steps 5000
     --frozen-eval-policy pool
     --no-distill-observation-skip
     --distill-buffer-steps 10000

@@ -123,7 +123,7 @@ SCRATCH_ARGS=(
     --tau 0.005
     --alpha 0.2
     --autotune
-    --no-autotune-init-from-alpha
+    --autotune-init-from-alpha
     --learning-starts 5000
     --random-actions-end 5000
     --eval-every 5000
