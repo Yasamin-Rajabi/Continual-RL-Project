@@ -90,6 +90,8 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--policy-lr", type=float, default=3e-4)
     p.add_argument("--alpha-lr", type=float, default=5e-3)
+    p.add_argument("--alpha-mass-lr", type=float, default=None,
+                   help="Learning rate for the raw alpha-mass gate; default reuses --alpha-lr (legacy behavior).")
     p.add_argument("--alpha-mass-reg", type=float, default=0.05)
     p.add_argument("--alpha-warmup-steps", type=int, default=5_000)
     p.add_argument("--alpha-entropy-reg", type=float, default=0.01,
@@ -273,6 +275,7 @@ def _expected_training_config(args, suite, task_id, seq_idx, seed, cfg):
         "random_actions_end": int(args.random_actions_end),
         "policy_lr": float(args.policy_lr),
         "alpha_lr": float(args.alpha_lr),
+        "alpha_mass_lr": float(args.alpha_lr if args.alpha_mass_lr is None else args.alpha_mass_lr),
         "alpha_warmup_steps": int(args.alpha_warmup_steps),
         "alpha_entropy_reg": float(args.alpha_entropy_reg),
         "distill_encoder_lr_mult": float(args.distill_encoder_lr_mult),
@@ -371,6 +374,7 @@ def train_chain(args, suite, condition, cfg, seed):
             f"--batch-size={args.batch_size}",
             f"--policy-lr={args.policy_lr}",
             f"--alpha-lr={args.alpha_lr}",
+            f"--alpha-mass-lr={args.alpha_lr if args.alpha_mass_lr is None else args.alpha_mass_lr}",
             f"--alpha-mass-reg={args.alpha_mass_reg}",
             f"--alpha-warmup-steps={args.alpha_warmup_steps}",
             f"--alpha-entropy-reg={args.alpha_entropy_reg}",

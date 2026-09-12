@@ -47,6 +47,7 @@ TRAINING_KEYS = (
     "random_actions_end",
     "policy_lr",
     "alpha_lr",
+    "alpha_mass_lr",
     "alpha_warmup_steps",
     "alpha_entropy_reg",
     "distill_encoder_lr_mult",
@@ -90,6 +91,8 @@ TRAINING_KEYS = (
 # the upcoming lineage/KL investigations. Plotting-only files are excluded so a
 # cosmetic plot edit does not force model retraining.
 PRE_LINEAGE_BALANCING_SOURCE_FINGERPRINTS = {'8ab92dde4d65d370311a3dce70871804ad3ae6ef426c9e38ae63ea7348b7485c', '1e598563580b6ffbba6830f48cc866bb0e3cce81c43aea7f7213e4cad2ee2702', '29ed1d675cfe9ce90ad07b288d084a2e7548e833f4d9032960d9fe24c4c520c1'}
+
+PRE_ALPHA_MASS_LR_SOURCE_FINGERPRINTS = {'0418793c2c93a5573294a207a60214496d166a9422bc30246db53813b63d57a1'}
 
 SOURCE_CANDIDATES = (
     "run_sac.py",
@@ -268,7 +271,13 @@ def runtime_versions() -> dict:
 
 
 def training_config(mapping: Mapping[str, Any]) -> dict:
-    return {key: _jsonable(mapping[key]) for key in TRAINING_KEYS if key in mapping}
+    config = {key: _jsonable(mapping[key]) for key in TRAINING_KEYS if key in mapping}
+    # None means "reuse alpha_lr" so store the effective value in manifests.
+    # This makes explicit --alpha-mass-lr=<alpha_lr> and the legacy/default
+    # behavior semantically identical.
+    if "alpha_mass_lr" in config and config["alpha_mass_lr"] is None:
+        config["alpha_mass_lr"] = config.get("alpha_lr")
+    return config
 
 
 def load_manifest(run_dir) -> dict | None:
@@ -347,6 +356,11 @@ def checkpoint_matches(
         # exactly the current default when the new flag is False.
         if key == "balance_source_lineages" and key not in actual and value is False:
             continue
+        # Before --alpha-mass-lr existed, alpha_mass was optimized in the same
+        # Adam parameter group as alpha/alpha_scale, i.e. its effective LR was
+        # exactly alpha_lr. Accept those manifests only for that equivalent case.
+        if key == "alpha_mass_lr" and key not in actual and value == actual.get("alpha_lr"):
+            continue
         if actual.get(key) != value:
             return False, f"training config mismatch for {key}: saved={actual.get(key)!r}, expected={value!r}"
 
@@ -360,9 +374,17 @@ def checkpoint_matches(
             not bool(expected.get("balance_source_lineages", False))
             and saved_source in PRE_LINEAGE_BALANCING_SOURCE_FINGERPRINTS
         )
+        # The code immediately before this option existed used alpha_lr for the
+        # mass gate. Preserve compatibility only when the requested effective
+        # mass LR is still alpha_lr; a genuinely different mass LR must retrain.
+        allow_pre_alpha_mass_lr = (
+            expected.get("alpha_mass_lr", expected.get("alpha_lr")) == expected.get("alpha_lr")
+            and saved_source in PRE_ALPHA_MASS_LR_SOURCE_FINGERPRINTS
+        )
         if (
             saved_source not in _compatible_legacy_source_fingerprints(root)
             and not allow_pre_lineage
+            and not allow_pre_alpha_mass_lr
         ):
             return False, "training source fingerprint changed"
 

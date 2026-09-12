@@ -124,3 +124,29 @@ paper_PERF_occurrences_deterministic_amass.csv
 paper_PERF_return_deterministic_amass.png
 paper_PERF_success_deterministic_amass.png
 ```
+
+
+## Separate alpha-mass learning rate
+
+`--alpha-mass-lr` controls only the raw historical-vs-novel mass parameter `g`
+where `m = sigmoid(g)`. The within-history alpha logits (and optional alpha
+scale) continue to use `--alpha-lr`.
+
+If `--alpha-mass-lr` is omitted, it reuses `--alpha-lr`, exactly preserving the
+old optimizer behavior. For the proposed slower-gate diagnostic, use for example:
+
+```bash
+--alpha-lr 5e-3
+--alpha-mass-lr 3e-4
+--alpha-mass-reg 0
+```
+
+For the HalfCheetah SLURM scripts the default line is now explicit:
+
+```bash
+--alpha-mass-lr 5e-3
+```
+
+Change the same line in `job_eval.sh` when evaluating a run trained with a
+non-default mass LR; checkpoint identity deliberately treats a different
+alpha-mass LR as a different training configuration.

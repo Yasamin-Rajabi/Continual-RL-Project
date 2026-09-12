@@ -74,6 +74,9 @@ class Args:
     random_actions_end: int = 5_000
     policy_lr: float = 3e-4
     alpha_lr: float = 5e-3
+    alpha_mass_lr: Optional[float] = None
+    """Learning rate for the raw historical-vs-novel alpha-mass gate.
+    None preserves the legacy behavior by reusing --alpha-lr."""
     alpha_warmup_steps: int = 5_000
     q_lr: float = 3e-4
     policy_frequency: int = 2
@@ -424,6 +427,8 @@ def _validate_args(args):
         raise ValueError("--use-alpha-scale and --fix-alpha-scale are mutually exclusive")
     if args.alpha_lr <= 0 or args.policy_lr <= 0 or args.q_lr <= 0:
         raise ValueError("policy/q/alpha learning rates must be > 0")
+    if args.alpha_mass_lr is not None and args.alpha_mass_lr <= 0:
+        raise ValueError("alpha_mass_lr must be > 0 when specified")
     if args.alpha_warmup_steps < 0:
         raise ValueError("alpha_warmup_steps must be >= 0")
     if args.alpha_mass_reg < 0 or args.drift_reg < 0 or args.alpha_entropy_reg < 0:
@@ -565,14 +570,20 @@ if __name__ == "__main__":
 
     fc_param_ids = {id(p) for p in actor.model.fc.parameters()}
     fc_params = [p for p in actor.model.fc.parameters() if p.requires_grad]
-    alpha_param_objs = []
+    # Keep the within-history routing parameters and the historical-vs-novel
+    # mass gate in separate optimizer groups.  Historically they shared
+    # --alpha-lr; --alpha-mass-lr=None preserves exactly that behavior.
+    alpha_route_param_objs = []
     if actor.model.alpha is not None and actor.model.alpha.requires_grad:
-        alpha_param_objs.append(actor.model.alpha)
+        alpha_route_param_objs.append(actor.model.alpha)
     if actor.model.alpha_scale is not None and actor.model.alpha_scale.requires_grad:
-        alpha_param_objs.append(actor.model.alpha_scale)
+        alpha_route_param_objs.append(actor.model.alpha_scale)
+    alpha_mass_param_objs = []
     if actor.model.alpha_mass is not None and actor.model.alpha_mass.requires_grad:
-        alpha_param_objs.append(actor.model.alpha_mass)
+        alpha_mass_param_objs.append(actor.model.alpha_mass)
+    alpha_param_objs = alpha_route_param_objs + alpha_mass_param_objs
     alpha_param_ids = {id(p) for p in alpha_param_objs}
+    alpha_mass_lr = args.alpha_lr if args.alpha_mass_lr is None else args.alpha_mass_lr
     own_params = [
         p for p in actor_params
         if id(p) not in alpha_param_ids and id(p) not in fc_param_ids
@@ -590,8 +601,10 @@ if __name__ == "__main__":
         param_groups.append({"params": own_params, "lr": args.policy_lr})
     if fc_params:
         param_groups.append({"params": fc_params, "lr": encoder_lr})
-    if alpha_param_objs:
-        param_groups.append({"params": alpha_param_objs, "lr": args.alpha_lr})
+    if alpha_route_param_objs:
+        param_groups.append({"params": alpha_route_param_objs, "lr": args.alpha_lr})
+    if alpha_mass_param_objs:
+        param_groups.append({"params": alpha_mass_param_objs, "lr": alpha_mass_lr})
 
     actor_optimizer = None
     novel_optimizer = None
@@ -605,8 +618,13 @@ if __name__ == "__main__":
         if not novel_groups:
             raise RuntimeError("Policy-student mode has no trainable novel-expert parameters")
         novel_optimizer = optim.Adam(novel_groups)
-        if alpha_param_objs:
-            mixture_optimizer = optim.Adam([{"params": alpha_param_objs, "lr": args.alpha_lr}])
+        mixture_groups = []
+        if alpha_route_param_objs:
+            mixture_groups.append({"params": alpha_route_param_objs, "lr": args.alpha_lr})
+        if alpha_mass_param_objs:
+            mixture_groups.append({"params": alpha_mass_param_objs, "lr": alpha_mass_lr})
+        if mixture_groups:
+            mixture_optimizer = optim.Adam(mixture_groups)
     else:
         actor_optimizer = optim.Adam(param_groups)
 
