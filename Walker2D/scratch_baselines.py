@@ -151,12 +151,16 @@ def _expected_training_config(suite, task_id, total_timesteps, seed, args, varia
     }
 
 
-def checkpoint_matches(path, suite, task_id, total_timesteps, seed, args, variant="plain"):
+def checkpoint_matches(
+    path, suite, task_id, total_timesteps, seed, args, variant="plain", *,
+    check_runtime=True,
+):
     expected = _expected_training_config(suite, task_id, total_timesteps, seed, args, variant)
     if not checkpoint_complete(path):
         return False, "checkpoint files or valid run_manifest.json are missing"
     return identity_checkpoint_matches(
-        path, expected, pretrained_encoder=args.pretrained_encoder
+        path, expected, pretrained_encoder=args.pretrained_encoder,
+        check_runtime=check_runtime,
     )
 
 

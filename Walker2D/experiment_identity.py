@@ -330,6 +330,7 @@ def checkpoint_matches(
     parent_dirs=(),
     pretrained_encoder=None,
     root=None,
+    check_runtime: bool = True,
 ) -> tuple[bool, str]:
     """Return (matches, reason) for resumable orchestration."""
     manifest = load_manifest(run_dir)
@@ -351,9 +352,14 @@ def checkpoint_matches(
         if saved_source not in _compatible_legacy_source_fingerprints(root):
             return False, "training source fingerprint changed"
 
-    current_runtime = runtime_versions()
-    if manifest.get("runtime_versions") != current_runtime:
-        return False, "Python/package runtime versions changed"
+    # Runtime equality is required when a checkpoint may be resumed/reused for
+    # training or policy execution.  Post-hoc metrics that only read already
+    # recorded learning curves can set check_runtime=False and compare the
+    # *training* runtimes of the scratch and continual manifests instead.
+    if check_runtime:
+        current_runtime = runtime_versions()
+        if manifest.get("runtime_versions") != current_runtime:
+            return False, "Python/package runtime versions changed"
 
     expected_pretrained = None if pretrained_encoder is None else sha256_file(pretrained_encoder)
     if manifest.get("pretrained_encoder_sha256") != expected_pretrained:
