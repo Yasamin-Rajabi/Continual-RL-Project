@@ -56,6 +56,7 @@ make the new method changes individually switchable:
 | `--condition-alpha-scale` | `--no-condition-alpha-scale` | Classic modes learn alpha scale from 1; weight-delta modes use fixed scale 5. Disabling this lets `--use-alpha-scale/--fix-alpha-scale` choose one global rule. |
 | `--distill-observation-skip` | `--no-distill-observation-skip` | Distillation modes concatenate raw observation to shared features before the policy heads. |
 | `--alpha-lr 5e-3` | change value | Separate learning rate for knowledge-mixture parameters. |
+| `--alpha-mass-lr 3e-4` | change value | Optional separate LR for the historical-vs-novel alpha-mass gate. If omitted, it reuses `--alpha-lr` exactly as before. |
 | `--alpha-warmup-steps 5000` | `0` | Early weight-delta phase learns historical mixing before the new residual/mass moves. It activates only when at least two historical slots exist. |
 | `--alpha-mass-reg 0.05` | `0` | Regularizes effective mass after warmup. |
 | `--drift-reg 1.0` | `0` | When `--train-shared` and distillation are both active, penalizes encoder drift on historical observations. |

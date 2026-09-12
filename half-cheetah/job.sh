@@ -153,6 +153,7 @@ COMMON_ARGS=(
     --batch-size 256
     --policy-lr 3e-4
     --alpha-lr 5e-3
+    --alpha-mass-lr 5e-3
     --alpha-mass-reg 0.0
     # --alpha-mass-reg 0.05
     --alpha-warmup-steps 5000

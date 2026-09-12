@@ -158,12 +158,12 @@ def _benchmark_cache_config(args):
         "frozen_eval_policy", "eval_action_mode", "skip_forward_transfer",
         "task_sequence", "save_root", "runs_root", "analysis_root",
         "total_timesteps", "learning_starts", "random_actions_end",
-        "batch_size", "policy_lr", "alpha_lr", "alpha_warmup_steps", "alpha_entropy_reg",
+        "batch_size", "policy_lr", "alpha_lr", "alpha_mass_lr", "alpha_warmup_steps", "alpha_entropy_reg",
         "distill_encoder_lr_mult", "q_lr", "gamma", "tau", "alpha",
         "autotune", "autotune_init_from_alpha", "pool_size", "eval_every",
         "num_evals", "test_adapt_steps", "test_adapt_lr", "distill_observation_skip",
         "distill_extra_steps", "collect_cosine_buffers",
-        "max_distill_buffer", "similarity_samples", "distill_max_samples",
+        "max_distill_buffer", "similarity_samples", "balance_source_lineages", "distill_max_samples",
         "distill_epochs", "distill_lr", "distill_batch_size",
         "distill_test_frac", "distill_select_best_val", "train_shared",
         "freeze_root_encoder", "encoder_from_base", "pretrained_encoder",
@@ -177,6 +177,8 @@ def _benchmark_cache_config(args):
         value = getattr(args, key)
         if key == "task_sequence":
             config["sequence"] = list(value)
+        elif key == "alpha_mass_lr" and value is None:
+            config[key] = float(getattr(args, "alpha_lr"))
         elif isinstance(value, pathlib.Path):
             config[key] = str(value)
         else:
@@ -220,10 +222,12 @@ def _validate_scratch_checkpoints(
 ):
     """Require only that the scratch learning-curve files exist.
 
-    Forward Transfer consumes saved TensorBoard/CSV learning curves.  Do not
+    Forward Transfer consumes saved TensorBoard/CSV learning curves. Do not
     compare manifests, package/runtime versions, source identity, training
-    configuration, or checkpoint compatibility here.
+    configuration, or checkpoint compatibility here. Those checks belong to
+    training/resume, not post-hoc metric computation.
     """
+    del seed  # FT scratch availability does not depend on the continual seed.
     if _CUSTOM_MODEL_MAP:
         return
 
@@ -250,7 +254,6 @@ def _validate_scratch_checkpoints(
         raise RuntimeError(
             "Forward-transfer scratch baselines are missing:\n  - " + joined
         )
-
 
 def _load_scalar_csv(directory, scalar_tag):
     """Fallback reader for the scalars.csv mirror written next to TensorBoard."""
@@ -622,7 +625,8 @@ def survey_metrics_cache_path(args, suite, condition, seed):
 
 def compute_survey_metrics(args, suite, condition, seed, device, scratch_seeds, scratch_total_timesteps):
     # Forward transfer only requires the expected scratch learning-curve
-    # files to exist. No provenance/runtime/config compatibility checks.
+    # files to exist. Provenance/runtime compatibility is a training/resume
+    # concern and is intentionally not re-checked during post-hoc metrics.
     ft_available = not bool(getattr(args, "skip_forward_transfer", False))
     if ft_available:
         try:
