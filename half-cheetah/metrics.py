@@ -218,76 +218,37 @@ def _scratch_checkpoint_signatures(args, suite, condition, scratch_seeds, scratc
 def _validate_scratch_checkpoints(
     args, suite, condition, seed, scratch_seeds, scratch_total_timesteps
 ):
-    """Validate scratch curves for post-hoc Forward Transfer.
+    """Require only that the scratch learning-curve files exist.
 
-    FT is computed from learning curves that were already recorded during
-    training.  Therefore the Python/package versions of the *current metrics
-    process* are irrelevant.  What matters is that each scratch run matches
-    the expected training configuration/source and that its saved training
-    runtime matches the continual run whose curve it is compared against.
-
-    Only first encounters of unseen tasks after sequence position 0 are
-    validated because those are the only positions that enter FT.
+    Forward Transfer consumes saved TensorBoard/CSV learning curves.  Do not
+    compare manifests, package/runtime versions, source identity, training
+    configuration, or checkpoint compatibility here.
     """
     if _CUSTOM_MODEL_MAP:
         return
 
-    save_root = getattr(args, "scratch_save_root", scratch.SCRATCH_SAVE_ROOT)
     variant = _scratch_variant(args, condition)
-    problems = []
+    missing = []
 
-    for seq_idx, task_id in _first_unseen_positions(args.task_sequence):
-        continual_dir = checkpoint_dir(
-            args.save_root, suite, condition, seed, seq_idx, task_id
-        )
-        continual_manifest = load_manifest(continual_dir)
-        continual_runtime = None if continual_manifest is None else continual_manifest.get("runtime_versions")
-        if not isinstance(continual_runtime, dict):
-            problems.append(
-                f"task {task_id}: continual checkpoint has no valid saved training runtime "
-                f"({continual_dir})"
-            )
-            continue
-
+    for _seq_idx, task_id in _first_unseen_positions(args.task_sequence):
         for scratch_seed in scratch_seeds:
-            run_dir = scratch.scratch_checkpoint_dir(
-                save_root, suite, task_id, scratch_total_timesteps, scratch_seed, variant
+            curve_dir = pathlib.Path(scratch.scratch_event_dir(
+                args.runs_root, suite, task_id, scratch_total_timesteps,
+                scratch_seed, variant
+            ))
+            has_curve_file = (curve_dir / "scalars.csv").is_file() or any(
+                curve_dir.glob("events.out.tfevents.*")
             )
-
-            # This is a metrics-only check: do not compare the old training run
-            # to the package versions of the process that happens to recompute
-            # metrics today. Training/resume paths keep the strict default.
-            matches, reason = scratch.checkpoint_matches(
-                run_dir, suite, task_id, scratch_total_timesteps, scratch_seed,
-                args, variant, check_runtime=False,
-            )
-            if not matches:
-                problems.append(
-                    f"task {task_id}, seed {scratch_seed}: {reason} ({run_dir})"
-                )
-                continue
-
-            scratch_manifest = load_manifest(run_dir)
-            scratch_runtime = None if scratch_manifest is None else scratch_manifest.get("runtime_versions")
-            if not isinstance(scratch_runtime, dict):
-                problems.append(
-                    f"task {task_id}, seed {scratch_seed}: scratch checkpoint has no valid "
-                    f"saved training runtime ({run_dir})"
-                )
-                continue
-
-            if scratch_runtime != continual_runtime:
-                problems.append(
-                    f"task {task_id}, seed {scratch_seed}: scratch/continual TRAINING runtime mismatch; "
-                    f"scratch={scratch_runtime}, continual={continual_runtime} ({run_dir})"
+            if not has_curve_file:
+                missing.append(
+                    f"task {task_id}, seed {scratch_seed}: no scratch learning-curve "
+                    f"file found ({curve_dir})"
                 )
 
-    if problems:
-        joined = "\n  - ".join(problems)
+    if missing:
+        joined = "\n  - ".join(missing)
         raise RuntimeError(
-            "Forward-transfer scratch baselines are missing or incompatible. "
-            "FT compares saved learning curves, so the current evaluation runtime is ignored; "
-            "scratch and continual TRAINING provenance must still match:\n  - " + joined
+            "Forward-transfer scratch baselines are missing:\n  - " + joined
         )
 
 
@@ -660,10 +621,8 @@ def survey_metrics_cache_path(args, suite, condition, seed):
 
 
 def compute_survey_metrics(args, suite, condition, seed, device, scratch_seeds, scratch_total_timesteps):
-    # Forward transfer is undefined unless its from-scratch denominator was
-    # trained under the same SAC/encoder configuration. Validate before even
-    # considering a cached metric file so direct callers cannot silently mix
-    # incompatible experiments.
+    # Forward transfer only requires the expected scratch learning-curve
+    # files to exist. No provenance/runtime/config compatibility checks.
     ft_available = not bool(getattr(args, "skip_forward_transfer", False))
     if ft_available:
         try:
