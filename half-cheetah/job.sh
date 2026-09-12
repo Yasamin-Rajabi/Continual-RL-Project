@@ -58,7 +58,8 @@ EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-$BASE_STORAGE/ethos_student_halfcheetah_wind
 LOG_ROOT="$EXPERIMENT_ROOT/logs"
 SCRATCH_ROOT_BASE="$EXPERIMENT_ROOT/scratch"
 SCRATCH_SEEDS=(101 102 103)
-EVAL_MODES=(deterministic stochastic)
+# EVAL_MODES=(deterministic stochastic)
+EVAL_MODES=(deterministic)
 
 clean_host_python_env() {
     if [[ -n "${VIRTUAL_ENV:-}" ]]; then
@@ -141,7 +142,8 @@ if [[ ! -f sanity_check_pool.py ]]; then
     exit 2
 fi
 
-VARIANTS=(baseline combined combined_policy combined_policy_student)
+# VARIANTS=(baseline combined combined_policy combined_policy_student)
+VARIANTS=(combined_policy combined_policy_student)
 
 COMMON_ARGS=(
     --task-suites halfcheetah_wind_vel
@@ -151,7 +153,8 @@ COMMON_ARGS=(
     --batch-size 256
     --policy-lr 3e-4
     --alpha-lr 5e-3
-    --alpha-mass-reg 0.05
+    --alpha-mass-reg 0.0
+    # --alpha-mass-reg 0.05
     --alpha-warmup-steps 5000
     --alpha-entropy-reg 0.01
     --drift-reg 1.0
@@ -172,7 +175,8 @@ COMMON_ARGS=(
     --no-distill-observation-skip
     --distill-buffer-steps 5000
     --similarity-samples 2048
-    --no-balance-source-lineages
+    # --no-balance-source-lineages
+    --balance-source-lineages
     --max-distill-buffer 50000
     --distill-max-samples 20000
     --distill-epochs 16
