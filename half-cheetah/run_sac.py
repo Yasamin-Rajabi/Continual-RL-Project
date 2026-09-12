@@ -139,6 +139,9 @@ class Args:
     collect_cosine_buffers: bool = False
     max_distill_buffer: int = 50_000
     similarity_samples: int = 2_048
+    balance_source_lineages: bool = False
+    """Balance behavioral-similarity, distillation, and retained merge-buffer
+    samples across original source_ids instead of only immediate merge parents."""
     distill_max_samples: int = 20_000
     distill_epochs: int = 16
     distill_select_best_val: bool = True
@@ -514,6 +517,7 @@ if __name__ == "__main__":
         constrain_alpha_mass=args.constrain_alpha_mass,
         distill_test_frac=args.distill_test_frac,
         similarity_samples=args.similarity_samples,
+        balance_source_lineages=args.balance_source_lineages,
         distill_max_samples=args.distill_max_samples,
         distill_epochs=args.distill_epochs,
         distill_select_best_val=args.distill_select_best_val,
@@ -977,6 +981,26 @@ if __name__ == "__main__":
             if "similarity_states" in merge_info:
                 writer.add_scalar("analysis/merge/similarity_states", merge_info["similarity_states"], global_step)
             writer.add_scalar("analysis/merge/used_distillation", float(merge_info["used_distillation"]), global_step)
+            writer.add_scalar(
+                "analysis/merge/balance_source_lineages",
+                float(merge_info.get("balance_source_lineages", False)),
+                global_step,
+            )
+            writer.add_scalar(
+                "analysis/merge/source_lineages_parent_1",
+                len(merge_info.get("parent_1_source_lineage", {})),
+                global_step,
+            )
+            writer.add_scalar(
+                "analysis/merge/source_lineages_parent_2",
+                len(merge_info.get("parent_2_source_lineage", {})),
+                global_step,
+            )
+            writer.add_scalar(
+                "analysis/merge/source_lineages_merged",
+                len(merge_info.get("merged_source_lineage", {})),
+                global_step,
+            )
             writer.add_scalar("analysis/merge/pool_size_before", merge_info["pool_size_before"], global_step)
             writer.add_scalar("analysis/merge/pool_size_after", merge_info["pool_size_after"], global_step)
             lineage = {

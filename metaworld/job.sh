@@ -12,10 +12,42 @@
 set -euo pipefail
 
 MODE="${1:-}"
+COMMENT="${RUN_COMMENT:-}"
 if [[ "$MODE" == "--worker" ]]; then
+    COMMENT="${4:-${RUN_COMMENT:-}}"
     REPO_DIR="${SLURM_SUBMIT_DIR:?SLURM_SUBMIT_DIR is not set}"
 else
     REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --comment)
+                [[ $# -ge 2 ]] || { echo "ERROR: --comment needs a value" >&2; exit 2; }
+                COMMENT="$2"
+                shift 2
+                ;;
+            --comment=*)
+                COMMENT="${1#--comment=}"
+                shift
+                ;;
+            -h|--help)
+                echo "Usage: bash ${BASH_SOURCE[0]} [--comment NAME]"
+                echo "Example: bash ${BASH_SOURCE[0]} --comment amass"
+                exit 0
+                ;;
+            *)
+                echo "ERROR: unknown argument: $1" >&2
+                exit 2
+                ;;
+        esac
+    done
+fi
+if [[ -n "$COMMENT" && ! "$COMMENT" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    echo "ERROR: --comment may contain only letters, digits, '.', '_' and '-' and must start with a letter/digit" >&2
+    exit 2
+fi
+COMMENT_SUFFIX=""
+if [[ -n "$COMMENT" ]]; then
+    COMMENT_SUFFIX="_${COMMENT}"
 fi
 cd "$REPO_DIR"
 
@@ -140,6 +172,7 @@ COMMON_ARGS=(
     --no-distill-observation-skip
     --distill-buffer-steps 10000
     --similarity-samples 2048
+    --no-balance-source-lineages
     --max-distill-buffer 50000
     --distill-max-samples 20000
     --distill-epochs 16
@@ -186,6 +219,7 @@ if [[ "$MODE" != "--worker" ]]; then
     echo "Submitting MetaWorld paper10 main runs"
     echo "Methods: ${VARIANTS[*]}"
     echo "Modes: ${EVAL_MODES[*]}"
+    echo "Comment: ${COMMENT:-<none>}"
     echo "FT: enabled"
     echo "Container: $IMAGE"
     echo "============================================================"
@@ -195,9 +229,9 @@ if [[ "$MODE" != "--worker" ]]; then
             job_id="$(
                 sbatch --parsable \
                     --job-name="causal" \
-                    --output="$LOG_ROOT/${variant}_${mode}_%j.out" \
-                    --error="$LOG_ROOT/${variant}_${mode}_%j.err" \
-                    "$SCRIPT_PATH" --worker "$variant" "$mode"
+                    --output="$LOG_ROOT/${variant}_${mode}${COMMENT_SUFFIX}_%j.out" \
+                    --error="$LOG_ROOT/${variant}_${mode}${COMMENT_SUFFIX}_%j.err" \
+                    "$SCRIPT_PATH" --worker "$variant" "$mode" "$COMMENT"
             )"
             job_id="${job_id%%;*}"
             echo "[submitted] $variant / $mode -> $job_id"
@@ -220,7 +254,7 @@ if [[ "$EVAL_MODE" != "deterministic" && "$EVAL_MODE" != "stochastic" ]]; then
     exit 2
 fi
 
-RUN_ROOT="$EXPERIMENT_ROOT/main/${VARIANT}_${EVAL_MODE}"
+RUN_ROOT="$EXPERIMENT_ROOT/main/${VARIANT}_${EVAL_MODE}${COMMENT_SUFFIX}"
 SCRATCH_MODE_ROOT="$SCRATCH_ROOT_BASE/$EVAL_MODE"
 mkdir -p "$RUN_ROOT/agents" "$RUN_ROOT/runs" "$RUN_ROOT/plots" "$RUN_ROOT/analysis"
 
@@ -252,6 +286,7 @@ echo "============================================================"
 echo "[main] environment:  MetaWorld paper10"
 echo "[main] variant:      $VARIANT"
 echo "[main] evaluation:   $EVAL_MODE"
+echo "[main] comment:      ${COMMENT:-<none>}"
 echo "[main] condition:    $CONDITION_INDEX"
 echo "[main] composition:  $COMPOSITION_SPACE"
 echo "[main] FT scratch:   $SCRATCH_MODE_ROOT"

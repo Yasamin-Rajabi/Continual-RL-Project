@@ -74,6 +74,7 @@ repeated encounters are relearning/savings.
 |---|---|---|
 | `--constrain-alpha-mass` | `--no-constrain-alpha-mass` | Positive normalized-softplus mass instead of a scalar that can hit zero/negative. |
 | `--distill-select-best-val` | `--no-distill-select-best-val` | Restore best held-out-KL student epoch instead of always keeping the last epoch. |
+| `--no-balance-source-lineages` | `--balance-source-lineages` | Legacy merge sampling balances immediate parents. Enabling the flag balances behavioral-KL reference states, distillation rows, validation splits, and truncated retained merge buffers across original `source_ids` (sequence occurrences). |
 | `--no-collect-cosine-buffers` | `--collect-cosine-buffers` | Cosine-only modes skip unused post-training rollout states; enable to equalize post-training interaction counts. |
 | `--no-use-alpha-scale` | `--use-alpha-scale` | Optional learned global scaling of historical alpha logits. |
 | `--autotune --no-autotune-init-from-alpha` | `--autotune-init-from-alpha` | Legacy entropy autotuning starts at alpha=1; optional flag starts at `--alpha`. |
@@ -99,6 +100,6 @@ available only as an explicit ablation.
 - `source_ids` identify sequence occurrences separately from semantic `task_ids`.
 - merge snapshots/logs preserve task-level and source-occurrence lineage.
 - KL logs include mean, p95, and max tails for selected merge pairs and distillation.
-- parent-balanced replay/distillation is intentionally **not** lineage-balanced yet;
-  that behavior is the control for the upcoming exponential-decay investigation.
+- `--no-balance-source-lineages` preserves the original immediate-parent-balanced control.
+- `--balance-source-lineages` enables the source-occurrence-balanced ablation intended to prevent recursive merge lineages from being exponentially underrepresented.
 - critic reset/persistence is intentionally unchanged pending the critic TODO.

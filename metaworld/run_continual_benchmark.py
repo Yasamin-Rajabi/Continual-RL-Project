@@ -124,6 +124,8 @@ def parse_args():
                    help="Compute A_N/FG/BWT without scratch baselines; leave FT unreported.")
     p.add_argument("--max-distill-buffer", type=int, default=50_000)
     p.add_argument("--similarity-samples", type=int, default=2_048)
+    p.add_argument("--balance-source-lineages", action=argparse.BooleanOptionalAction, default=False,
+                   help="Balance behavioral-KL/distillation/merge-buffer sampling across original source_ids rather than immediate parents.")
     p.add_argument("--distill-max-samples", type=int, default=20_000)
     p.add_argument("--distill-epochs", type=int, default=16)
     p.add_argument("--distill-lr", type=float, default=5e-4)
@@ -297,6 +299,7 @@ def _expected_training_config(args, suite, task_id, seq_idx, seed, cfg):
         "collect_cosine_buffers": bool(args.collect_cosine_buffers),
         "max_distill_buffer": int(args.max_distill_buffer),
         "similarity_samples": int(args.similarity_samples),
+        "balance_source_lineages": bool(args.balance_source_lineages),
         "distill_max_samples": int(args.distill_max_samples),
         "distill_epochs": int(args.distill_epochs),
         "distill_lr": float(args.distill_lr),
@@ -383,6 +386,7 @@ def train_chain(args, suite, condition, cfg, seed):
             f"--distill-extra-steps={args.distill_extra_steps}",
             f"--max-distill-buffer={args.max_distill_buffer}",
             f"--similarity-samples={args.similarity_samples}",
+            "--balance-source-lineages" if args.balance_source_lineages else "--no-balance-source-lineages",
             f"--distill-max-samples={args.distill_max_samples}",
             f"--distill-epochs={args.distill_epochs}",
             f"--distill-lr={args.distill_lr}",

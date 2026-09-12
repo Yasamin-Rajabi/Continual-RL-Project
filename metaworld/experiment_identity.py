@@ -77,6 +77,7 @@ TRAINING_KEYS = (
     "collect_cosine_buffers",
     "max_distill_buffer",
     "similarity_samples",
+    "balance_source_lineages",
     "distill_max_samples",
     "distill_epochs",
     "distill_lr",
@@ -88,6 +89,8 @@ TRAINING_KEYS = (
 # Files that can affect a training trajectory or the stored analysis needed by
 # the upcoming lineage/KL investigations. Plotting-only files are excluded so a
 # cosmetic plot edit does not force model retraining.
+PRE_LINEAGE_BALANCING_SOURCE_FINGERPRINTS = {'b5b5988a15077e6e9b6f08c2898974b21cf6cf85025233ea4e4c61db09960db5', '56e12b4ed45e30f116119131257f20edb2b6db4f121a50faadc798343c7f8878', '0dad5fc37d59d92b8d6da09c433bfee55b8b88712a7a88f8e8f69eabd4b3d0fb'}
+
 SOURCE_CANDIDATES = (
     "run_sac.py",
     "cka_rl.py",
@@ -340,16 +343,27 @@ def checkpoint_matches(
     expected = training_config(expected_mapping)
     actual = manifest.get("training_config", {})
     for key, value in expected.items():
+        # Checkpoints created before the lineage-balancing ablation existed are
+        # exactly the current default when the new flag is False.
+        if key == "balance_source_lineages" and key not in actual and value is False:
+            continue
         if actual.get(key) != value:
             return False, f"training config mismatch for {key}: saved={actual.get(key)!r}, expected={value!r}"
 
     saved_source = manifest.get("source_fingerprint")
     current_source = source_fingerprint(root)
     if saved_source != current_source:
-        # Backward compatibility for checkpoints created before the semantic
-        # fingerprint was introduced.  Accept only the two known byte-level
-        # writer variants; all other source changes remain stale.
-        if saved_source not in _compatible_legacy_source_fingerprints(root):
+        # Backward compatibility for logging-only changes and for the exact
+        # pre-lineage-balancing implementation. The latter is accepted only
+        # when the expected config keeps balance_source_lineages disabled.
+        allow_pre_lineage = (
+            not bool(expected.get("balance_source_lineages", False))
+            and saved_source in PRE_LINEAGE_BALANCING_SOURCE_FINGERPRINTS
+        )
+        if (
+            saved_source not in _compatible_legacy_source_fingerprints(root)
+            and not allow_pre_lineage
+        ):
             return False, "training source fingerprint changed"
 
     # Runtime equality is required when a checkpoint may be resumed/reused for

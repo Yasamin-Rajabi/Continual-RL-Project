@@ -17,7 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from loguru import logger
 
-from knowledge_pools import BASE_FUSION_MODE, HeadPool
+from knowledge_pools import BASE_FUSION_MODE, HeadPool, balanced_lineage_indices
 from policy_utils import bound_log_std, diagonal_gaussian_kl, symmetric_diagonal_gaussian_kl
 from shared_arch import shared, validate_shared_encoder
 
@@ -64,6 +64,7 @@ class CkaRlAgent(PolicySpaceMixin, nn.Module):
         distill_batch_size=256,
         distill_max_samples=20_000,
         similarity_samples=2048,
+        balance_source_lineages=False,
         hidden_dim=128,
         shared_dim=256,
         train_shared=False,
@@ -112,6 +113,7 @@ class CkaRlAgent(PolicySpaceMixin, nn.Module):
         self.distill_batch_size = int(distill_batch_size)
         self.distill_max_samples = int(distill_max_samples)
         self.similarity_samples = int(similarity_samples)
+        self.balance_source_lineages = bool(balance_source_lineages)
         self.train_shared = bool(train_shared)
         self.freeze_root_encoder = bool(freeze_root_encoder)
         if self.train_shared and self.freeze_root_encoder:
@@ -318,7 +320,15 @@ class CkaRlAgent(PolicySpaceMixin, nn.Module):
         for buf in buffers:
             obs = buf["obs"]
             take = min(per_slot, len(obs))
-            idx = np.random.choice(len(obs), size=take, replace=False)
+            if self.balance_source_lineages:
+                if "source_ids" not in buf:
+                    raise RuntimeError(
+                        "--balance-source-lineages requires source_ids in every retained buffer; "
+                        "start the ablation from task 0 rather than an older checkpoint."
+                    )
+                idx = balanced_lineage_indices(buf["source_ids"], take)
+            else:
+                idx = np.random.choice(len(obs), size=take, replace=False)
             samples.append(obs[idx].astype(np.float32, copy=False))
         return samples
 
@@ -508,17 +518,48 @@ class CkaRlAgent(PolicySpaceMixin, nn.Module):
         buf2 = self.mean_pool.pool[idx2].get("buffer")
         if buf1 is None or buf2 is None:
             raise RuntimeError("distillation requested but a selected pool entry has no observation buffer")
+
+        if self.balance_source_lineages:
+            for buf in (buf1, buf2):
+                if "source_ids" not in buf:
+                    raise RuntimeError(
+                        "--balance-source-lineages requires source_ids in every retained buffer; "
+                        "start the ablation from task 0 rather than an older checkpoint."
+                    )
+            obs_all = np.concatenate([buf1["obs"], buf2["obs"]], axis=0)
+            teacher_all = np.concatenate([
+                np.zeros(len(buf1["obs"]), dtype=np.int64),
+                np.ones(len(buf2["obs"]), dtype=np.int64),
+            ])
+            source_all = np.concatenate([
+                np.asarray(buf1["source_ids"]).reshape(-1),
+                np.asarray(buf2["source_ids"]).reshape(-1),
+            ])
+            take = min(len(obs_all), self.distill_max_samples)
+            idx = balanced_lineage_indices(source_all, take)
+            return (
+                obs_all[idx].astype(np.float32, copy=False),
+                teacher_all[idx],
+                source_all[idx].astype(np.int64, copy=False),
+            )
+
+        # Legacy behavior: equal row budget for the two immediate parents.
         max_each = max(1, self.distill_max_samples // 2)
-        obs_parts, teacher_ids = [], []
+        obs_parts, teacher_ids, source_ids = [], [], []
         for teacher_id, buf in enumerate((buf1, buf2)):
             obs = buf["obs"]
             take = min(len(obs), max_each)
             idx = np.random.choice(len(obs), size=take, replace=False)
             obs_parts.append(obs[idx])
             teacher_ids.append(np.full(take, teacher_id, dtype=np.int64))
+            if "source_ids" in buf:
+                source_ids.append(np.asarray(buf["source_ids"])[idx].reshape(-1))
+            else:
+                source_ids.append(np.full(take, teacher_id, dtype=np.int64))
         return (
             np.concatenate(obs_parts, axis=0).astype(np.float32, copy=False),
             np.concatenate(teacher_ids, axis=0),
+            np.concatenate(source_ids, axis=0).astype(np.int64, copy=False),
         )
 
     def _distill_pair(self, idx1: int, idx2: int):
@@ -530,10 +571,11 @@ class CkaRlAgent(PolicySpaceMixin, nn.Module):
         no held-out rows exist, the lowest training KL), not blindly the last
         optimization epoch.
         """
-        obs, teacher_ids_np = self._balanced_parent_data(idx1, idx2)
+        obs, teacher_ids_np, source_ids_np = self._balanced_parent_data(idx1, idx2)
         z = self._encode_obs(obs)
         device = z.device
         teacher_ids = torch.as_tensor(teacher_ids_np, dtype=torch.long, device=device)
+        source_ids = torch.as_tensor(source_ids_np, dtype=torch.long, device=device)
 
         with torch.no_grad():
             m1, l1 = self._entry_outputs(z, idx1)
@@ -552,23 +594,27 @@ class CkaRlAgent(PolicySpaceMixin, nn.Module):
         optimizer = torch.optim.Adam(trainables, lr=self.distill_lr)
 
         n = len(obs)
-        # Stratify the held-out split by immediate parent so train/test
-        # diagnostics do not accidentally contain only one teacher.  NOTE: this
-        # does NOT lineage-balance original source tasks inside an already-merged
-        # parent; source_ids are retained separately so that effect can be
-        # measured before we change the algorithm.
+        # Legacy mode stratifies by immediate parent.  Lineage-balanced mode
+        # stratifies by original source occurrence so every retained lineage is
+        # represented in training and, when possible, held-out validation.
         train_parts, test_parts = [], []
-        for teacher_id in (0, 1):
-            parent_idx = torch.nonzero(teacher_ids == teacher_id, as_tuple=False).flatten()
-            parent_idx = parent_idx[torch.randperm(parent_idx.numel(), device=device)]
-            n_parent_test = (
-                int(parent_idx.numel() * self.distill_test_frac)
+        split_groups = (
+            torch.unique(source_ids).tolist()
+            if self.balance_source_lineages
+            else [0, 1]
+        )
+        split_labels = source_ids if self.balance_source_lineages else teacher_ids
+        for group_id in split_groups:
+            group_idx = torch.nonzero(split_labels == int(group_id), as_tuple=False).flatten()
+            group_idx = group_idx[torch.randperm(group_idx.numel(), device=device)]
+            n_group_test = (
+                int(group_idx.numel() * self.distill_test_frac)
                 if self.distill_test_frac > 0 else 0
             )
-            # Keep at least one training row for every non-empty parent.
-            n_parent_test = min(n_parent_test, max(parent_idx.numel() - 1, 0))
-            test_parts.append(parent_idx[:n_parent_test])
-            train_parts.append(parent_idx[n_parent_test:])
+            # Keep at least one training row for every non-empty lineage/parent.
+            n_group_test = min(n_group_test, max(group_idx.numel() - 1, 0))
+            test_parts.append(group_idx[:n_group_test])
+            train_parts.append(group_idx[n_group_test:])
         train_idx = torch.cat(train_parts)
         test_idx = torch.cat(test_parts)
         train_idx = train_idx[torch.randperm(train_idx.numel(), device=device)]
@@ -688,6 +734,8 @@ class CkaRlAgent(PolicySpaceMixin, nn.Module):
             "policy/distill_select_best_val": float(self.distill_select_best_val),
             "policy/distill_initial_val_kl": None if initial_val is None else float(initial_val["mean"]),
             "policy/distill_rows": int(n),
+            "policy/distill_source_lineages": int(torch.unique(source_ids).numel()),
+            "policy/distill_balance_source_lineages": float(self.balance_source_lineages),
         }
         logger.info(
             f"[policy distill] rows={n} best_epoch={best_epoch} selected_epoch={selected_epoch} "
@@ -730,9 +778,13 @@ class CkaRlAgent(PolicySpaceMixin, nn.Module):
 
         buf1 = self.mean_pool.pool[idx1].get("buffer")
         buf2 = self.mean_pool.pool[idx2].get("buffer")
-        merged_buffer = HeadPool.merge_buffers(buf1, buf2, self.max_distill_buffer)
+        merged_buffer = HeadPool.merge_buffers(
+            buf1, buf2, self.max_distill_buffer,
+            balance_source_lineages=self.balance_source_lineages,
+        )
         merge_info.update({
             "used_distillation": used_distillation,
+            "balance_source_lineages": bool(self.balance_source_lineages),
             "pool_size_before": int(self.mean_pool.pool_length()),
             "pool_size_after": int(self.mean_pool.pool_length() - 1),
             # task-level lineage is useful for semantic task composition; source
