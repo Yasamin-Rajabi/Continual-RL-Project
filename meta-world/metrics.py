@@ -34,6 +34,7 @@ begin with):
 """
 from __future__ import annotations
 
+import csv
 import json
 import pathlib
 
@@ -241,6 +242,34 @@ def _validate_scratch_checkpoints(args, suite, condition, scratch_seeds, scratch
         )
 
 
+def _load_scalar_csv(directory, scalar_tag):
+    """Fallback reader for the scalars.csv mirror written next to TensorBoard."""
+    path = pathlib.Path(directory) / "scalars.csv"
+    if not path.exists():
+        return np.empty(0), np.empty(0)
+    steps, values = [], []
+    try:
+        with path.open(newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if row.get("tag") != scalar_tag:
+                    continue
+                step = row.get("step", "")
+                value = row.get("value", "")
+                if step == "" or value == "":
+                    continue
+                steps.append(float(step))
+                values.append(float(value))
+    except Exception:
+        return np.empty(0), np.empty(0)
+    if not steps:
+        return np.empty(0), np.empty(0)
+    order = np.argsort(np.asarray(steps, dtype=np.float64), kind="stable")
+    return (
+        np.asarray(steps, dtype=np.float64)[order],
+        np.asarray(values, dtype=np.float64)[order],
+    )
+
+
 def load_scalar(directory, scalar_tag):
     directory = pathlib.Path(directory)
     if not directory.exists():
@@ -250,15 +279,18 @@ def load_scalar(directory, scalar_tag):
             str(directory), size_guidance={event_accumulator.SCALARS: 0}
         )
         ea.Reload()
+        if scalar_tag in ea.Tags().get("scalars", []):
+            events = ea.Scalars(scalar_tag)
+            if events:
+                return (
+                    np.asarray([e.step for e in events], dtype=np.float64),
+                    np.asarray([e.value for e in events], dtype=np.float64),
+                )
     except Exception:
-        return np.empty(0), np.empty(0)
-    if scalar_tag not in ea.Tags().get("scalars", []):
-        return np.empty(0), np.empty(0)
-    events = ea.Scalars(scalar_tag)
-    return (
-        np.asarray([e.step for e in events], dtype=np.float64),
-        np.asarray([e.value for e in events], dtype=np.float64),
-    )
+        pass
+    # TensorBoard remains the primary source. CSV is a byte-simple backup and
+    # makes post-hoc FT robust if an event file is missing/corrupted.
+    return _load_scalar_csv(directory, scalar_tag)
 
 
 def final_scalar(directory, scalar_tag):

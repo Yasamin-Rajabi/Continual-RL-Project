@@ -11,6 +11,7 @@ pretrained encoder file while keeping the same output path.
 """
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.metadata
 import json
@@ -129,7 +130,59 @@ def sha256_file(path) -> str | None:
     return h.hexdigest()
 
 
+class _RunSacLoggingStripper(ast.NodeTransformer):
+    """Remove pure logging plumbing from run_sac.py before identity hashing.
+
+    Training semantics still remain fingerprinted.  This only strips the writer
+    import/construction and direct writer.* calls, so switching TensorBoard to a
+    CSV-mirroring writer or adding/removing scalar logging does not make trained
+    checkpoints look stale.
+    """
+
+    _WRITER_METHODS = {"add_scalar", "add_text", "flush", "close"}
+
+    def visit_ImportFrom(self, node):
+        if node.module in {"torch.utils.tensorboard", "csv_summary_writer"}:
+            return None
+        return self.generic_visit(node)
+
+    def visit_Assign(self, node):
+        # Strip only the top-level writer construction, not arbitrary assignments.
+        if any(isinstance(t, ast.Name) and t.id == "writer" for t in node.targets):
+            value = node.value
+            if isinstance(value, ast.Call):
+                func = value.func
+                if isinstance(func, ast.Name) and func.id in {"SummaryWriter", "CsvSummaryWriter"}:
+                    return None
+        return self.generic_visit(node)
+
+    def visit_Expr(self, node):
+        value = node.value
+        if isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute):
+            owner = value.func.value
+            if (isinstance(owner, ast.Name) and owner.id == "writer"
+                    and value.func.attr in self._WRITER_METHODS):
+                return None
+        return self.generic_visit(node)
+
+
+def _semantic_source_bytes(name: str, path: pathlib.Path) -> bytes:
+    """Canonical bytes for training identity.
+
+    run_sac.py is parsed so pure metric-output statements do not affect the
+    training fingerprint. Other training-relevant files remain byte-exact.
+    """
+    if name != "run_sac.py":
+        return path.read_bytes()
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(path))
+    tree = _RunSacLoggingStripper().visit(tree)
+    ast.fix_missing_locations(tree)
+    return ast.dump(tree, annotate_fields=True, include_attributes=False).encode("utf-8")
+
+
 def source_fingerprint(root=None) -> str:
+    """Fingerprint training semantics while ignoring pure run_sac logging changes."""
     root = pathlib.Path(root or pathlib.Path(__file__).resolve().parent)
     h = hashlib.sha256()
     found = 0
@@ -140,11 +193,61 @@ def source_fingerprint(root=None) -> str:
         found += 1
         h.update(name.encode("utf-8"))
         h.update(b"\0")
-        h.update(path.read_bytes())
+        h.update(_semantic_source_bytes(name, path))
         h.update(b"\0")
     if found == 0:
         raise RuntimeError(f"no training source files found under {root}")
     return h.hexdigest()
+
+
+def _raw_source_fingerprint(root: pathlib.Path, run_sac_bytes: bytes | None = None) -> str:
+    """Legacy schema-v2 byte fingerprint used by already-trained checkpoints."""
+    h = hashlib.sha256()
+    found = 0
+    for name in SOURCE_CANDIDATES:
+        path = root / name
+        if not path.exists():
+            continue
+        found += 1
+        h.update(name.encode("utf-8"))
+        h.update(b"\0")
+        if name == "run_sac.py" and run_sac_bytes is not None:
+            h.update(run_sac_bytes)
+        else:
+            h.update(path.read_bytes())
+        h.update(b"\0")
+    if found == 0:
+        raise RuntimeError(f"no training source files found under {root}")
+    return h.hexdigest()
+
+
+def _compatible_legacy_source_fingerprints(root=None) -> set[str]:
+    """Raw hashes accepted only for old manifests.
+
+    The CSV logger changed exactly the SummaryWriter import and constructor.
+    Reconstruct both byte-level variants from the current source so checkpoints
+    produced immediately before or after that logging-only change remain valid.
+    Any other training-source change still fails validation.
+    """
+    root = pathlib.Path(root or pathlib.Path(__file__).resolve().parent)
+    run_sac = root / "run_sac.py"
+    variants = {_raw_source_fingerprint(root)}
+    if not run_sac.exists():
+        return variants
+    text = run_sac.read_text(encoding="utf-8")
+
+    tb = text.replace(
+        "from csv_summary_writer import CsvSummaryWriter",
+        "from torch.utils.tensorboard import SummaryWriter",
+    ).replace("writer = CsvSummaryWriter(", "writer = SummaryWriter(")
+    variants.add(_raw_source_fingerprint(root, tb.encode("utf-8")))
+
+    csv = text.replace(
+        "from torch.utils.tensorboard import SummaryWriter",
+        "from csv_summary_writer import CsvSummaryWriter",
+    ).replace("writer = SummaryWriter(", "writer = CsvSummaryWriter(")
+    variants.add(_raw_source_fingerprint(root, csv.encode("utf-8")))
+    return variants
 
 
 def runtime_versions() -> dict:
@@ -239,9 +342,14 @@ def checkpoint_matches(
         if actual.get(key) != value:
             return False, f"training config mismatch for {key}: saved={actual.get(key)!r}, expected={value!r}"
 
+    saved_source = manifest.get("source_fingerprint")
     current_source = source_fingerprint(root)
-    if manifest.get("source_fingerprint") != current_source:
-        return False, "training source fingerprint changed"
+    if saved_source != current_source:
+        # Backward compatibility for checkpoints created before the semantic
+        # fingerprint was introduced.  Accept only the two known byte-level
+        # writer variants; all other source changes remain stale.
+        if saved_source not in _compatible_legacy_source_fingerprints(root):
+            return False, "training source fingerprint changed"
 
     current_runtime = runtime_versions()
     if manifest.get("runtime_versions") != current_runtime:
