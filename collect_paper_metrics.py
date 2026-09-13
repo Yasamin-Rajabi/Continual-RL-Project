@@ -23,9 +23,6 @@ A_N, FG, BWT and FT are NOT recomputed from PERF here.  They are read from
 * FT: learning-curve AUC versus matched scratch, first unseen encounters only.
 
 This script never trains or evaluates an agent.  It only reads saved CSVs.
-
-For commented run folders created by ``job.sh --comment NAME`` (for example
-``combined_deterministic_amass``), pass the same ``--comment NAME`` here.
 """
 from __future__ import annotations
 
@@ -123,7 +120,38 @@ def _task_id_from_run_dir(run_dir: Path):
     return int(m.group(1)) if m else None
 
 
-def _perf_for_method(method_dir: Path, suite: str, method: str, eval_mode: str, survey_rows):
+def _parse_run_folder(name: str, eval_mode: str):
+    """Return (base_method, comment, display_label) for a main run folder.
+
+    Examples:
+      combined_policy_deterministic -> (combined_policy, "", combined_policy)
+      combined_policy_deterministic_am0_lineage ->
+          (combined_policy, am0_lineage, combined_policy_am0_lineage)
+    """
+    token = f"_{eval_mode}"
+    pos = name.find(token)
+    if pos <= 0:
+        return None
+    base_method = name[:pos]
+    suffix = name[pos + len(token):]
+    if suffix and not suffix.startswith("_"):
+        return None
+    comment = suffix[1:] if suffix.startswith("_") else ""
+    label = base_method if not comment else f"{base_method}_{comment}"
+    return base_method, comment, label
+
+
+def args_eval_mode_from_dir(name: str):
+    # Used only for audit rows. The caller has already filtered deterministic
+    # or stochastic folders, so infer the token directly from the folder name.
+    if "_deterministic" in name:
+        return "deterministic"
+    if "_stochastic" in name:
+        return "stochastic"
+    return ""
+
+
+def _perf_for_method(method_dir: Path, suite: str, method: str, label: str, survey_rows):
     """Compute per-seed PERF from ALL sequence occurrences.
 
     Each seed is averaged across its occurrences first.  Paper aggregation is
@@ -165,7 +193,7 @@ def _perf_for_method(method_dir: Path, suite: str, method: str, eval_mode: str, 
             scalar_files = sorted(seq_dir.glob("*/scalars.csv"))
             if len(scalar_files) != 1:
                 raise RuntimeError(
-                    f"Expected exactly one scalars.csv for {method} seed={seed} seq={seq_idx}, "
+                    f"Expected exactly one scalars.csv for {label} seed={seed} seq={seq_idx}, "
                     f"found {len(scalar_files)} under {seq_dir}"
                 )
             scalar_path = scalar_files[0]
@@ -187,8 +215,10 @@ def _perf_for_method(method_dir: Path, suite: str, method: str, eval_mode: str, 
             success_values.append(success)
             return_values.append(ret)
             occurrence_rows.append({
-                "method": method,
-                "eval_mode": eval_mode,
+                "method": label,
+                "base_method": method,
+                "run_folder": method_dir.name,
+                "eval_mode": args_eval_mode_from_dir(method_dir.name),
                 "seed": seed,
                 "seq_idx": seq_idx,
                 "task_id": "" if task_id is None else task_id,
@@ -208,7 +238,7 @@ def _perf_for_method(method_dir: Path, suite: str, method: str, eval_mode: str, 
 
     if len(set(occurrence_counts)) > 1:
         raise RuntimeError(
-            f"Inconsistent number of sequence occurrences for {method}: {occurrence_counts}"
+            f"Inconsistent number of sequence occurrences for {label}: {occurrence_counts}"
         )
 
     return per_seed, occurrence_rows
@@ -248,22 +278,27 @@ def main():
     ap.add_argument("--experiment-root", required=True)
     ap.add_argument("--suite", required=True)
     ap.add_argument("--eval-mode", choices=("deterministic", "stochastic"), default="deterministic")
-    ap.add_argument("--comment", default="", help="Optional run-folder suffix used by job.sh, e.g. amass for combined_deterministic_amass.")
     ap.add_argument("--output", default=None)
     args = ap.parse_args()
 
     root = Path(args.experiment_root)
-    comment = args.comment.strip()
-    if comment and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", comment):
-        raise SystemExit("--comment may contain only letters, digits, '.', '_' and '-' and must start with a letter/digit")
-    run_suffix = f"_{args.eval_mode}" + (f"_{comment}" if comment else "")
-    candidates = sorted((root / "main").glob(f"*{run_suffix}"))
+    # Include both the original folders (e.g. combined_policy_deterministic)
+    # and commented ablation folders (e.g. combined_policy_deterministic_am0).
+    # The eval-mode token must be a full folder-name component boundary, so
+    # deterministic_old or similarly malformed names are ignored.
+    candidates = []
+    for path in sorted((root / "main").iterdir() if (root / "main").exists() else []):
+        if not path.is_dir():
+            continue
+        parsed = _parse_run_folder(path.name, args.eval_mode)
+        if parsed is not None:
+            candidates.append((path, *parsed))
+
     aggregate_rows = []
     per_seed_rows = []
     all_occurrence_rows = []
 
-    for method_dir in candidates:
-        method = method_dir.name[:-len(run_suffix)]
+    for method_dir, method, comment, label in candidates:
         base = method_dir / "plots" / args.suite
         survey_rows = _read_rows(base / "survey_metrics.csv")
         summary_rows = _read_rows(base / "summary_metrics.csv")
@@ -271,7 +306,7 @@ def main():
             continue
 
         perf_by_seed, occurrence_rows = _perf_for_method(
-            method_dir, args.suite, method, args.eval_mode, survey_rows
+            method_dir, args.suite, method, label, survey_rows
         )
         all_occurrence_rows.extend(occurrence_rows)
 
@@ -296,9 +331,11 @@ def main():
             survey = survey_by_seed.get(seed, {})
             summary = summary_by_seed.get(seed, {})
             seed_row = {
-                "method": method,
-                "eval_mode": args.eval_mode,
+                "method": label,
+                "base_method": method,
                 "comment": comment,
+                "run_folder": method_dir.name,
+                "eval_mode": args.eval_mode,
                 "seed": seed,
                 "PERF_return": perf["PERF_return"],
                 "PERF_success": perf["PERF_success"],
@@ -316,7 +353,13 @@ def main():
             )
             per_seed_rows.append(seed_row)
 
-        row = {"method": method, "eval_mode": args.eval_mode, "comment": comment}
+        row = {
+            "method": label,
+            "base_method": method,
+            "comment": comment,
+            "run_folder": method_dir.name,
+            "eval_mode": args.eval_mode,
+        }
 
         # Correct PERF: per-seed mean over all task occurrences, then mean/std
         # over seeds.
@@ -356,8 +399,7 @@ def main():
     if not aggregate_rows:
         raise SystemExit(f"No metric CSVs found under {root/'main'} for mode={args.eval_mode}")
 
-    output_tag = args.eval_mode + (f"_{comment}" if comment else "")
-    output = Path(args.output) if args.output else root / f"paper_metrics_{output_tag}.csv"
+    output = Path(args.output) if args.output else root / f"paper_metrics_{args.eval_mode}.csv"
     output.parent.mkdir(parents=True, exist_ok=True)
 
     with output.open("w", newline="", encoding="utf-8") as f:
@@ -365,13 +407,13 @@ def main():
         writer.writeheader()
         writer.writerows(aggregate_rows)
 
-    per_seed_path = output.parent / f"paper_metrics_per_seed_{output_tag}.csv"
+    per_seed_path = output.parent / f"paper_metrics_per_seed_{args.eval_mode}.csv"
     with per_seed_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(per_seed_rows[0].keys()))
         writer.writeheader()
         writer.writerows(per_seed_rows)
 
-    occurrence_path = output.parent / f"paper_PERF_occurrences_{output_tag}.csv"
+    occurrence_path = output.parent / f"paper_PERF_occurrences_{args.eval_mode}.csv"
     with occurrence_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(all_occurrence_rows[0].keys()))
         writer.writeheader()
@@ -397,15 +439,15 @@ def main():
         aggregate_rows,
         metric="PERF_return",
         ylabel="Mean end-of-task episodic return",
-        title=f"{args.suite}: PERF over task occurrences ({output_tag})",
-        output_path=plot_dir / f"paper_PERF_return_{output_tag}.png",
+        title=f"{args.suite}: PERF over task occurrences ({args.eval_mode})",
+        output_path=plot_dir / f"paper_PERF_return_{args.eval_mode}.png",
     )
     _plot_perf(
         aggregate_rows,
         metric="PERF_success",
         ylabel="Mean end-of-task success",
-        title=f"{args.suite}: PERF over task occurrences ({output_tag})",
-        output_path=plot_dir / f"paper_PERF_success_{output_tag}.png",
+        title=f"{args.suite}: PERF over task occurrences ({args.eval_mode})",
+        output_path=plot_dir / f"paper_PERF_success_{args.eval_mode}.png",
     )
 
 
