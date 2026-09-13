@@ -8,6 +8,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --partition=h100
 #SBATCH --qos=normal
+#SBATCH --exclude=kh023
 
 set -euo pipefail
 
@@ -153,7 +154,7 @@ COMMON_ARGS=(
     --batch-size 256
     --policy-lr 3e-4
     --alpha-lr 5e-3
-    --alpha-mass-lr 5e-3
+    # --alpha-mass-lr 5e-3
     --alpha-mass-reg 0.0
     # --alpha-mass-reg 0.05
     --alpha-warmup-steps 5000
@@ -176,8 +177,8 @@ COMMON_ARGS=(
     --no-distill-observation-skip
     --distill-buffer-steps 5000
     --similarity-samples 2048
-    # --no-balance-source-lineages
-    --balance-source-lineages
+    --no-balance-source-lineages
+    # --balance-source-lineages
     --max-distill-buffer 50000
     --distill-max-samples 20000
     --distill-epochs 16
