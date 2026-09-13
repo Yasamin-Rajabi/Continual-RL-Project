@@ -8,7 +8,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --partition=h100
 #SBATCH --qos=normal
-#SBATCH --exclude=kh023
+#SBATCH --exclude=kh023,kh032
 
 set -euo pipefail
 
@@ -144,7 +144,7 @@ if [[ ! -f sanity_check_pool.py ]]; then
 fi
 
 # VARIANTS=(baseline combined combined_policy combined_policy_student)
-VARIANTS=(combined_policy combined_policy_student)
+VARIANTS=(combined_policy)
 
 COMMON_ARGS=(
     --task-suites halfcheetah_wind_vel
@@ -177,8 +177,8 @@ COMMON_ARGS=(
     --no-distill-observation-skip
     --distill-buffer-steps 5000
     --similarity-samples 2048
-    --no-balance-source-lineages
-    # --balance-source-lineages
+    # --no-balance-source-lineages
+    --balance-source-lineages
     --max-distill-buffer 50000
     --distill-max-samples 20000
     --distill-epochs 16

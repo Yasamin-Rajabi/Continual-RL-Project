@@ -8,6 +8,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --partition=h100
 #SBATCH --qos=normal
+#SBATCH --exclude=kh023,kh032
 
 set -euo pipefail
 
@@ -26,7 +27,7 @@ EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-$BASE_STORAGE/ethos_student_metaworld_paper1
 LOG_ROOT="$EXPERIMENT_ROOT/logs"
 SCRATCH_ROOT_BASE="$EXPERIMENT_ROOT/scratch"
 SCRATCH_SEEDS=(101 102 103)
-EVAL_MODES=(deterministic stochastic)
+EVAL_MODES=(deterministic)
 
 clean_host_python_env() {
     if [[ -n "${VIRTUAL_ENV:-}" ]]; then
@@ -114,7 +115,7 @@ SCRATCH_ARGS=(
     --policy-lr 1e-3
     --alpha-lr 5e-3
     --alpha-mass-reg 0.05
-    --alpha-warmup-steps 5000
+    --alpha-warmup-steps 10000
     --alpha-entropy-reg 0.01
     --drift-reg 1.0
     --distill-encoder-lr-mult 0.1
@@ -124,16 +125,16 @@ SCRATCH_ARGS=(
     --alpha 0.2
     --autotune
     --autotune-init-from-alpha
-    --learning-starts 5000
-    --random-actions-end 5000
+    --learning-starts 10000
+    --random-actions-end 10000
     --eval-every 10000
     --num-evals 5
     --no-distill-observation-skip
-    --distill-buffer-steps 10000
-    --similarity-samples 2048
-    --max-distill-buffer 50000
-    --distill-max-samples 20000
-    --distill-epochs 16
+    --distill-buffer-steps 20000
+    --similarity-samples 4096
+    --max-distill-buffer 100000
+    --distill-max-samples 40000
+    --distill-epochs 32
     --distill-lr 5e-4
     --distill-batch-size 256
     --distill-test-frac 0.2
