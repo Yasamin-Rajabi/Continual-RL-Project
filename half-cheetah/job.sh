@@ -14,7 +14,12 @@ set -euo pipefail
 
 MODE="${1:-}"
 COMMENT="${RUN_COMMENT:-}"
+AGGREGATE=0
+
 if [[ "$MODE" == "--worker" ]]; then
+    COMMENT="${5:-${RUN_COMMENT:-}}"
+    REPO_DIR="${SLURM_SUBMIT_DIR:?SLURM_SUBMIT_DIR is not set}"
+elif [[ "$MODE" == "--aggregate-worker" ]]; then
     COMMENT="${4:-${RUN_COMMENT:-}}"
     REPO_DIR="${SLURM_SUBMIT_DIR:?SLURM_SUBMIT_DIR is not set}"
 else
@@ -30,9 +35,14 @@ else
                 COMMENT="${1#--comment=}"
                 shift
                 ;;
+            --aggregate)
+                AGGREGATE=1
+                shift
+                ;;
             -h|--help)
-                echo "Usage: bash ${BASH_SOURCE[0]} [--comment NAME]"
-                echo "Example: bash ${BASH_SOURCE[0]} --comment amass"
+                echo "Usage: bash ${BASH_SOURCE[0]} [--comment NAME] [--aggregate]"
+                echo "Train seeds independently: bash ${BASH_SOURCE[0]} [--comment NAME]"
+                echo "Aggregate after all seed jobs finish: bash ${BASH_SOURCE[0]} --aggregate [--comment NAME]"
                 exit 0
                 ;;
             *)
@@ -59,6 +69,7 @@ EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-$BASE_STORAGE/ethos_student_halfcheetah_wind
 LOG_ROOT="$EXPERIMENT_ROOT/logs"
 SCRATCH_ROOT_BASE="$EXPERIMENT_ROOT/scratch"
 SCRATCH_SEEDS=(101 102 103)
+MAIN_SEEDS=(1 2 3)
 # EVAL_MODES=(deterministic stochastic)
 EVAL_MODES=(deterministic)
 
@@ -148,7 +159,6 @@ VARIANTS=(combined_policy)
 
 COMMON_ARGS=(
     --task-suites halfcheetah_wind_vel
-    --seeds 1 2 3
     --total-timesteps 80000
     --pool-size 5
     --batch-size 256
@@ -218,13 +228,44 @@ variant_mapping() {
     esac
 }
 
-if [[ "$MODE" != "--worker" ]]; then
+if [[ "$MODE" != "--worker" && "$MODE" != "--aggregate-worker" ]]; then
     mkdir -p "$LOG_ROOT" "$EXPERIMENT_ROOT/main"
     SCRIPT_PATH="$(realpath "$0")"
+
+    if [[ "$AGGREGATE" -eq 1 ]]; then
+        echo "============================================================"
+        echo "Submitting HalfCheetah-WindVel aggregation/evaluation jobs"
+        echo "Methods: ${VARIANTS[*]}"
+        echo "Modes: ${EVAL_MODES[*]}"
+        echo "Seeds: ${MAIN_SEEDS[*]}"
+        echo "Comment: ${COMMENT:-<none>}"
+        echo "Training: DISABLED; existing checkpoints only"
+        echo "Container: $IMAGE"
+        echo "============================================================"
+
+        for mode in "${EVAL_MODES[@]}"; do
+            for variant in "${VARIANTS[@]}"; do
+                job_id="$(
+                    sbatch --parsable \
+                        --job-name="causal" \
+                        --output="$LOG_ROOT/aggregate_${variant}_${mode}${COMMENT_SUFFIX}_%j.out" \
+                        --error="$LOG_ROOT/aggregate_${variant}_${mode}${COMMENT_SUFFIX}_%j.err" \
+                        "$SCRIPT_PATH" --aggregate-worker "$variant" "$mode" "$COMMENT"
+                )"
+                job_id="${job_id%%;*}"
+                echo "[submitted aggregate] $variant / $mode -> $job_id"
+            done
+        done
+
+        echo "Aggregation jobs submitted. No SLURM dependencies were created."
+        exit 0
+    fi
+
     echo "============================================================"
-    echo "Submitting HalfCheetah-WindVel main runs"
+    echo "Submitting HalfCheetah-WindVel main runs with one SLURM job per seed"
     echo "Methods: ${VARIANTS[*]}"
     echo "Modes: ${EVAL_MODES[*]}"
+    echo "Seeds: ${MAIN_SEEDS[*]}"
     echo "Comment: ${COMMENT:-<none>}"
     echo "FT: enabled"
     echo "Container: $IMAGE"
@@ -232,25 +273,36 @@ if [[ "$MODE" != "--worker" ]]; then
 
     for mode in "${EVAL_MODES[@]}"; do
         for variant in "${VARIANTS[@]}"; do
-            job_id="$(
-                sbatch --parsable \
-                    --job-name="causal" \
-                    --output="$LOG_ROOT/${variant}_${mode}${COMMENT_SUFFIX}_%j.out" \
-                    --error="$LOG_ROOT/${variant}_${mode}${COMMENT_SUFFIX}_%j.err" \
-                    "$SCRIPT_PATH" --worker "$variant" "$mode" "$COMMENT"
-            )"
-            job_id="${job_id%%;*}"
-            echo "[submitted] $variant / $mode -> $job_id"
+            for seed in "${MAIN_SEEDS[@]}"; do
+                job_id="$(
+                    sbatch --parsable \
+                        --job-name="causal" \
+                        --output="$LOG_ROOT/${variant}_${mode}_seed${seed}${COMMENT_SUFFIX}_%j.out" \
+                        --error="$LOG_ROOT/${variant}_${mode}_seed${seed}${COMMENT_SUFFIX}_%j.err" \
+                        "$SCRIPT_PATH" --worker "$variant" "$mode" "$seed" "$COMMENT"
+                )"
+                job_id="${job_id%%;*}"
+                echo "[submitted] $variant / $mode / seed $seed -> $job_id"
+            done
         done
     done
 
-    echo "All eight main jobs submitted. job.sh does not create SLURM dependencies on scratch jobs."
-    echo "Make sure the matching scratch baselines are complete before submitting job.sh."
+    echo "All seed jobs submitted. No SLURM dependencies were created."
+    echo "Wait for all seed jobs to finish successfully, then run:"
+    echo "  bash $SCRIPT_PATH --aggregate${COMMENT:+ --comment $COMMENT}"
     exit 0
 fi
 
 VARIANT="${2:?Missing variant}"
 EVAL_MODE="${3:?Missing evaluation mode}"
+SEED=""
+if [[ "$MODE" == "--worker" ]]; then
+    SEED="${4:?Missing seed}"
+    if [[ "$SEED" != "1" && "$SEED" != "2" && "$SEED" != "3" ]]; then
+        echo "ERROR: seed must be one of: ${MAIN_SEEDS[*]}" >&2
+        exit 2
+    fi
+fi
 read -r CONDITION_INDEX COMPOSITION_SPACE <<<"$(variant_mapping "$VARIANT")" || {
     echo "ERROR: unsupported variant: $VARIANT" >&2
     exit 2
@@ -271,12 +323,25 @@ if [[ ! -d "$SCRATCH_MODE_ROOT/runs/scratch" ]]; then
     echo "ERROR: scratch TensorBoard logs are missing: $SCRATCH_MODE_ROOT/runs/scratch" >&2
     exit 3
 fi
-if [[ -e "$RUN_ROOT/runs/scratch" && ! -L "$RUN_ROOT/runs/scratch" ]]; then
+EXPECTED_SCRATCH_LINK="$(realpath "$SCRATCH_MODE_ROOT/runs/scratch")"
+if [[ -L "$RUN_ROOT/runs/scratch" ]]; then
+    CURRENT_SCRATCH_LINK="$(readlink -f "$RUN_ROOT/runs/scratch")"
+    if [[ "$CURRENT_SCRATCH_LINK" != "$EXPECTED_SCRATCH_LINK" ]]; then
+        echo "ERROR: $RUN_ROOT/runs/scratch points to $CURRENT_SCRATCH_LINK, expected $EXPECTED_SCRATCH_LINK" >&2
+        exit 3
+    fi
+elif [[ -e "$RUN_ROOT/runs/scratch" ]]; then
     echo "ERROR: $RUN_ROOT/runs/scratch exists and is not a symlink" >&2
     exit 3
+else
+    if ! ln -s "$EXPECTED_SCRATCH_LINK" "$RUN_ROOT/runs/scratch" 2>/dev/null; then
+        # Another seed job may have created the same correct symlink concurrently.
+        if [[ ! -L "$RUN_ROOT/runs/scratch" ]] ||            [[ "$(readlink -f "$RUN_ROOT/runs/scratch")" != "$EXPECTED_SCRATCH_LINK" ]]; then
+            echo "ERROR: could not create scratch symlink safely: $RUN_ROOT/runs/scratch" >&2
+            exit 3
+        fi
+    fi
 fi
-rm -f "$RUN_ROOT/runs/scratch"
-ln -s "$(realpath "$SCRATCH_MODE_ROOT/runs/scratch")" "$RUN_ROOT/runs/scratch"
 
 VARIANT_ARGS=()
 case "$VARIANT" in
@@ -292,6 +357,12 @@ echo "============================================================"
 echo "[main] environment:  HalfCheetah-WindVel"
 echo "[main] variant:      $VARIANT"
 echo "[main] evaluation:   $EVAL_MODE"
+if [[ "$MODE" == "--worker" ]]; then
+    echo "[main] seed:         $SEED"
+else
+    echo "[main] seeds:        ${MAIN_SEEDS[*]}"
+    echo "[main] mode:         aggregate/evaluation only"
+fi
 echo "[main] comment:      ${COMMENT:-<none>}"
 echo "[main] condition:    $CONDITION_INDEX"
 echo "[main] composition:  $COMPOSITION_SPACE"
@@ -300,23 +371,62 @@ echo "[main] output:       $RUN_ROOT"
 echo "[main] container:    $IMAGE"
 echo "============================================================"
 
-run_in_container python -u "$REPO_DIR/sanity_check_pool.py"
+# sanity_check_pool.py uses a fixed /tmp path. Serialize it per node so
+# independently scheduled seed jobs cannot collide when SLURM places them together.
+(
+    flock -x 9
+    run_in_container python -u "$REPO_DIR/sanity_check_pool.py"
+) 9>/tmp/cka_pool_sanity.lock
 
-run_in_container python -u "$REPO_DIR/run_continual_benchmark.py" \
-    "${COMMON_ARGS[@]}" \
-    "${VARIANT_ARGS[@]}" \
-    --eval-action-mode "$EVAL_MODE" \
-    --condition-index "$CONDITION_INDEX" \
-    --composition-spaces "$COMPOSITION_SPACE" \
-    --scratch-seeds "${SCRATCH_SEEDS[@]}" \
-    --scratch-save-root "$SCRATCH_MODE_ROOT/models" \
-    --save-root "$RUN_ROOT/agents" \
-    --runs-root "$RUN_ROOT/runs" \
-    --plots-root "$RUN_ROOT/plots" \
-    --analysis-root "$RUN_ROOT/analysis"
+if [[ "$MODE" == "--worker" ]]; then
+    # Training outputs (agents/runs/analysis) stay in the exact canonical RUN_ROOT
+    # and are already seed-scoped by run_continual_benchmark.py. Only temporary
+    # worker plots are isolated to avoid concurrent writes; canonical plots and
+    # mean/std metrics are produced later by --aggregate.
+    WORKER_PLOTS_ROOT="${TMPDIR:-/tmp}/ethos_${SLURM_JOB_ID:-$$}_${VARIANT}_${EVAL_MODE}_seed${SEED}_plots"
+    mkdir -p "$WORKER_PLOTS_ROOT"
 
-echo "============================================================"
-echo "[done] $VARIANT / $EVAL_MODE"
-echo "[done] survey metrics: $RUN_ROOT/plots/halfcheetah_wind_vel/survey_metrics.csv"
-echo "[done] plots: $RUN_ROOT/plots"
-echo "============================================================"
+    run_in_container python -u "$REPO_DIR/run_continual_benchmark.py" \
+        "${COMMON_ARGS[@]}" \
+        "${VARIANT_ARGS[@]}" \
+        --seeds "$SEED" \
+        --skip-retention \
+        --skip-survey-metrics \
+        --eval-action-mode "$EVAL_MODE" \
+        --condition-index "$CONDITION_INDEX" \
+        --composition-spaces "$COMPOSITION_SPACE" \
+        --scratch-seeds "${SCRATCH_SEEDS[@]}" \
+        --scratch-save-root "$SCRATCH_MODE_ROOT/models" \
+        --save-root "$RUN_ROOT/agents" \
+        --runs-root "$RUN_ROOT/runs" \
+        --plots-root "$WORKER_PLOTS_ROOT" \
+        --analysis-root "$RUN_ROOT/analysis"
+
+    echo "============================================================"
+    echo "[done] $VARIANT / $EVAL_MODE / seed $SEED"
+    echo "[done] checkpoints: $RUN_ROOT/agents"
+    echo "[done] training logs: $RUN_ROOT/runs"
+    echo "[next] after all seeds finish: bash $REPO_DIR/job.sh --aggregate${COMMENT:+ --comment $COMMENT}"
+    echo "============================================================"
+else
+    run_in_container python -u "$REPO_DIR/run_continual_benchmark.py" \
+        "${COMMON_ARGS[@]}" \
+        "${VARIANT_ARGS[@]}" \
+        --skip-training \
+        --seeds "${MAIN_SEEDS[@]}" \
+        --eval-action-mode "$EVAL_MODE" \
+        --condition-index "$CONDITION_INDEX" \
+        --composition-spaces "$COMPOSITION_SPACE" \
+        --scratch-seeds "${SCRATCH_SEEDS[@]}" \
+        --scratch-save-root "$SCRATCH_MODE_ROOT/models" \
+        --save-root "$RUN_ROOT/agents" \
+        --runs-root "$RUN_ROOT/runs" \
+        --plots-root "$RUN_ROOT/plots" \
+        --analysis-root "$RUN_ROOT/analysis"
+
+    echo "============================================================"
+    echo "[done aggregate] $VARIANT / $EVAL_MODE / seeds ${MAIN_SEEDS[*]}"
+    echo "[done aggregate] survey metrics: $RUN_ROOT/plots/halfcheetah_wind_vel/survey_metrics.csv"
+    echo "[done aggregate] plots: $RUN_ROOT/plots"
+    echo "============================================================"
+fi
