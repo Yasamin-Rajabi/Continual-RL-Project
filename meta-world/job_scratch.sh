@@ -3,8 +3,8 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=8G
-#SBATCH --time=36:00:00
+#SBATCH --mem=16G
+#SBATCH --time=48:00:00
 #SBATCH --gres=gpu:1
 #SBATCH --partition=h100
 #SBATCH --qos=normal
@@ -22,7 +22,7 @@ cd "$REPO_DIR"
 PROJECT_ROOT="${PROJECT_ROOT:-$HOME/Cont/Continual-RL-Project}"
 IMAGE="${ETHOS_IMAGE:-$HOME/containers/ethos_crl_torch280_mj237.sif}"
 BASE_STORAGE="${BASE_STORAGE:-$PROJECT_ROOT/crl_experiments}"
-EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-$BASE_STORAGE/ethos_student_walker2d_150k}"
+EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-$BASE_STORAGE/ethos_student_metaworld_paper10_500k}"
 LOG_ROOT="$EXPERIMENT_ROOT/logs"
 SCRATCH_ROOT_BASE="$EXPERIMENT_ROOT/scratch"
 SCRATCH_SEEDS=(101 102 103)
@@ -106,19 +106,19 @@ if [[ ! -f scratch_baselines.py ]]; then
 fi
 
 SCRATCH_ARGS=(
-    --task-suites walker2d_dynamics
+    --task-suites mw_paper10
     --seeds 1 2 3
-    --total-timesteps 150000
-    --pool-size 5
-    --batch-size 256
-    --policy-lr 3e-4
+    --total-timesteps 500000
+    --pool-size 8
+    --batch-size 128
+    --policy-lr 1e-3
     --alpha-lr 5e-3
     --alpha-mass-reg 0.05
     --alpha-warmup-steps 5000
     --alpha-entropy-reg 0.01
     --drift-reg 1.0
     --distill-encoder-lr-mult 0.1
-    --q-lr 3e-4
+    --q-lr 1e-3
     --gamma 0.99
     --tau 0.005
     --alpha 0.2
@@ -126,10 +126,10 @@ SCRATCH_ARGS=(
     --autotune-init-from-alpha
     --learning-starts 5000
     --random-actions-end 5000
-    --eval-every 5000
+    --eval-every 10000
     --num-evals 5
     --no-distill-observation-skip
-    --distill-buffer-steps 5000
+    --distill-buffer-steps 10000
     --similarity-samples 2048
     --max-distill-buffer 50000
     --distill-max-samples 20000
@@ -150,7 +150,7 @@ if [[ "$MODE" != "--worker" ]]; then
     mkdir -p "$LOG_ROOT" "$SCRATCH_ROOT_BASE"
     SCRIPT_PATH="$(realpath "$0")"
     echo "============================================================"
-    echo "Submitting Walker2D FT scratch baselines"
+    echo "Submitting MetaWorld paper10 FT scratch baselines"
     echo "Modes: ${EVAL_MODES[*]}"
     echo "Scratch seeds: ${SCRATCH_SEEDS[*]}"
     echo "Container: $IMAGE"
@@ -191,10 +191,10 @@ prepare_container_runtime
 verify_container_runtime
 
 echo "============================================================"
-echo "[scratch] environment: Walker2D"
+echo "[scratch] environment: MetaWorld paper10"
 echo "[scratch] mode:        $EVAL_MODE"
 echo "[scratch] seed:        $SCRATCH_SEED"
-echo "[scratch] suite:       walker2d_dynamics"
+echo "[scratch] suite:       mw_paper10"
 echo "[scratch] root:        $SCRATCH_MODE_ROOT"
 echo "[scratch] container:   $IMAGE"
 echo "============================================================"

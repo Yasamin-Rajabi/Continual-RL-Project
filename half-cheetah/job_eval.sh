@@ -52,7 +52,7 @@ fi
 cd "$REPO_DIR"
 
 PROJECT_ROOT="${PROJECT_ROOT:-$HOME/Cont/Continual-RL-Project}"
-IMAGE="${ETHOS_IMAGE:-$HOME/containers/ethos_crl_torch280.sif}"
+IMAGE="${ETHOS_IMAGE:-$HOME/containers/ethos_crl_torch280_mj237.sif}"
 BASE_STORAGE="${BASE_STORAGE:-$PROJECT_ROOT/crl_experiments}"
 EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-$BASE_STORAGE/ethos_student_halfcheetah_windvel_80k}"
 LOG_ROOT="$EXPERIMENT_ROOT/logs"

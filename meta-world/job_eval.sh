@@ -3,12 +3,11 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=8G
-#SBATCH --time=24:00:00
+#SBATCH --mem=16G
+#SBATCH --time=48:00:00
 #SBATCH --gres=gpu:1
 #SBATCH --partition=h100
 #SBATCH --qos=normal
-#SBATCH --exclude=kh023
 
 set -euo pipefail
 
@@ -55,12 +54,11 @@ cd "$REPO_DIR"
 PROJECT_ROOT="${PROJECT_ROOT:-$HOME/Cont/Continual-RL-Project}"
 IMAGE="${ETHOS_IMAGE:-$HOME/containers/ethos_crl_torch280_mj237.sif}"
 BASE_STORAGE="${BASE_STORAGE:-$PROJECT_ROOT/crl_experiments}"
-EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-$BASE_STORAGE/ethos_student_halfcheetah_windvel_80k}"
+EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-$BASE_STORAGE/ethos_student_metaworld_paper10_500k}"
 LOG_ROOT="$EXPERIMENT_ROOT/logs"
 SCRATCH_ROOT_BASE="$EXPERIMENT_ROOT/scratch"
 SCRATCH_SEEDS=(101 102 103)
-# EVAL_MODES=(deterministic stochastic)
-EVAL_MODES=(deterministic)
+EVAL_MODES=(deterministic stochastic)
 
 clean_host_python_env() {
     if [[ -n "${VIRTUAL_ENV:-}" ]]; then
@@ -143,25 +141,24 @@ if [[ ! -f sanity_check_pool.py ]]; then
     exit 2
 fi
 
-# VARIANTS=(baseline combined combined_policy combined_policy_student)
-VARIANTS=(combined_policy combined_policy_student)
+VARIANTS=(baseline combined combined_policy combined_policy_student)
 
 COMMON_ARGS=(
-    --task-suites halfcheetah_wind_vel
+    --skip-training
+    --task-suites mw_paper10
     --seeds 1 2 3
-    --total-timesteps 80000
-    --pool-size 5
-    --batch-size 256
-    --policy-lr 3e-4
+    --total-timesteps 500000
+    --pool-size 8
+    --batch-size 128
+    --policy-lr 1e-3
     --alpha-lr 5e-3
-    # --alpha-mass-lr 5e-3
-    --alpha-mass-reg 0.0
-    # --alpha-mass-reg 0.05
+    --alpha-mass-lr 5e-3
+    --alpha-mass-reg 0.05
     --alpha-warmup-steps 5000
     --alpha-entropy-reg 0.01
     --drift-reg 1.0
     --distill-encoder-lr-mult 0.1
-    --q-lr 3e-4
+    --q-lr 1e-3
     --gamma 0.99
     --tau 0.005
     --alpha 0.2
@@ -169,16 +166,15 @@ COMMON_ARGS=(
     --autotune-init-from-alpha
     --learning-starts 5000
     --random-actions-end 5000
-    --eval-every 5000
+    --eval-every 10000
     --num-evals 5
     --retention-eval-episodes 5
     --test-adapt-steps 5000
     --frozen-eval-policy pool
     --no-distill-observation-skip
-    --distill-buffer-steps 5000
+    --distill-buffer-steps 10000
     --similarity-samples 2048
     --no-balance-source-lineages
-    # --balance-source-lineages
     --max-distill-buffer 50000
     --distill-max-samples 20000
     --distill-epochs 16
@@ -222,11 +218,12 @@ if [[ "$MODE" != "--worker" ]]; then
     mkdir -p "$LOG_ROOT" "$EXPERIMENT_ROOT/main"
     SCRIPT_PATH="$(realpath "$0")"
     echo "============================================================"
-    echo "Submitting HalfCheetah-WindVel main runs"
+    echo "Submitting MetaWorld paper10 main runs"
     echo "Methods: ${VARIANTS[*]}"
     echo "Modes: ${EVAL_MODES[*]}"
     echo "Comment: ${COMMENT:-<none>}"
     echo "FT: enabled"
+    echo "Training: DISABLED (--skip-training); existing checkpoints only"
     echo "Container: $IMAGE"
     echo "============================================================"
 
@@ -235,8 +232,8 @@ if [[ "$MODE" != "--worker" ]]; then
             job_id="$(
                 sbatch --parsable \
                     --job-name="causal" \
-                    --output="$LOG_ROOT/${variant}_${mode}${COMMENT_SUFFIX}_%j.out" \
-                    --error="$LOG_ROOT/${variant}_${mode}${COMMENT_SUFFIX}_%j.err" \
+                    --output="$LOG_ROOT/eval_${variant}_${mode}${COMMENT_SUFFIX}_%j.out" \
+                    --error="$LOG_ROOT/eval_${variant}_${mode}${COMMENT_SUFFIX}_%j.err" \
                     "$SCRIPT_PATH" --worker "$variant" "$mode" "$COMMENT"
             )"
             job_id="${job_id%%;*}"
@@ -289,7 +286,7 @@ case "$VARIANT" in
 esac
 
 echo "============================================================"
-echo "[main] environment:  HalfCheetah-WindVel"
+echo "[main] environment:  MetaWorld paper10"
 echo "[main] variant:      $VARIANT"
 echo "[main] evaluation:   $EVAL_MODE"
 echo "[main] comment:      ${COMMENT:-<none>}"
@@ -317,6 +314,6 @@ run_in_container python -u "$REPO_DIR/run_continual_benchmark.py" \
 
 echo "============================================================"
 echo "[done] $VARIANT / $EVAL_MODE"
-echo "[done] survey metrics: $RUN_ROOT/plots/halfcheetah_wind_vel/survey_metrics.csv"
+echo "[done] survey metrics: $RUN_ROOT/plots/mw_paper10/survey_metrics.csv"
 echo "[done] plots: $RUN_ROOT/plots"
 echo "============================================================"
