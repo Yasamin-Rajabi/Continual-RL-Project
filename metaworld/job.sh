@@ -69,7 +69,7 @@ LOG_ROOT="$EXPERIMENT_ROOT/logs"
 SCRATCH_ROOT_BASE="$EXPERIMENT_ROOT/scratch"
 SCRATCH_SEEDS=(101 102 103)
 MAIN_SEEDS=(1 2 3)
-EVAL_MODES=(deterministic stochastic)
+EVAL_MODES=(deterministic)
 
 clean_host_python_env() {
     if [[ -n "${VIRTUAL_ENV:-}" ]]; then
@@ -152,7 +152,8 @@ if [[ ! -f sanity_check_pool.py ]]; then
     exit 2
 fi
 
-VARIANTS=(baseline combined combined_policy combined_policy_student)
+# VARIANTS=(baseline combined_policy)
+VARIANTS=(combined_policy)
 
 COMMON_ARGS=(
     --task-suites mw_paper10
@@ -162,8 +163,8 @@ COMMON_ARGS=(
     --policy-lr 1e-3
     --alpha-lr 5e-3
     --alpha-mass-lr 5e-3
-    --alpha-mass-reg 0.05
-    --alpha-warmup-steps 5000
+    --alpha-mass-reg 0.0
+    --alpha-warmup-steps 10000
     --alpha-entropy-reg 0.01
     --drift-reg 1.0
     --distill-encoder-lr-mult 0.1
@@ -173,20 +174,20 @@ COMMON_ARGS=(
     --alpha 0.2
     --autotune
     --autotune-init-from-alpha
-    --learning-starts 5000
-    --random-actions-end 5000
+    --learning-starts 10000
+    --random-actions-end 10000
     --eval-every 10000
     --num-evals 5
     --retention-eval-episodes 5
-    --test-adapt-steps 5000
+    --test-adapt-steps 10000
     --frozen-eval-policy pool
     --no-distill-observation-skip
-    --distill-buffer-steps 10000
-    --similarity-samples 2048
-    --no-balance-source-lineages
-    --max-distill-buffer 50000
-    --distill-max-samples 20000
-    --distill-epochs 16
+    --distill-buffer-steps 20000
+    --similarity-samples 4096
+    --balance-source-lineages
+    --max-distill-buffer 100000
+    --distill-max-samples 40000
+    --distill-epochs 32
     --distill-lr 5e-4
     --distill-batch-size 256
     --distill-test-frac 0.2
@@ -216,9 +217,7 @@ variant_mapping() {
     local variant="$1"
     case "$variant" in
         baseline)                echo "1 parameter" ;;
-        combined)                echo "4 parameter" ;;
         combined_policy)         echo "4 policy" ;;
-        combined_policy_student) echo "4 policy" ;;
         *) return 1 ;;
     esac
 }

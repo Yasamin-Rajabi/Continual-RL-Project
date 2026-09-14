@@ -23,3 +23,29 @@ apptainer exec \
     --logdir "$ROOT" \
     --host 0.0.0.0 \
     --port 6006
+
+
+Run:
+
+bash job.sh --aggregate
+
+or, if you trained with a comment:
+
+bash job.sh --aggregate --comment am0_lineage
+
+This submits an evaluation-only aggregation job that uses:
+seed 1
+seed 2
+seed 3
+
+bash job_scratch.sh
+
+# wait
+
+bash job.sh --comment myrun
+
+# wait for all seed jobs
+
+bash job.sh --aggregate --comment myrun
+
+After the aggregate job finishes, your existing collect_paper_metrics.py can read the results normally. 
