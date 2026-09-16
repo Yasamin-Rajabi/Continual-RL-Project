@@ -145,6 +145,7 @@ VARIANTS=(baseline combined combined_policy combined_policy_student)
 
 COMMON_ARGS=(
     --skip-training
+    --skip-invalid-seeds
     --task-suites mw_paper10
     --seeds 1 2 3
     --total-timesteps 500000

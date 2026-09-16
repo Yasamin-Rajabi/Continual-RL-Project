@@ -139,6 +139,10 @@ def parse_args():
     p.add_argument("--plots-root", default="plots_walker2d_continual")
     p.add_argument("--analysis-root", default="analysis_runs")
     p.add_argument("--skip-training", action="store_true")
+    p.add_argument(
+        "--skip-invalid-seeds", action="store_true",
+        help="With --skip-training, skip seeds whose checkpoint chain is missing, stale, or unreadable instead of aborting aggregation.",
+    )
     p.add_argument("--skip-retention", action="store_true")
     p.add_argument("--skip-survey-metrics", action="store_true")
     p.add_argument(
@@ -486,41 +490,126 @@ def main():
     print(f"Conditions: {conditions}")
 
     requested_sequence = args.task_sequence
+    requested_seeds = list(args.seeds)
     for suite in args.task_suites:
         from tasks import DEFAULT_CONTINUAL_SEQUENCE
         import tasks as task_definitions
         suite_default = (task_definitions.default_sequence(suite) if hasattr(task_definitions, "default_sequence")
                          else DEFAULT_CONTINUAL_SEQUENCE)
         args.task_sequence = list(requested_sequence if requested_sequence is not None else suite_default)
+        args.seeds = list(requested_seeds)
         print(f"\n================ {suite} ================")
-        for condition, cfg in selected_conditions.items():
-            for seed in args.seeds:
-                train_chain(args, suite, condition, cfg, seed)
+
+        # During evaluation-only aggregation, optionally validate each complete
+        # continual seed independently.  A failed/partial seed is excluded from
+        # the aggregate instead of aborting the good seeds.  Normal training and
+        # strict --skip-training behavior are unchanged unless the explicit
+        # --skip-invalid-seeds flag is present.
+        if args.skip_training and args.skip_invalid_seeds:
+            valid_seeds = []
+            invalid_seed_reasons = {}
+            for seed in requested_seeds:
+                try:
+                    for condition, cfg in selected_conditions.items():
+                        train_chain(args, suite, condition, cfg, seed)
+                except Exception as exc:
+                    invalid_seed_reasons[seed] = f"{type(exc).__name__}: {exc}"
+                    print(
+                        f"[skip-invalid-seeds] skipping {suite} seed {seed}: "
+                        f"{invalid_seed_reasons[seed]}",
+                        file=sys.stderr,
+                    )
+                    continue
+                valid_seeds.append(seed)
+
+            if not valid_seeds:
+                details = "; ".join(
+                    f"seed {seed}: {reason}" for seed, reason in invalid_seed_reasons.items()
+                )
+                raise RuntimeError(
+                    f"No valid seeds remain for {suite} after checkpoint validation. {details}"
+                )
+            args.seeds = valid_seeds
+            print(f"[skip-invalid-seeds] checkpoint-valid seeds for {suite}: {args.seeds}")
+        else:
+            for condition, cfg in selected_conditions.items():
+                for seed in args.seeds:
+                    train_chain(args, suite, condition, cfg, seed)
 
         plots.plot_training_metrics(args, suite, conditions)
         plots.plot_sequence_diagnostics(args, suite, conditions)
         plots.plot_merge_lineage(args, suite, conditions)
         plots.plot_zero_shot(args, suite, conditions)
 
-        if not args.skip_retention:
+        if args.skip_training and args.skip_invalid_seeds:
+            # Evaluate each seed transactionally: a seed contributes to the
+            # aggregate only if every requested metric can be computed for every
+            # selected condition.  This also catches unreadable/corrupt .pt files
+            # that may pass the lightweight manifest/file-existence checks above.
             all_payloads = {condition: [] for condition in conditions}
-            for condition in conditions:
-                for seed in args.seeds:
-                    all_payloads[condition].append(
-                        metrics.build_retention_matrix(args, suite, condition, seed, device)
-                    )
-            plots.plot_retention(args, suite, conditions, all_payloads)
-            plots.write_summary_csv(args, suite, conditions, all_payloads)
-
-        if not args.skip_survey_metrics:
             survey_payloads = {condition: [] for condition in conditions}
-            for condition in conditions:
-                for seed in args.seeds:
-                    survey_payloads[condition].append(metrics.compute_survey_metrics(
-                        args, suite, condition, seed, device,
-                        args.scratch_seeds, args.total_timesteps))
-            plots.plot_survey_metrics(args, suite, conditions, survey_payloads)
-            plots.write_survey_metrics_csv(args, suite, conditions, survey_payloads)
+            metric_valid_seeds = []
+            for seed in list(args.seeds):
+                seed_retention = {}
+                seed_survey = {}
+                try:
+                    for condition in conditions:
+                        if not args.skip_retention:
+                            seed_retention[condition] = metrics.build_retention_matrix(
+                                args, suite, condition, seed, device
+                            )
+                        if not args.skip_survey_metrics:
+                            seed_survey[condition] = metrics.compute_survey_metrics(
+                                args, suite, condition, seed, device,
+                                args.scratch_seeds, args.total_timesteps
+                            )
+                except Exception as exc:
+                    print(
+                        f"[skip-invalid-seeds] skipping {suite} seed {seed} during metric "
+                        f"evaluation: {type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
+                    continue
+
+                metric_valid_seeds.append(seed)
+                for condition, payload in seed_retention.items():
+                    all_payloads[condition].append(payload)
+                for condition, payload in seed_survey.items():
+                    survey_payloads[condition].append(payload)
+
+            if not metric_valid_seeds:
+                raise RuntimeError(
+                    f"No valid seeds remain for {suite} after metric evaluation."
+                )
+            args.seeds = metric_valid_seeds
+            print(f"[skip-invalid-seeds] aggregate seeds for {suite}: {args.seeds}")
+
+            if not args.skip_retention:
+                plots.plot_retention(args, suite, conditions, all_payloads)
+                plots.write_summary_csv(args, suite, conditions, all_payloads)
+            if not args.skip_survey_metrics:
+                plots.plot_survey_metrics(args, suite, conditions, survey_payloads)
+                plots.write_survey_metrics_csv(args, suite, conditions, survey_payloads)
+        else:
+            if not args.skip_retention:
+                all_payloads = {condition: [] for condition in conditions}
+                for condition in conditions:
+                    for seed in args.seeds:
+                        all_payloads[condition].append(
+                            metrics.build_retention_matrix(args, suite, condition, seed, device)
+                        )
+                plots.plot_retention(args, suite, conditions, all_payloads)
+                plots.write_summary_csv(args, suite, conditions, all_payloads)
+
+            if not args.skip_survey_metrics:
+                survey_payloads = {condition: [] for condition in conditions}
+                for condition in conditions:
+                    for seed in args.seeds:
+                        survey_payloads[condition].append(metrics.compute_survey_metrics(
+                            args, suite, condition, seed, device,
+                            args.scratch_seeds, args.total_timesteps))
+                plots.plot_survey_metrics(args, suite, conditions, survey_payloads)
+                plots.write_survey_metrics_csv(args, suite, conditions, survey_payloads)
 
     print(f"\nDone. Plots and cached metrics: {args.plots_root}")
 

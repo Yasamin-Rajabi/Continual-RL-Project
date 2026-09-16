@@ -408,6 +408,7 @@ else
         "${COMMON_ARGS[@]}" \
         "${VARIANT_ARGS[@]}" \
         --skip-training \
+        --skip-invalid-seeds \
         --seeds "${MAIN_SEEDS[@]}" \
         --eval-action-mode "$EVAL_MODE" \
         --condition-index "$CONDITION_INDEX" \
