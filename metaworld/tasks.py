@@ -106,7 +106,18 @@ _SMOKE2: Tuple[MetaWorldTask, ...] = (
     MetaWorldTask("drawer-close-v2", "easy", "smoke only"),
 )
 
+_PAPER10 = tuple(MetaWorldTask(name, "paper", "CKA-RL appendix C.1 task list") for name in (
+    "hammer-v2", "push-wall-v2", "faucet-close-v2", "push-back-v2", "stick-pull-v2",
+    "handle-press-side-v2", "push-v2", "shelf-place-v2", "window-close-v2", "peg-unplug-side-v2",
+))
+_LEGACY7 = tuple(MetaWorldTask(name, "legacy", "Original meta-world folder task list") for name in (
+    "hammer-v2", "faucet-close-v2", "stick-pull-v2", "handle-press-side-v2", "push-v2",
+    "window-close-v2", "peg-unplug-side-v2",
+))
+
 TASK_SUITES: Dict[str, List[MetaWorldTask]] = {
+    "mw_paper10": list(_PAPER10),
+    "mw_legacy7": list(_LEGACY7),
     "mw_easy4": list(_EASY4),
     "mw_easy6": list(_EASY6),
     "mw_smoke2": list(_SMOKE2),
@@ -119,6 +130,8 @@ EASY6_CONTINUAL_SEQUENCE = (0, 2, 3, 1, 4, 5, 0, 3, 2, 5, 1, 4)
 SMOKE_CONTINUAL_SEQUENCE = (0, 1, 0)
 
 SEQUENCES = {
+    "mw_paper10": tuple(range(10)) * 2,
+    "mw_legacy7": tuple(range(7)) * 2 + (1, 3, 5),
     "mw_easy4": DEFAULT_CONTINUAL_SEQUENCE,
     "mw_easy6": EASY6_CONTINUAL_SEQUENCE,
     "mw_smoke2": SMOKE_CONTINUAL_SEQUENCE,
@@ -154,7 +167,8 @@ def get_task(task_id: int, task_suite: str = "mw_easy4", render: bool = False):
     spec = get_task_spec(task_id, task_suite)
     # task_id, not a random seed: with frozen goal placements the seed IS the
     # task, so train and eval envs must agree. See metaworld_envs.
-    return make_env(spec.name, task_id=task_id, render=render)
+    return make_env(spec.name, task_id=task_id, render=render,
+                    freeze_goal=task_suite not in ("mw_paper10", "mw_legacy7"))
 
 
 if __name__ == "__main__":

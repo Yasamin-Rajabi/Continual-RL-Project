@@ -1,33 +1,7 @@
-"""Walker2D target-velocity tasks under deterministic dynamics perturbations.
+"""Walker2D dynamics environments without appended task/context observations.
 
-This module is the Walker2D analogue of ``halfcheetah_envs.py``.  The continual
-shift is deliberately in the *dynamics*, while every task keeps the same control
-objective: remain upright and track the same forward target velocity.  That makes
-policy consolidation the main source of difficulty instead of changing the
-meaning of the reward from task to task.
-
-Reward used by every task::
-
-    reward = healthy_reward - |v_x - target_velocity| - ctrl_cost
-
-The underlying Walker2d-v5 health definition and termination rule are preserved.
-The task changes only model parameters after Gymnasium constructs the canonical
-Walker2d-v5 MuJoCo model:
-
-- right-leg body masses
-- left-leg body masses
-- foot sliding friction
-- damping on the six actuated joints
-- actuator gear (motor strength)
-
-``tasks.get_task`` wraps the raw env with ``TaskConditionedObservationWrapper``
-so both actor and critic receive a six-dimensional task vector:
-
-    [target_velocity, right_mass_scale, left_mass_scale,
-     foot_friction_scale, joint_damping_scale, actuator_strength_scale]
-
-Walker2d-v5 has a 17-D raw observation and 6-D action space, therefore the
-benchmark uses a 23-D conditioned observation and 6-D action space.
+The legacy task-observation wrapper remains as an identity adapter for import
+compatibility. get_task and encoder pretraining do not apply task conditioning.
 """
 from __future__ import annotations
 
@@ -234,54 +208,24 @@ class Walker2dDynamicsEnv(Walker2dEnv):
 
 
 def make_task_specific_observation(task, observation: np.ndarray) -> np.ndarray:
-    """Append the task/dynamics vector to one observation or an observation batch."""
-    observation = np.asarray(observation)
-    task_vec = np.asarray(
-        [
-            task.target_velocity,
-            task.right_mass_scale,
-            task.left_mass_scale,
-            task.foot_friction_scale,
-            task.joint_damping_scale,
-            task.actuator_strength_scale,
-        ],
-        dtype=observation.dtype,
-    )
-    if observation.ndim == 1:
-        return np.concatenate([observation, task_vec], axis=-1)
-    task_vec = np.broadcast_to(
-        task_vec, observation.shape[:-1] + (TASK_VECTOR_DIM,)
-    )
-    return np.concatenate([observation, task_vec], axis=-1)
+    """Legacy compatibility helper. Task concatenation is disabled."""
+    del task
+    # Previously: np.concatenate([observation, task_vec], axis=-1).
+    return np.asarray(observation)
 
 
 _ObservationWrapperBase = gym.ObservationWrapper if gym is not None else object
 
 
 class TaskConditionedObservationWrapper(_ObservationWrapperBase):
-    """Append the six-dimensional Walker2D task vector on reset() and step()."""
+    """Deprecated identity wrapper; it never appends task parameters."""
 
     def __init__(self, env, task):
         if _IMPORT_ERROR is not None:
-            raise ImportError(
-                "Walker2D tasks require gymnasium[mujoco] and mujoco. "
-                "Install requirements.txt first."
-            ) from _IMPORT_ERROR
+            raise ImportError("Install gymnasium[mujoco] and mujoco") from _IMPORT_ERROR
         super().__init__(env)
-        self.task = task
-        low = np.concatenate(
-            [
-                np.asarray(self.observation_space.low, dtype=np.float32),
-                np.full(TASK_VECTOR_DIM, -np.inf, dtype=np.float32),
-            ]
-        )
-        high = np.concatenate(
-            [
-                np.asarray(self.observation_space.high, dtype=np.float32),
-                np.full(TASK_VECTOR_DIM, np.inf, dtype=np.float32),
-            ]
-        )
-        self.observation_space = gym.spaces.Box(low=low, high=high, dtype=np.float32)
+        # Do not store or expose task context. Observation bounds stay raw.
+        del task
 
     def observation(self, observation):
-        return make_task_specific_observation(self.task, observation).astype(np.float32)
+        return np.asarray(observation, dtype=np.float32)

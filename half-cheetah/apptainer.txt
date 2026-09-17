@@ -1,0 +1,51 @@
+IMAGE="$HOME/containers/ethos_crl_torch280.sif"
+PROJECT_ROOT="$HOME/Cont/Continual-RL-Project"
+ROOT="$PROJECT_ROOT/crl_experiments/ethos_student_halfcheetah_windvel_80k"
+
+APPTAINERENV_PYTHONNOUSERSITE=1 \
+apptainer exec \
+  --bind "$PROJECT_ROOT:$PROJECT_ROOT" \
+  "$IMAGE" \
+  python "$PROJECT_ROOT/collect_paper_metrics.py" \
+    --experiment-root "$ROOT" \
+    --suite halfcheetah_wind_vel \
+    --eval-mode deterministic
+
+
+IMAGE="$HOME/containers/ethos_crl_torch280.sif"
+ROOT="$HOME/Cont/Continual-RL-Project/crl_experiments/ethos_student_halfcheetah_windvel_80k"
+
+APPTAINERENV_PYTHONNOUSERSITE=1 \
+apptainer exec \
+  --bind "$HOME:$HOME" \
+  "$IMAGE" \
+  tensorboard \
+    --logdir "$ROOT" \
+    --host 0.0.0.0 \
+    --port 6006
+
+
+Run:
+
+bash job.sh --aggregate
+
+or, if you trained with a comment:
+
+bash job.sh --aggregate --comment am0_lineage
+
+This submits an evaluation-only aggregation job that uses:
+seed 1
+seed 2
+seed 3
+
+bash job_scratch.sh
+
+# wait
+
+bash job.sh --comment myrun
+
+# wait for all seed jobs
+
+bash job.sh --aggregate --comment myrun
+
+After the aggregate job finishes, your existing collect_paper_metrics.py can read the results normally. 

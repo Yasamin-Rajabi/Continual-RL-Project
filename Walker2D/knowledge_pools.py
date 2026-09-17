@@ -20,6 +20,70 @@ BASE_FUSION_MODE = "classic_cka"
 _HEAD_KEYS = ("l0_weight", "l0_bias", "l2_weight", "l2_bias")
 
 
+def balanced_lineage_indices(source_ids, max_rows: int):
+    """Sample up to ``max_rows`` indices as evenly as possible by source lineage.
+
+    ``source_ids`` are unique continual-sequence occurrence IDs stored with every
+    retained rollout row.  The allocation is water-filled across lineages: each
+    lineage receives the same quota whenever it has enough rows, and unused quota
+    from small lineages is redistributed across the remaining lineages.  Sampling
+    inside each lineage is uniform without replacement.
+    """
+    source_ids = np.asarray(source_ids).reshape(-1)
+    n_rows = int(source_ids.shape[0])
+    target = min(max(int(max_rows), 0), n_rows)
+    if target == 0:
+        return np.empty((0,), dtype=np.int64)
+
+    unique_ids = np.unique(source_ids)
+    groups = {
+        source_id: np.flatnonzero(source_ids == source_id)
+        for source_id in unique_ids
+    }
+    allocations = {source_id: 0 for source_id in unique_ids}
+    remaining = target
+    active = list(unique_ids)
+
+    # Water-fill quotas across lineages. Randomize tie order so the few remainder
+    # rows do not systematically favor low-valued sequence IDs.
+    while remaining > 0 and active:
+        active = list(np.random.permutation(active))
+        share = remaining // len(active)
+        if share == 0:
+            for source_id in active[:remaining]:
+                allocations[source_id] += 1
+            remaining = 0
+            break
+
+        next_active = []
+        used = 0
+        for source_id in active:
+            capacity = len(groups[source_id]) - allocations[source_id]
+            take = min(capacity, share)
+            allocations[source_id] += take
+            used += take
+            if allocations[source_id] < len(groups[source_id]):
+                next_active.append(source_id)
+        remaining -= used
+        active = next_active
+        if used == 0:
+            break
+
+    chosen = []
+    for source_id in unique_ids:
+        take = allocations[source_id]
+        if take <= 0:
+            continue
+        group = groups[source_id]
+        chosen.append(np.random.choice(group, size=take, replace=False))
+
+    if not chosen:
+        return np.empty((0,), dtype=np.int64)
+    indices = np.concatenate(chosen).astype(np.int64, copy=False)
+    np.random.shuffle(indices)
+    return indices
+
+
 class HeadPool(nn.Module):
     def __init__(
         self,
@@ -44,7 +108,9 @@ class HeadPool(nn.Module):
                 "available with fusion_mode='weight_delta'."
             )
 
-        self.format_version = 2
+        self.format_version = 3
+        self.force_unit_mass = False
+        self.composition_space = "parameter"
         self.head_type = head_type
         self.act_dim = int(act_dim)
         self.hidden_dim = int(hidden_dim)
@@ -108,20 +174,21 @@ class HeadPool(nn.Module):
         self.alpha_scale = alpha_scale
         # alpha_mass is stored as an unconstrained RAW parameter.  Use
         # effective_alpha_mass() whenever it participates in the policy so the
-        # semantic mass is strictly positive while still initializing at 1.0.
+        # semantic mass is bounded to [0, 1] (initialized at 0.95).
         self.alpha_mass = alpha_mass
 
     def effective_alpha_mass(self):
         if self.alpha_mass is None:
             return None
+        if getattr(self, "force_unit_mass", False):
+            return torch.ones_like(self.alpha_mass)
         if not self.constrain_alpha_mass:
             # Legacy/ablation behaviour: the learned scalar may become zero or
             # negative. Kept behind a flag so the stabilization can be isolated.
             return self.alpha_mass
-        # softplus(raw) is strictly positive. Dividing by softplus(1) keeps
-        # raw=1 (the existing initialization) exactly equivalent to mass=1.
-        normalizer = F.softplus(torch.ones_like(self.alpha_mass))
-        return F.softplus(self.alpha_mass) / normalizer
+        # A finite logit keeps the gate differentiable; warmup uses an exact
+        # value of one without setting the parameter to +infinity.
+        return torch.sigmoid(self.alpha_mass)
 
     def _historical(self):
         if not self.pool:
@@ -186,9 +253,9 @@ class HeadPool(nn.Module):
     def inherit_pool_from(self, latest_pool: "HeadPool"):
         if getattr(latest_pool, "format_version", 1) != self.format_version:
             raise RuntimeError(
-                "Checkpoint uses the legacy independent-head pool format. "
-                "Start a fresh continual chain with this version so behavioral-KL "
-                "pair alignment is guaranteed."
+                "Checkpoint predates task-blind observations and sigmoid/policy-space support. "
+                "Start a fresh continual chain with this version; do not reuse older weights. "
+                "Pool alignment and gate semantics must match."
             )
         self.pool = []
         for entry in latest_pool.pool:
@@ -289,12 +356,14 @@ class HeadPool(nn.Module):
         self.last_merge_info = dict(merge_info)
 
     @staticmethod
-    def merge_buffers(buf1, buf2, max_rows: int):
-        """Merge two lineage buffers without letting the larger parent dominate.
+    def merge_buffers(buf1, buf2, max_rows: int, balance_source_lineages: bool = False):
+        """Merge two retained rollout buffers under a fixed row budget.
 
-        If truncation is required, reserve roughly half the budget for each
-        parent and only use spare capacity when one parent is too small. The
-        same sampled row indices are applied to every stored array.
+        Default/legacy behavior balances the two immediate parents.  With
+        ``balance_source_lineages=True``, truncation instead balances the unique
+        ``source_ids`` (continual-sequence occurrences) across both parents.
+        This prevents an already-merged parent from repeatedly halving the
+        representation of its older source lineages.
         """
         if buf1 is None and buf2 is None:
             return None
@@ -313,13 +382,22 @@ class HeadPool(nn.Module):
         if n1 + n2 <= max_rows:
             return {key: np.concatenate([buf1[key], buf2[key]], axis=0) for key in keys}
 
+        if balance_source_lineages:
+            if "source_ids" not in keys:
+                raise RuntimeError(
+                    "--balance-source-lineages requires source_ids in every retained buffer; "
+                    "start the ablation from task 0 rather than an older checkpoint."
+                )
+            combined = {key: np.concatenate([buf1[key], buf2[key]], axis=0) for key in keys}
+            idx = balanced_lineage_indices(combined["source_ids"], max_rows)
+            return {key: combined[key][idx] for key in keys}
+
+        # Legacy behavior: give each immediate parent roughly half the buffer.
         half = max_rows // 2
         take1 = min(n1, half)
         take2 = min(n2, max_rows - take1)
-        # If parent 2 was too small, give its unused budget back to parent 1.
         if take1 + take2 < max_rows:
             take1 = min(n1, take1 + (max_rows - take1 - take2))
-        # If parent 1 was too small, give its unused budget to parent 2.
         if take1 + take2 < max_rows:
             take2 = min(n2, take2 + (max_rows - take1 - take2))
 

@@ -249,3 +249,5 @@ gym_tmp/
 
 # results directories
 _walker2d_*
+
+crl_experiments/

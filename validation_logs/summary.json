@@ -1,0 +1,396 @@
+{
+  "python_syntax": [
+    "half-cheetah/analysis_logging.py",
+    "half-cheetah/checkpoint_evaluation.py",
+    "half-cheetah/cka_rl.py",
+    "half-cheetah/estimate_timing.py",
+    "half-cheetah/experiment_identity.py",
+    "half-cheetah/halfcheetah_envs.py",
+    "half-cheetah/knowledge_pools.py",
+    "half-cheetah/metrics.py",
+    "half-cheetah/plots.py",
+    "half-cheetah/policy_composition.py",
+    "half-cheetah/policy_space.py",
+    "half-cheetah/policy_utils.py",
+    "half-cheetah/run_continual_benchmark.py",
+    "half-cheetah/run_eval_custom.py",
+    "half-cheetah/run_sac.py",
+    "half-cheetah/sanity_check_pool.py",
+    "half-cheetah/scratch_baselines.py",
+    "half-cheetah/shared_arch.py",
+    "half-cheetah/tasks.py",
+    "half-cheetah/td_jepa.py",
+    "half-cheetah/tdjepa_pretrain.py",
+    "half-cheetah/training_protocol.py",
+    "Walker2D/analysis_logging.py",
+    "Walker2D/checkpoint_evaluation.py",
+    "Walker2D/cka_rl.py",
+    "Walker2D/estimate_timing.py",
+    "Walker2D/experiment_identity.py",
+    "Walker2D/knowledge_pools.py",
+    "Walker2D/metrics.py",
+    "Walker2D/plots.py",
+    "Walker2D/policy_composition.py",
+    "Walker2D/policy_space.py",
+    "Walker2D/policy_utils.py",
+    "Walker2D/run_continual_benchmark.py",
+    "Walker2D/run_eval_custom.py",
+    "Walker2D/run_sac.py",
+    "Walker2D/sanity_check_pool.py",
+    "Walker2D/scratch_baselines.py",
+    "Walker2D/shared_arch.py",
+    "Walker2D/tasks.py",
+    "Walker2D/td_jepa.py",
+    "Walker2D/tdjepa_pretrain.py",
+    "Walker2D/training_protocol.py",
+    "Walker2D/walker2d_envs.py",
+    "Walker2D/walker2d_smoke.py",
+    "Hopper/analysis_logging.py",
+    "Hopper/checkpoint_evaluation.py",
+    "Hopper/cka_rl.py",
+    "Hopper/experiment_identity.py",
+    "Hopper/hopper_envs.py",
+    "Hopper/knowledge_pools.py",
+    "Hopper/metrics.py",
+    "Hopper/plots.py",
+    "Hopper/policy_composition.py",
+    "Hopper/policy_space.py",
+    "Hopper/policy_utils.py",
+    "Hopper/run_continual_benchmark.py",
+    "Hopper/run_eval_custom.py",
+    "Hopper/run_sac.py",
+    "Hopper/sanity_check_pool.py",
+    "Hopper/scratch_baselines.py",
+    "Hopper/shared_arch.py",
+    "Hopper/tasks.py",
+    "Hopper/training_protocol.py",
+    "metaworld/analysis_logging.py",
+    "metaworld/checkpoint_evaluation.py",
+    "metaworld/cka_rl.py",
+    "metaworld/estimate_timing.py",
+    "metaworld/experiment_identity.py",
+    "metaworld/knowledge_pools.py",
+    "metaworld/metaworld_envs.py",
+    "metaworld/metrics.py",
+    "metaworld/pilot_check.py",
+    "metaworld/plots.py",
+    "metaworld/policy_composition.py",
+    "metaworld/policy_space.py",
+    "metaworld/policy_utils.py",
+    "metaworld/run_continual_benchmark.py",
+    "metaworld/run_eval_custom.py",
+    "metaworld/run_sac.py",
+    "metaworld/sanity_check_pool.py",
+    "metaworld/scratch_baselines.py",
+    "metaworld/shared_arch.py",
+    "metaworld/tasks.py",
+    "metaworld/td_jepa.py",
+    "metaworld/tdjepa_pretrain.py",
+    "metaworld/training_protocol.py",
+    "meta-world/analysis_logging.py",
+    "meta-world/checkpoint_evaluation.py",
+    "meta-world/cka_rl.py",
+    "meta-world/estimate_timing.py",
+    "meta-world/experiment_identity.py",
+    "meta-world/knowledge_pools.py",
+    "meta-world/metaworld_envs.py",
+    "meta-world/metrics.py",
+    "meta-world/pilot_check.py",
+    "meta-world/plots.py",
+    "meta-world/policy_composition.py",
+    "meta-world/policy_space.py",
+    "meta-world/policy_utils.py",
+    "meta-world/run_continual_benchmark.py",
+    "meta-world/run_eval_custom.py",
+    "meta-world/run_sac.py",
+    "meta-world/sanity_check_pool.py",
+    "meta-world/scratch_baselines.py",
+    "meta-world/shared_arch.py",
+    "meta-world/tasks.py",
+    "meta-world/td_jepa.py",
+    "meta-world/tdjepa_pretrain.py",
+    "meta-world/training_protocol.py",
+    "tests/synthetic_smoke.py",
+    "tests/test_policy_space.py"
+  ],
+  "shell_syntax": [
+    "Hopper/run_comparison.sh",
+    "Walker2D/job.sh",
+    "Walker2D/local_smoke_test.sh",
+    "Walker2D/run_comparison.sh",
+    "Walker2D/run_kaggle.sh",
+    "Walker2D/run_recommended.sh",
+    "ant/run_kaggle.sh",
+    "half-cheetah/job.sh",
+    "half-cheetah/run_comparison.sh",
+    "half-cheetah/run_kaggle.sh",
+    "half-cheetah/run_recommended.sh",
+    "meta-world/run_comparison.sh",
+    "meta-world/run_kaggle.sh",
+    "metaworld/run_comparison.sh",
+    "metaworld/run_kaggle.sh",
+    "minigrid/run_kaggle.sh"
+  ],
+  "unchanged_merge_functions": {
+    "half-cheetah": {
+      "_select_cosine_pair": true,
+      "_select_behavioral_pair": true,
+      "_distill_pair": true
+    },
+    "Walker2D": {
+      "_select_cosine_pair": true,
+      "_select_behavioral_pair": true,
+      "_distill_pair": true
+    },
+    "metaworld": {
+      "_select_cosine_pair": true,
+      "_select_behavioral_pair": true,
+      "_distill_pair": true
+    }
+  },
+  "unit_tests": {
+    "half-cheetah": "12 passed",
+    "Walker2D": "12 passed",
+    "Hopper": "12 passed",
+    "metaworld": "12 passed",
+    "meta-world": "12 passed"
+  },
+  "synthetic": [
+    {
+      "entry": "half-cheetah",
+      "type": "SYNTHETIC adapters, NOT real simulators",
+      "passed": true,
+      "runs": [
+        {
+          "family": "half-cheetah",
+          "condition": "baseline",
+          "trained_tasks": 3,
+          "exact_Delta": 40,
+          "evaluations_checked": 4,
+          "adaptation_checked": true
+        },
+        {
+          "family": "half-cheetah",
+          "condition": "combined",
+          "trained_tasks": 3,
+          "exact_Delta": 40,
+          "evaluations_checked": 4,
+          "adaptation_checked": true
+        },
+        {
+          "family": "half-cheetah",
+          "condition": "baseline_policy",
+          "trained_tasks": 3,
+          "exact_Delta": 40,
+          "evaluations_checked": 4,
+          "adaptation_checked": true
+        },
+        {
+          "family": "half-cheetah",
+          "condition": "combined_policy",
+          "trained_tasks": 3,
+          "exact_Delta": 40,
+          "evaluations_checked": 4,
+          "adaptation_checked": true
+        }
+      ]
+    },
+    {
+      "entry": "Walker2D",
+      "type": "SYNTHETIC adapters, NOT real simulators",
+      "passed": true,
+      "runs": [
+        {
+          "family": "Walker2D",
+          "condition": "baseline",
+          "trained_tasks": 3,
+          "exact_Delta": 40,
+          "evaluations_checked": 4,
+          "adaptation_checked": true
+        },
+        {
+          "family": "Walker2D",
+          "condition": "combined",
+          "trained_tasks": 3,
+          "exact_Delta": 40,
+          "evaluations_checked": 4,
+          "adaptation_checked": true
+        },
+        {
+          "family": "Walker2D",
+          "condition": "baseline_policy",
+          "trained_tasks": 3,
+          "exact_Delta": 40,
+          "evaluations_checked": 4,
+          "adaptation_checked": true
+        },
+        {
+          "family": "Walker2D",
+          "condition": "combined_policy",
+          "trained_tasks": 3,
+          "exact_Delta": 40,
+          "evaluations_checked": 4,
+          "adaptation_checked": true
+        }
+      ]
+    },
+    {
+      "entry": "Hopper",
+      "type": "SYNTHETIC adapters, NOT real simulators",
+      "passed": true,
+      "runs": [
+        {
+          "family": "Hopper",
+          "condition": "baseline",
+          "trained_tasks": 3,
+          "exact_Delta": 40,
+          "evaluations_checked": 4,
+          "adaptation_checked": true
+        },
+        {
+          "family": "Hopper",
+          "condition": "combined",
+          "trained_tasks": 3,
+          "exact_Delta": 40,
+          "evaluations_checked": 4,
+          "adaptation_checked": true
+        },
+        {
+          "family": "Hopper",
+          "condition": "baseline_policy",
+          "trained_tasks": 3,
+          "exact_Delta": 40,
+          "evaluations_checked": 4,
+          "adaptation_checked": true
+        },
+        {
+          "family": "Hopper",
+          "condition": "combined_policy",
+          "trained_tasks": 3,
+          "exact_Delta": 40,
+          "evaluations_checked": 4,
+          "adaptation_checked": true
+        }
+      ]
+    },
+    {
+      "entry": "metaworld",
+      "type": "SYNTHETIC adapters, NOT real simulators",
+      "passed": true,
+      "runs": [
+        {
+          "family": "metaworld",
+          "condition": "baseline",
+          "trained_tasks": 3,
+          "exact_Delta": 40,
+          "evaluations_checked": 4,
+          "adaptation_checked": true
+        },
+        {
+          "family": "metaworld",
+          "condition": "combined",
+          "trained_tasks": 3,
+          "exact_Delta": 40,
+          "evaluations_checked": 4,
+          "adaptation_checked": true
+        },
+        {
+          "family": "metaworld",
+          "condition": "baseline_policy",
+          "trained_tasks": 3,
+          "exact_Delta": 40,
+          "evaluations_checked": 4,
+          "adaptation_checked": true
+        },
+        {
+          "family": "metaworld",
+          "condition": "combined_policy",
+          "trained_tasks": 3,
+          "exact_Delta": 40,
+          "evaluations_checked": 4,
+          "adaptation_checked": true
+        }
+      ]
+    },
+    {
+      "entry": "meta-world",
+      "type": "SYNTHETIC adapters, NOT real simulators",
+      "passed": true,
+      "runs": [
+        {
+          "family": "meta-world",
+          "condition": "baseline",
+          "trained_tasks": 3,
+          "exact_Delta": 40,
+          "evaluations_checked": 4,
+          "adaptation_checked": true
+        },
+        {
+          "family": "meta-world",
+          "condition": "combined",
+          "trained_tasks": 3,
+          "exact_Delta": 40,
+          "evaluations_checked": 4,
+          "adaptation_checked": true
+        },
+        {
+          "family": "meta-world",
+          "condition": "baseline_policy",
+          "trained_tasks": 3,
+          "exact_Delta": 40,
+          "evaluations_checked": 4,
+          "adaptation_checked": true
+        },
+        {
+          "family": "meta-world",
+          "condition": "combined_policy",
+          "trained_tasks": 3,
+          "exact_Delta": 40,
+          "evaluations_checked": 4,
+          "adaptation_checked": true
+        }
+      ]
+    },
+    {
+      "entry": "halfcheetah_wind_vel",
+      "type": "SYNTHETIC adapters, NOT real simulators",
+      "passed": true,
+      "runs": [
+        {
+          "family": "half-cheetah",
+          "condition": "baseline",
+          "trained_tasks": 3,
+          "exact_Delta": 40,
+          "evaluations_checked": 4,
+          "adaptation_checked": true
+        },
+        {
+          "family": "half-cheetah",
+          "condition": "combined",
+          "trained_tasks": 3,
+          "exact_Delta": 40,
+          "evaluations_checked": 4,
+          "adaptation_checked": true
+        },
+        {
+          "family": "half-cheetah",
+          "condition": "baseline_policy",
+          "trained_tasks": 3,
+          "exact_Delta": 40,
+          "evaluations_checked": 4,
+          "adaptation_checked": true
+        },
+        {
+          "family": "half-cheetah",
+          "condition": "combined_policy",
+          "trained_tasks": 3,
+          "exact_Delta": 40,
+          "evaluations_checked": 4,
+          "adaptation_checked": true
+        }
+      ]
+    }
+  ],
+  "real_simulator_tests": "NOT RUN: gymnasium, mujoco, stable-baselines3, tyro, tensorboard and metaworld unavailable; attempted dependency installation failed due network resolution.",
+  "scope": "Algorithm changes limited to requested continuous-control families; shell LF normalization repository-wide."
+}

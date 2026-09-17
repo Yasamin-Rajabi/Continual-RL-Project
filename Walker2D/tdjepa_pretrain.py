@@ -49,7 +49,8 @@ def make_pretrain_env(task: Walker2DTask):
         joint_damping_scale=task.joint_damping_scale,
         actuator_strength_scale=task.actuator_strength_scale,
     )
-    return gym.wrappers.TimeLimit(TaskConditionedObservationWrapper(env, task), max_episode_steps=1000)
+    # No appended dynamics vector during pretraining.
+    return gym.wrappers.TimeLimit(env, max_episode_steps=1000)
 
 
 def collect_transitions(

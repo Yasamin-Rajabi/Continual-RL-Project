@@ -1,4 +1,4 @@
-"""All numeric-metric computation for the continual Walker2D benchmark.
+"""All numeric-metric computation for the continual HalfCheetah benchmark.
 
 Pure computation + JSON caching: reads TensorBoard scalars, evaluates saved
 checkpoints, returns numbers. No matplotlib anywhere in this file -- see
@@ -27,21 +27,14 @@ begin with):
                     repeated task is relearning/savings, not forward transfer.
       FT_success  : the literal survey formula, AUC over test_success in
                     [0,1] vs. a from-scratch baseline's AUC.
-      FT_return   : algebraic reduction of the same formula assuming
-                    r_max=0 (true here: reward = -|v_error| - ctrl_cost is
-                    always <= 0), which cancels the unknown r_min and
-                    reduces to FT_i = 1 - R_i/R_i^b using RAW
-                    charts/test_episodic_return integrals -- no [0,1]
-                    normalization needed. Both p_i,i and p_N,i (for FG/BWT)
-                    are re-evaluated from saved checkpoints with the same test
-                    adaptation protocol and episode seeds. FT learning curves
-                    and their scratch denominators come from TensorBoard logs
-                    that already exist. p_N,i is evaluated once per UNIQUE
-                    task_id against the final checkpoint (not once per
-                    occurrence -- duplicate task_ids share the same environment).
+      FT_return   : (AUC_return - AUC_scratch) / (U - AUC_scratch),
+                    with the suite-specific achievable return upper bound U.
+                    FG/BWT use matching frozen/adapted checkpoint evaluations.
+                    FT comes from monitored active-policy learning curves.
 """
 from __future__ import annotations
 
+import csv
 import json
 import pathlib
 
@@ -144,20 +137,25 @@ def checkpoint_matches(path, expected_mapping, *, parent_dirs=(), pretrained_enc
     )
 
 
-CACHE_SCHEMA_VERSION = 6
+CACHE_SCHEMA_VERSION = 7
+ERROR_KEY = "velocity_error"
+EPISODIC_SUCCESS = False
+RETURN_UPPER_BOUND = 1000.0
 
 
 def _benchmark_cache_config(args):
     """Configuration knobs that materially determine cached metrics."""
     keys = (
+        "composition_spaces", "projection_epochs", "projection_max_samples",
+        "frozen_eval_policy", "eval_action_mode", "skip_forward_transfer",
         "task_sequence", "save_root", "runs_root", "analysis_root",
         "total_timesteps", "learning_starts", "random_actions_end",
-        "batch_size", "policy_lr", "alpha_lr", "alpha_warmup_steps", "alpha_entropy_reg",
+        "batch_size", "policy_lr", "alpha_lr", "alpha_mass_lr", "alpha_warmup_steps", "alpha_entropy_reg",
         "distill_encoder_lr_mult", "q_lr", "gamma", "tau", "alpha",
         "autotune", "autotune_init_from_alpha", "pool_size", "eval_every",
         "num_evals", "test_adapt_steps", "test_adapt_lr", "distill_observation_skip",
         "distill_extra_steps", "collect_cosine_buffers",
-        "max_distill_buffer", "similarity_samples", "distill_max_samples",
+        "max_distill_buffer", "similarity_samples", "balance_source_lineages", "distill_max_samples",
         "distill_epochs", "distill_lr", "distill_batch_size",
         "distill_test_frac", "distill_select_best_val", "train_shared",
         "freeze_root_encoder", "encoder_from_base", "pretrained_encoder",
@@ -171,6 +169,8 @@ def _benchmark_cache_config(args):
         value = getattr(args, key)
         if key == "task_sequence":
             config["sequence"] = list(value)
+        elif key == "alpha_mass_lr" and value is None:
+            config[key] = float(getattr(args, "alpha_lr"))
         elif isinstance(value, pathlib.Path):
             config[key] = str(value)
         else:
@@ -192,7 +192,7 @@ def _scratch_variant(args, condition):
     if _CUSTOM_MODEL_MAP:
         return getattr(args, "scratch_variant", "plain")
     return scratch.variant_for_condition(
-        condition, bool(getattr(args, "distill_observation_skip", True))
+        condition, bool(getattr(args, "distill_observation_skip", False))
     )
 
 
@@ -209,39 +209,70 @@ def _scratch_checkpoint_signatures(args, suite, condition, scratch_seeds, scratc
     return result
 
 
-def _validate_scratch_checkpoints(args, suite, condition, scratch_seeds, scratch_total_timesteps):
-    """Fail fast if FT would use missing or configuration-mismatched baselines.
+def _validate_scratch_checkpoints(
+    args, suite, condition, seed, scratch_seeds, scratch_total_timesteps
+):
+    """Require only that the scratch learning-curve files exist.
 
-    Cache signatures alone prevent stale JSON reuse, but direct metric calls must
-    also reject a baseline trained with different encoder/SAC settings.
+    Forward Transfer consumes saved TensorBoard/CSV learning curves. Do not
+    compare manifests, package/runtime versions, source identity, training
+    configuration, or checkpoint compatibility here. Those checks belong to
+    training/resume, not post-hoc metric computation.
     """
-    # Arbitrary custom-model evaluation cannot reconstruct the training CLI of
-    # externally supplied checkpoints. Keep the normal benchmark strict, but
-    # allow run_eval_custom.py to use user-supplied scratch baselines explicitly.
+    del seed  # FT scratch availability does not depend on the continual seed.
     if _CUSTOM_MODEL_MAP:
         return
-    save_root = getattr(args, "scratch_save_root", scratch.SCRATCH_SAVE_ROOT)
+
     variant = _scratch_variant(args, condition)
-    problems = []
-    for task_id in sorted(set(args.task_sequence)):
-        for seed in scratch_seeds:
-            run_dir = scratch.scratch_checkpoint_dir(
-                save_root, suite, task_id, scratch_total_timesteps, seed, variant
+    missing = []
+
+    for _seq_idx, task_id in _first_unseen_positions(args.task_sequence):
+        for scratch_seed in scratch_seeds:
+            curve_dir = pathlib.Path(scratch.scratch_event_dir(
+                args.runs_root, suite, task_id, scratch_total_timesteps,
+                scratch_seed, variant
+            ))
+            has_curve_file = (curve_dir / "scalars.csv").is_file() or any(
+                curve_dir.glob("events.out.tfevents.*")
             )
-            matches, reason = scratch.checkpoint_matches(
-                run_dir, suite, task_id, scratch_total_timesteps, seed, args, variant
-            )
-            if not matches:
-                problems.append(
-                    f"task {task_id}, seed {seed}: {reason} ({run_dir})"
+            if not has_curve_file:
+                missing.append(
+                    f"task {task_id}, seed {scratch_seed}: no scratch learning-curve "
+                    f"file found ({curve_dir})"
                 )
-    if problems:
-        joined = "\n  - ".join(problems)
+
+    if missing:
+        joined = "\n  - ".join(missing)
         raise RuntimeError(
-            "Forward-transfer scratch baselines are missing or incompatible. "
-            "Retrain them with scratch_baselines.py using the same training/encoder "
-            f"settings as the continual run:\n  - {joined}"
+            "Forward-transfer scratch baselines are missing:\n  - " + joined
         )
+
+def _load_scalar_csv(directory, scalar_tag):
+    """Fallback reader for the scalars.csv mirror written next to TensorBoard."""
+    path = pathlib.Path(directory) / "scalars.csv"
+    if not path.exists():
+        return np.empty(0), np.empty(0)
+    steps, values = [], []
+    try:
+        with path.open(newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if row.get("tag") != scalar_tag:
+                    continue
+                step = row.get("step", "")
+                value = row.get("value", "")
+                if step == "" or value == "":
+                    continue
+                steps.append(float(step))
+                values.append(float(value))
+    except Exception:
+        return np.empty(0), np.empty(0)
+    if not steps:
+        return np.empty(0), np.empty(0)
+    order = np.argsort(np.asarray(steps, dtype=np.float64), kind="stable")
+    return (
+        np.asarray(steps, dtype=np.float64)[order],
+        np.asarray(values, dtype=np.float64)[order],
+    )
 
 
 def load_scalar(directory, scalar_tag):
@@ -253,15 +284,18 @@ def load_scalar(directory, scalar_tag):
             str(directory), size_guidance={event_accumulator.SCALARS: 0}
         )
         ea.Reload()
+        if scalar_tag in ea.Tags().get("scalars", []):
+            events = ea.Scalars(scalar_tag)
+            if events:
+                return (
+                    np.asarray([e.step for e in events], dtype=np.float64),
+                    np.asarray([e.value for e in events], dtype=np.float64),
+                )
     except Exception:
-        return np.empty(0), np.empty(0)
-    if scalar_tag not in ea.Tags().get("scalars", []):
-        return np.empty(0), np.empty(0)
-    events = ea.Scalars(scalar_tag)
-    return (
-        np.asarray([e.step for e in events], dtype=np.float64),
-        np.asarray([e.value for e in events], dtype=np.float64),
-    )
+        pass
+    # TensorBoard remains the primary source. CSV is a byte-simple backup and
+    # makes post-hoc FT robust if an event file is missing/corrupted.
+    return _load_scalar_csv(directory, scalar_tag)
 
 
 def final_scalar(directory, scalar_tag):
@@ -288,163 +322,22 @@ def load_continual_scalar(runs_root, suite, condition, seed, task_sequence, tota
 # Checkpoint evaluation (shared by the full retention matrix below and the
 # cheap diagonal/last-row-only survey metrics further down).
 # ==========================================================================
-def evaluate_checkpoint(run_dir, suite, task_id, episodes, seed, device):
-    env = get_task(task_id, task_suite=suite)
-    policy = FrozenCkaPolicy.load(str(run_dir), map_location=device).to(device)
-    policy.eval()
-    returns, success, velocity_errors = [], [], []
-    for ep in range(episodes):
-        obs, _ = env.reset(seed=seed + 10_000 * task_id + ep)
-        ep_return = 0.0
-        ep_success, ep_error = [], []
-        while True:
-            obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-            with torch.no_grad():
-                mean, _ = policy(obs_t)
-            mid = (env.action_space.high + env.action_space.low) / 2.0
-            scale = (env.action_space.high - env.action_space.low) / 2.0
-            action = np.tanh(mean[0].cpu().numpy()) * scale + mid
-            obs, reward, terminated, truncated, info = env.step(action)
-            ep_return += float(reward)
-            ep_success.append(float(info.get("success", np.nan)))
-            ep_error.append(float(info.get("velocity_error", np.nan)))
-            if terminated or truncated:
-                break
-        returns.append(ep_return)
-        success.append(float(np.nanmean(ep_success)))
-        velocity_errors.append(float(np.nanmean(ep_error)))
-    env.close()
-    return {
-        "return": float(np.mean(returns)),
-        "success": float(np.nanmean(success)),
-        "velocity_error": float(np.nanmean(velocity_errors)),
-    }
+def evaluate_checkpoint(run_dir, suite, task_id, episodes, seed, device, *,
+                        frozen_policy="pool", action_mode="deterministic"):
+    from checkpoint_evaluation import evaluate
+    return evaluate(run_dir, suite, task_id, episodes, seed, device,
+                    frozen_policy=frozen_policy, action_mode=action_mode,
+                    error_key=ERROR_KEY, episodic_success=EPISODIC_SUCCESS)
 
 
-def adapt_and_evaluate_checkpoint(
-    run_dir, suite, task_id, episodes, seed, device, *, adapt_steps=5_000, adapt_lr=1e-2
-):
-    """Evaluate after optional test-time adaptation of knowledge-mixture scalars.
-
-    This integrates the friend's alpha-adaptation evaluator while keeping the
-    adapt_steps=0 evaluates the frozen finalized pool from a uniform mixture. Head/encoder
-    weights stay frozen; only alpha, an enabled learnable alpha-scale, and
-    alpha-mass are adapted.
-    """
-    # Always reconstruct the FINALIZED knowledge pool.  With
-    # adapt_steps == 0 this gives a deterministic frozen finalized-pool
-    # evaluation from the same uniform routing initialization used by the
-    # adaptation protocol, rather than falling back to the pre-finalize
-    # policy_snapshot.pt.
-    run_dir = pathlib.Path(run_dir)
-    required = [run_dir / name for name in ("policy_snapshot.pt", "fc.pt", "mean_pool.pt", "logstd_pool.pt")]
-    if not all(path.exists() for path in required):
-        return evaluate_checkpoint(run_dir, suite, task_id, episodes, seed, device)
-
-    snapshot = torch.load(run_dir / "policy_snapshot.pt", map_location=device, weights_only=False)
-    mean_pool_data = torch.load(run_dir / "mean_pool.pt", map_location="cpu", weights_only=False)
-    fusion_mode = getattr(mean_pool_data, "fusion_mode", "classic_cka")
-    use_alpha_mass = bool(getattr(mean_pool_data, "use_alpha_mass", False))
-    constrain_alpha_mass = bool(getattr(mean_pool_data, "constrain_alpha_mass", True))
-
-    saved_scale = getattr(mean_pool_data, "alpha_scale", None)
-    saved_scale_value = None if saved_scale is None else float(saved_scale.detach().cpu().reshape(-1)[0])
-    saved_scale_trainable = bool(saved_scale is not None and saved_scale.requires_grad)
-    fix_alpha_scale = bool(
-        saved_scale is not None and (not saved_scale_trainable)
-        and saved_scale_value is not None and abs(saved_scale_value - 5.0) < 1e-6
-    )
-    use_alpha_scale = bool(saved_scale_trainable and not fix_alpha_scale)
-
-    from cka_rl import CkaRlAgent
-    # A finalized pool no longer has a semantically valid pre-finalize alpha
-    # vector. Start adaptation deterministically from a uniform mixture instead
-    # of reusing stale/reindexed logits or random initialization.
-    agent = CkaRlAgent(
-        obs_dim=int(snapshot["obs_dim"]),
-        act_dim=int(snapshot["act_dim"]),
-        base_dir=None,
-        latest_dir=str(run_dir),
-        alpha_init="Uniform",
-        fusion_mode=fusion_mode,
-        use_alpha_mass=use_alpha_mass,
-        constrain_alpha_mass=constrain_alpha_mass,
-        use_alpha_scale=use_alpha_scale,
-        fix_alpha_scale=fix_alpha_scale,
-        distillation=bool(snapshot.get("distillation", False)),
-        distill_observation_skip=bool(snapshot.get("distill_observation_skip", True)),
-        encoder_linear_out=bool(snapshot.get("encoder_linear_out", False)),
-        train_shared=False,
-    ).to(device)
-
-    # Remember intended alpha-scale trainability BEFORE freezing everything.
-    adapt_scale = use_alpha_scale
-    for param in agent.parameters():
-        param.requires_grad_(False)
-
-    adapt_params = []
-    if agent.alpha is not None and agent.alpha.numel() > 1:
-        agent.alpha.requires_grad_(True)
-        adapt_params.append(agent.alpha)
-    if adapt_scale and agent.alpha_scale is not None:
-        agent.alpha_scale.requires_grad_(True)
-        adapt_params.append(agent.alpha_scale)
-    if use_alpha_mass and agent.alpha_mass is not None:
-        agent.alpha_mass.requires_grad_(True)
-        adapt_params.append(agent.alpha_mass)
-
-    env = get_task(task_id, task_suite=suite)
-    if adapt_params:
-        optimizer = torch.optim.Adam(adapt_params, lr=adapt_lr)
-        torch.manual_seed(int(seed))
-        obs, _ = env.reset(seed=seed)
-        for _ in range(int(adapt_steps)):
-            obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-            mean, raw_log_std = agent(obs_t)
-            std = bound_log_std(raw_log_std).exp()
-            dist = torch.distributions.Normal(mean, std)
-            sampled = dist.sample()
-            action = torch.tanh(sampled)[0].detach().cpu().numpy()
-            next_obs, reward, terminated, truncated, _ = env.step(action)
-
-            # Friend's test-time rule: one-step REINFORCE on the mixture scalars.
-            # The sampled action is treated as the score-function sample.
-            loss = -dist.log_prob(sampled).sum(dim=-1) * float(reward)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            if terminated or truncated:
-                obs, _ = env.reset()
-            else:
-                obs = next_obs
-
-    agent.eval()
-    returns, success, velocity_errors = [], [], []
-    for ep in range(episodes):
-        obs, _ = env.reset(seed=seed + 10_000 * task_id + ep)
-        ep_return = 0.0
-        ep_success, ep_error = [], []
-        while True:
-            obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-            with torch.no_grad():
-                mean, _ = agent(obs_t)
-            action = torch.tanh(mean[0]).cpu().numpy()
-            obs, reward, terminated, truncated, info = env.step(action)
-            ep_return += float(reward)
-            ep_success.append(float(info.get("success", np.nan)))
-            ep_error.append(float(info.get("velocity_error", np.nan)))
-            if terminated or truncated:
-                break
-        returns.append(ep_return)
-        success.append(float(np.nanmean(ep_success)))
-        velocity_errors.append(float(np.nanmean(ep_error)))
-    env.close()
-    return {
-        "return": float(np.mean(returns)),
-        "success": float(np.nanmean(success)),
-        "velocity_error": float(np.nanmean(velocity_errors)),
-    }
+def adapt_and_evaluate_checkpoint(run_dir, suite, task_id, episodes, seed, device, *,
+                                  adapt_steps=0, adapt_lr=1e-2, frozen_policy="pool",
+                                  action_mode="deterministic"):
+    from checkpoint_evaluation import evaluate
+    return evaluate(run_dir, suite, task_id, episodes, seed, device,
+                    adapt_steps=adapt_steps, adapt_lr=adapt_lr,
+                    frozen_policy=frozen_policy, action_mode=action_mode,
+                    error_key=ERROR_KEY, episodic_success=EPISODIC_SUCCESS)
 
 
 def _evaluate_metric_checkpoint(args, run_dir, suite, task_id, episodes, seed, device):
@@ -452,7 +345,8 @@ def _evaluate_metric_checkpoint(args, run_dir, suite, task_id, episodes, seed, d
         run_dir, suite, task_id, episodes, seed, device,
         adapt_steps=int(getattr(args, "test_adapt_steps", 0)),
         adapt_lr=float(getattr(args, "test_adapt_lr", 1e-2)),
-    )
+        frozen_policy=getattr(args, "frozen_eval_policy", "pool"),
+        action_mode=getattr(args, "eval_action_mode", "deterministic"))
 
 
 # ==========================================================================
@@ -494,15 +388,20 @@ def build_retention_matrix(args, suite, condition, seed, device):
         "sequence": list(args.task_sequence),
         "eval_task_ids": eval_task_ids,
         "episodes": int(args.retention_eval_episodes),
+        "frozen_eval_policy": getattr(args, "frozen_eval_policy", "pool"),
+        "eval_action_mode": getattr(args, "eval_action_mode", "deterministic"),
+        "test_adapt_steps_per_checkpoint_task": int(getattr(args, "test_adapt_steps", 0)),
         "return": [],
         "success": [],
+        "evaluation_interactions": [],
+        "adaptation_interactions": [],
         "velocity_error": [],
     }
     for seq_idx, trained_task in enumerate(args.task_sequence):
         run_dir = checkpoint_dir(args.save_root, suite, condition, seed, seq_idx, trained_task)
         if not checkpoint_complete(run_dir):
             raise FileNotFoundError(run_dir)
-        rows = {metric: [] for metric in ("return", "success", "velocity_error")}
+        rows = {metric: [] for metric in ("return", "success", "velocity_error", "evaluation_interactions", "adaptation_interactions")}
         for eval_task in eval_task_ids:
             metrics = _evaluate_metric_checkpoint(
                 args, run_dir, suite, eval_task, args.retention_eval_episodes,
@@ -672,43 +571,40 @@ def compute_forward_transfer_success(args, suite, condition, seed, scratch_seeds
 
 
 def compute_forward_transfer_return(args, suite, condition, seed, scratch_seeds, scratch_total_timesteps):
-    """Algebraic reduction FT_i = 1 - R_i/R_i^b (see module docstring for
-    the derivation), using RAW charts/test_episodic_return integrals -- no
-    [0,1] normalization needed since r_min cancels out of the ratio. Uses the
-    same first-unseen-task positions as compute_forward_transfer_success."""
-    per_position = []
-    per_position_index = []
-    scratch_variant = _scratch_variant(args, condition)
+    """Return-AUC transfer with a valid environment-specific upper bound.
+
+    (AUC_return - AUC_scratch) / (return_upper_bound - AUC_scratch).
+    This is 1 - R/R_b only for HalfCheetah (upper bound zero). Walker2D
+    and Hopper have a survival reward, so the zero-bound shortcut is invalid.
+    MetaWorld uses its retained shaped-reward bound, 10 * 200 = 2000.
+    """
+    per_position, positions = [], []
+    variant = _scratch_variant(args, condition)
     for seq_idx, task_id in _first_unseen_positions(args.task_sequence):
-        run_steps, run_values = load_scalar(
-            event_dir(args.runs_root, suite, condition, seed, seq_idx, task_id),
-            "charts/test_episodic_return",
-        )
-        if run_steps.size < 2:
+        steps, values = load_scalar(event_dir(args.runs_root, suite, condition, seed, seq_idx, task_id),
+                                    "charts/test_episodic_return")
+        auc = _auc(steps, values)
+        if auc is None:
             continue
-        r_i = float(_trapz(run_values, run_steps))
-
-        baseline_integrals = []
-        for b_seed in scratch_seeds:
-            b_dir = scratch.scratch_event_dir(
-                args.runs_root, suite, task_id, scratch_total_timesteps, b_seed, scratch_variant
-            )
-            b_steps, b_values = load_scalar(b_dir, "charts/test_episodic_return")
-            if b_steps.size >= 2:
-                baseline_integrals.append(float(_trapz(b_values, b_steps)))
-        if not baseline_integrals:
+        baselines = []
+        for baseline_seed in scratch_seeds:
+            directory = scratch.scratch_event_dir(args.runs_root, suite, task_id,
+                                                 scratch_total_timesteps, baseline_seed, variant)
+            bs, bv = load_scalar(directory, "charts/test_episodic_return")
+            value = _auc(bs, bv)
+            if value is not None and np.isfinite(value):
+                baselines.append(value)
+        if not baselines:
             continue
-        r_i_b = float(np.mean(baseline_integrals))
-        if r_i_b == 0.0:
+        reference = float(np.mean(baselines))
+        denominator = RETURN_UPPER_BOUND - reference
+        if denominator <= 1e-12:
             continue
-        per_position.append(1.0 - (r_i / r_i_b))
-        per_position_index.append({"seq_idx": int(seq_idx), "task_id": int(task_id)})
-
-    return {
-        "FT_return": float(np.mean(per_position)) if per_position else float("nan"),
-        "FT_return_per_position": per_position,
-        "FT_return_positions": per_position_index,
-    }
+        per_position.append((auc - reference) / denominator)
+        positions.append({"seq_idx": int(seq_idx), "task_id": int(task_id)})
+    return {"FT_return": float(np.mean(per_position)) if per_position else float("nan"),
+            "FT_return_per_position": per_position, "FT_return_positions": positions,
+            "FT_return_upper_bound": RETURN_UPPER_BOUND}
 
 
 # ==========================================================================
@@ -720,13 +616,16 @@ def survey_metrics_cache_path(args, suite, condition, seed):
 
 
 def compute_survey_metrics(args, suite, condition, seed, device, scratch_seeds, scratch_total_timesteps):
-    # Forward transfer is undefined unless its from-scratch denominator was
-    # trained under the same SAC/encoder configuration. Validate before even
-    # considering a cached metric file so direct callers cannot silently mix
-    # incompatible experiments.
-    _validate_scratch_checkpoints(
-        args, suite, condition, scratch_seeds, scratch_total_timesteps
-    )
+    # Forward transfer only requires the expected scratch learning-curve
+    # files to exist. Provenance/runtime compatibility is a training/resume
+    # concern and is intentionally not re-checked during post-hoc metrics.
+    ft_available = not bool(getattr(args, "skip_forward_transfer", False))
+    if ft_available:
+        try:
+            _validate_scratch_checkpoints(args, suite, condition, seed, scratch_seeds, scratch_total_timesteps)
+        except RuntimeError as exc:
+            print(f"[metrics] A_N/FG/BWT will be computed; FT unavailable: {exc}")
+            ft_available = False
 
     cache = survey_metrics_cache_path(args, suite, condition, seed)
     if cache.exists() and not args.force_retrain:
@@ -734,6 +633,7 @@ def compute_survey_metrics(args, suite, condition, seed, device, scratch_seeds, 
             cached = json.load(f)
         expected_config = {
             **_benchmark_cache_config(args),
+            "ft_available": ft_available,
             "retention_eval_episodes": int(args.retention_eval_episodes),
             "scratch_seeds": [int(x) for x in scratch_seeds],
             "scratch_total_timesteps": int(scratch_total_timesteps),
@@ -757,13 +657,16 @@ def compute_survey_metrics(args, suite, condition, seed, device, scratch_seeds, 
     diagonal = compute_p_diagonal(args, suite, condition, seed, device)
     final_row = compute_p_final_row(args, suite, condition, seed, device)
     fg_bwt = compute_fg_bwt(diagonal, final_row, args.task_sequence)
-    ft_success = compute_forward_transfer_success(args, suite, condition, seed, scratch_seeds, scratch_total_timesteps)
-    ft_return = compute_forward_transfer_return(args, suite, condition, seed, scratch_seeds, scratch_total_timesteps)
+    ft_success = (compute_forward_transfer_success(args, suite, condition, seed, scratch_seeds, scratch_total_timesteps)
+                  if ft_available else {"FT_success": float("nan"), "FT_success_per_position": []})
+    ft_return = (compute_forward_transfer_return(args, suite, condition, seed, scratch_seeds, scratch_total_timesteps)
+                 if ft_available else {"FT_return": float("nan"), "FT_return_per_position": []})
 
     result = {
         "cache_schema_version": CACHE_SCHEMA_VERSION,
         "cache_config": {
             **_benchmark_cache_config(args),
+            "ft_available": ft_available,
             "retention_eval_episodes": int(args.retention_eval_episodes),
             "scratch_seeds": [int(x) for x in scratch_seeds],
             "scratch_total_timesteps": int(scratch_total_timesteps),

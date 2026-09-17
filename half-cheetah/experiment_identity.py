@@ -11,6 +11,7 @@ pretrained encoder file while keeping the same output path.
 """
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.metadata
 import json
@@ -18,7 +19,7 @@ import pathlib
 from typing import Any, Mapping, Sequence
 
 MANIFEST_NAME = "run_manifest.json"
-MANIFEST_SCHEMA_VERSION = 1
+MANIFEST_SCHEMA_VERSION = 2
 
 # Only knobs that can change the learned policy/pool are part of the training
 # signature. Logging/output-path settings are intentionally excluded so moving
@@ -32,6 +33,11 @@ TRAINING_KEYS = (
     "torch_deterministic",
     "cuda",
     "fusion_mode",
+    "composition_space",
+    "policy_student_replay",
+    "projection_epochs",
+    "projection_max_samples",
+    "eval_action_mode",
     "total_timesteps",
     "buffer_size",
     "gamma",
@@ -41,6 +47,7 @@ TRAINING_KEYS = (
     "random_actions_end",
     "policy_lr",
     "alpha_lr",
+    "alpha_mass_lr",
     "alpha_warmup_steps",
     "alpha_entropy_reg",
     "distill_encoder_lr_mult",
@@ -71,6 +78,7 @@ TRAINING_KEYS = (
     "collect_cosine_buffers",
     "max_distill_buffer",
     "similarity_samples",
+    "balance_source_lineages",
     "distill_max_samples",
     "distill_epochs",
     "distill_lr",
@@ -82,9 +90,16 @@ TRAINING_KEYS = (
 # Files that can affect a training trajectory or the stored analysis needed by
 # the upcoming lineage/KL investigations. Plotting-only files are excluded so a
 # cosmetic plot edit does not force model retraining.
+PRE_LINEAGE_BALANCING_SOURCE_FINGERPRINTS = {'15075233874f929c2ea5146a2bd259b5e147781c537a47b3a04b35fad667dd52', 'b8dce66f12a3902dd4ecbbdc1a30031fb322437577258b8460f609a800329e76', 'bec81d2249d9391fb07dfa94b8c3886f54603a2e0cf3d5bbe38944b9cc5b6be6'}
+
+PRE_ALPHA_MASS_LR_SOURCE_FINGERPRINTS = {'773c7cb53384f127985d17ebf066563738e9f0a75576c106335c8f13b028b0a4'}
+
 SOURCE_CANDIDATES = (
     "run_sac.py",
     "cka_rl.py",
+    "policy_composition.py",
+    "policy_space.py",
+    "training_protocol.py",
     "knowledge_pools.py",
     "shared_arch.py",
     "policy_utils.py",
@@ -121,7 +136,59 @@ def sha256_file(path) -> str | None:
     return h.hexdigest()
 
 
+class _RunSacLoggingStripper(ast.NodeTransformer):
+    """Remove pure logging plumbing from run_sac.py before identity hashing.
+
+    Training semantics still remain fingerprinted.  This only strips the writer
+    import/construction and direct writer.* calls, so switching TensorBoard to a
+    CSV-mirroring writer or adding/removing scalar logging does not make trained
+    checkpoints look stale.
+    """
+
+    _WRITER_METHODS = {"add_scalar", "add_text", "flush", "close"}
+
+    def visit_ImportFrom(self, node):
+        if node.module in {"torch.utils.tensorboard", "csv_summary_writer"}:
+            return None
+        return self.generic_visit(node)
+
+    def visit_Assign(self, node):
+        # Strip only the top-level writer construction, not arbitrary assignments.
+        if any(isinstance(t, ast.Name) and t.id == "writer" for t in node.targets):
+            value = node.value
+            if isinstance(value, ast.Call):
+                func = value.func
+                if isinstance(func, ast.Name) and func.id in {"SummaryWriter", "CsvSummaryWriter"}:
+                    return None
+        return self.generic_visit(node)
+
+    def visit_Expr(self, node):
+        value = node.value
+        if isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute):
+            owner = value.func.value
+            if (isinstance(owner, ast.Name) and owner.id == "writer"
+                    and value.func.attr in self._WRITER_METHODS):
+                return None
+        return self.generic_visit(node)
+
+
+def _semantic_source_bytes(name: str, path: pathlib.Path) -> bytes:
+    """Canonical bytes for training identity.
+
+    run_sac.py is parsed so pure metric-output statements do not affect the
+    training fingerprint. Other training-relevant files remain byte-exact.
+    """
+    if name != "run_sac.py":
+        return path.read_bytes()
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(path))
+    tree = _RunSacLoggingStripper().visit(tree)
+    ast.fix_missing_locations(tree)
+    return ast.dump(tree, annotate_fields=True, include_attributes=False).encode("utf-8")
+
+
 def source_fingerprint(root=None) -> str:
+    """Fingerprint training semantics while ignoring pure run_sac logging changes."""
     root = pathlib.Path(root or pathlib.Path(__file__).resolve().parent)
     h = hashlib.sha256()
     found = 0
@@ -132,11 +199,61 @@ def source_fingerprint(root=None) -> str:
         found += 1
         h.update(name.encode("utf-8"))
         h.update(b"\0")
-        h.update(path.read_bytes())
+        h.update(_semantic_source_bytes(name, path))
         h.update(b"\0")
     if found == 0:
         raise RuntimeError(f"no training source files found under {root}")
     return h.hexdigest()
+
+
+def _raw_source_fingerprint(root: pathlib.Path, run_sac_bytes: bytes | None = None) -> str:
+    """Legacy schema-v2 byte fingerprint used by already-trained checkpoints."""
+    h = hashlib.sha256()
+    found = 0
+    for name in SOURCE_CANDIDATES:
+        path = root / name
+        if not path.exists():
+            continue
+        found += 1
+        h.update(name.encode("utf-8"))
+        h.update(b"\0")
+        if name == "run_sac.py" and run_sac_bytes is not None:
+            h.update(run_sac_bytes)
+        else:
+            h.update(path.read_bytes())
+        h.update(b"\0")
+    if found == 0:
+        raise RuntimeError(f"no training source files found under {root}")
+    return h.hexdigest()
+
+
+def _compatible_legacy_source_fingerprints(root=None) -> set[str]:
+    """Raw hashes accepted only for old manifests.
+
+    The CSV logger changed exactly the SummaryWriter import and constructor.
+    Reconstruct both byte-level variants from the current source so checkpoints
+    produced immediately before or after that logging-only change remain valid.
+    Any other training-source change still fails validation.
+    """
+    root = pathlib.Path(root or pathlib.Path(__file__).resolve().parent)
+    run_sac = root / "run_sac.py"
+    variants = {_raw_source_fingerprint(root)}
+    if not run_sac.exists():
+        return variants
+    text = run_sac.read_text(encoding="utf-8")
+
+    tb = text.replace(
+        "from csv_summary_writer import CsvSummaryWriter",
+        "from torch.utils.tensorboard import SummaryWriter",
+    ).replace("writer = CsvSummaryWriter(", "writer = SummaryWriter(")
+    variants.add(_raw_source_fingerprint(root, tb.encode("utf-8")))
+
+    csv = text.replace(
+        "from torch.utils.tensorboard import SummaryWriter",
+        "from csv_summary_writer import CsvSummaryWriter",
+    ).replace("writer = SummaryWriter(", "writer = CsvSummaryWriter(")
+    variants.add(_raw_source_fingerprint(root, csv.encode("utf-8")))
+    return variants
 
 
 def runtime_versions() -> dict:
@@ -154,7 +271,13 @@ def runtime_versions() -> dict:
 
 
 def training_config(mapping: Mapping[str, Any]) -> dict:
-    return {key: _jsonable(mapping[key]) for key in TRAINING_KEYS if key in mapping}
+    config = {key: _jsonable(mapping[key]) for key in TRAINING_KEYS if key in mapping}
+    # None means "reuse alpha_lr" so store the effective value in manifests.
+    # This makes explicit --alpha-mass-lr=<alpha_lr> and the legacy/default
+    # behavior semantically identical.
+    if "alpha_mass_lr" in config and config["alpha_mass_lr"] is None:
+        config["alpha_mass_lr"] = config.get("alpha_lr")
+    return config
 
 
 def load_manifest(run_dir) -> dict | None:
@@ -219,6 +342,7 @@ def checkpoint_matches(
     parent_dirs=(),
     pretrained_encoder=None,
     root=None,
+    check_runtime: bool = True,
 ) -> tuple[bool, str]:
     """Return (matches, reason) for resumable orchestration."""
     manifest = load_manifest(run_dir)
@@ -228,16 +352,50 @@ def checkpoint_matches(
     expected = training_config(expected_mapping)
     actual = manifest.get("training_config", {})
     for key, value in expected.items():
+        # Checkpoints created before the lineage-balancing ablation existed are
+        # exactly the current default when the new flag is False.
+        if key == "balance_source_lineages" and key not in actual and value is False:
+            continue
+        # Before --alpha-mass-lr existed, alpha_mass was optimized in the same
+        # Adam parameter group as alpha/alpha_scale, i.e. its effective LR was
+        # exactly alpha_lr. Accept those manifests only for that equivalent case.
+        if key == "alpha_mass_lr" and key not in actual and value == actual.get("alpha_lr"):
+            continue
         if actual.get(key) != value:
             return False, f"training config mismatch for {key}: saved={actual.get(key)!r}, expected={value!r}"
 
+    saved_source = manifest.get("source_fingerprint")
     current_source = source_fingerprint(root)
-    if manifest.get("source_fingerprint") != current_source:
-        return False, "training source fingerprint changed"
+    if saved_source != current_source:
+        # Backward compatibility for logging-only changes and for the exact
+        # pre-lineage-balancing implementation. The latter is accepted only
+        # when the expected config keeps balance_source_lineages disabled.
+        allow_pre_lineage = (
+            not bool(expected.get("balance_source_lineages", False))
+            and saved_source in PRE_LINEAGE_BALANCING_SOURCE_FINGERPRINTS
+        )
+        # The code immediately before this option existed used alpha_lr for the
+        # mass gate. Preserve compatibility only when the requested effective
+        # mass LR is still alpha_lr; a genuinely different mass LR must retrain.
+        allow_pre_alpha_mass_lr = (
+            expected.get("alpha_mass_lr", expected.get("alpha_lr")) == expected.get("alpha_lr")
+            and saved_source in PRE_ALPHA_MASS_LR_SOURCE_FINGERPRINTS
+        )
+        if (
+            saved_source not in _compatible_legacy_source_fingerprints(root)
+            and not allow_pre_lineage
+            and not allow_pre_alpha_mass_lr
+        ):
+            return False, "training source fingerprint changed"
 
-    current_runtime = runtime_versions()
-    if manifest.get("runtime_versions") != current_runtime:
-        return False, "Python/package runtime versions changed"
+    # Runtime equality is required when a checkpoint may be resumed/reused for
+    # training or policy execution.  Post-hoc metrics that only read already
+    # recorded learning curves can set check_runtime=False and compare the
+    # *training* runtimes of the scratch and continual manifests instead.
+    if check_runtime:
+        current_runtime = runtime_versions()
+        if manifest.get("runtime_versions") != current_runtime:
+            return False, "Python/package runtime versions changed"
 
     expected_pretrained = None if pretrained_encoder is None else sha256_file(pretrained_encoder)
     if manifest.get("pretrained_encoder_sha256") != expected_pretrained:

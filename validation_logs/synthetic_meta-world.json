@@ -1,0 +1,38 @@
+{
+  "type": "SYNTHETIC adapters, NOT real simulators",
+  "passed": true,
+  "runs": [
+    {
+      "family": "meta-world",
+      "condition": "baseline",
+      "trained_tasks": 3,
+      "exact_Delta": 40,
+      "evaluations_checked": 4,
+      "adaptation_checked": true
+    },
+    {
+      "family": "meta-world",
+      "condition": "combined",
+      "trained_tasks": 3,
+      "exact_Delta": 40,
+      "evaluations_checked": 4,
+      "adaptation_checked": true
+    },
+    {
+      "family": "meta-world",
+      "condition": "baseline_policy",
+      "trained_tasks": 3,
+      "exact_Delta": 40,
+      "evaluations_checked": 4,
+      "adaptation_checked": true
+    },
+    {
+      "family": "meta-world",
+      "condition": "combined_policy",
+      "trained_tasks": 3,
+      "exact_Delta": 40,
+      "evaluations_checked": 4,
+      "adaptation_checked": true
+    }
+  ]
+}

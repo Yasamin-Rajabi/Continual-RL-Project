@@ -31,8 +31,10 @@ def parse_args():
 
     # Metric and test-time adaptation controls.
     p.add_argument("--retention-eval-episodes", type=int, default=3)
-    p.add_argument("--test-adapt-steps", type=int, default=1000,
+    p.add_argument("--test-adapt-steps", type=int, default=0,
                    help="Number of alpha-only adaptation steps before retention/final evaluation; 0 disables it.")
+    p.add_argument("--frozen-eval-policy", choices=["pool", "snapshot"], default="pool")
+    p.add_argument("--eval-action-mode", choices=["deterministic", "stochastic"], default="deterministic")
     p.add_argument("--test-adapt-lr", type=float, default=1e-2,
                    help="Learning rate for test-time alpha adaptation.")
 
