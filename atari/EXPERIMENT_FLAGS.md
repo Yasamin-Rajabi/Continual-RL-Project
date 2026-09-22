@@ -96,3 +96,476 @@ available only as an explicit ablation.
 - parent-balanced replay/distillation is intentionally **not** lineage-balanced yet;
   that behavior is the control for the upcoming exponential-decay investigation.
 - critic reset/persistence is intentionally unchanged pending the critic TODO.
+
+
+
+
+////////////////
+
+I inspected the plots carefully. My first impression is: **I do not think this is primarily a PPO hyperparameter problem.** There are signs that the PPO optimizer is behaving normally; the problem seems to be in **the continual composition / alpha mechanism / knowledge transfer schedule**. The good news is that the diagnostics are actually very informative.
+
+I will go through each observation and then suggest a tuning plan.
+
+---
+
+## 1. The main failure: catastrophic behavior after task transitions
+
+The evaluation curve is the most important one:
+
+![Image](https://images.openai.com/static-rsc-4/_ey6CBmGhw33Cy8V4CMpd4qAFEm0fpj0eUJiK1Oa_I65k83bDRYbl0uAt2R_YEXKgiwGMELbr425xLR_NFIS-Br4phdRKwM1jJHm_qSBDYj0s0dqYa0HbMY9oyxM0FKVjyTtFfBGxnzetbWnsE0D6zahUBQHO9qUzqdTVJE56YbQ2XHSpeckaltwtcmSkidd?purpose=fullsize)
+
+![Image](https://images.openai.com/static-rsc-4/4hG8BoDEB3qc3z4attPvLMbpA5Gslm2kJCVIDn5bzeyKxG2RbWCHVMrSzsCSLxXt6GCYomadgWYazPGpKBTqD3kJhLAom9OhwCmZ4MSH_4N9Yw4Fp3RZiFcDiR-Qb1HOKTOPudm0EFfr9bVHPLmHowWlOT9pB_gzKhpovwzUQVFSQVccmf1BogcCwITcPAyv?purpose=fullsize)
+
+![Image](https://images.openai.com/static-rsc-4/d-7ufRs-4CwGVLJ-NBNd57r6Zy_L9ZmNSATpCA_IkW1l5fMH6Uscea0JyImYGQK22lM30AQvX1DuL6m3Fkk7cbDZKXfm8Qm4kc1iFo4GIqwxbdyjB8yxiDmFsIAHCJVf7gU1JuilyO_asAyxjA4kPs4lQ3vL7GEOO47pLZGviY93lz5XkcVMPzZthrPqeMBz?purpose=fullsize)
+
+Your reward:
+
+* Task 0 starts around **22**
+* After transition to task 1 → drops to ~5
+* Task 2 → recovers partially
+* Task 4 → recovers to ~22
+* Task 5/6 → collapses again
+* Final tasks remain weak
+
+The heatmap confirms this:
+
+* Task 0 retention: excellent
+* Task 4 retention: excellent
+* Task 1/5/6/7: weak
+
+This is **not what I expect from bad PPO learning**.
+
+If PPO was the issue, we would see:
+
+* high policy loss instability,
+* exploding entropy,
+* bad learning curves everywhere.
+
+Instead:
+
+Your PPO loss:
+
+* stabilizes quickly
+* becomes almost zero after learning phases
+
+So PPO is converging.
+
+The issue is:
+
+> the merged policy is choosing a bad mixture after some tasks.
+
+---
+
+# 2. Alpha mass is almost frozen
+
+This plot is the biggest clue:
+
+### Historical-mixture alpha mass
+
+Your alpha mass stays:
+
+```
+0.94 - 0.96
+```
+
+almost everywhere.
+
+Meaning:
+
+The mixture gate is saying:
+
+> "Use almost only previous historical policy."
+
+This is happening even when the current task needs adaptation.
+
+For continual RL, this is dangerous.
+
+The current task contribution is too weak.
+
+Your method:
+
+```
+new policy =
+alpha_old * old knowledge
++
+alpha_new * current task
+```
+
+but your alpha:
+
+```
+alpha_old ≈ 0.96
+alpha_new ≈ 0.04
+```
+
+So the new task is barely entering.
+
+---
+
+## Change #1: increase alpha learning rate
+
+Currently:
+
+```bash
+--alpha-learning-rate 2.5e-4
+```
+
+I would try:
+
+```
+--alpha-learning-rate 1e-3
+```
+
+or even:
+
+```
+--alpha-learning-rate 2.5e-3
+```
+
+for Atari.
+
+Why?
+
+Your PPO LR is:
+
+```
+2.5e-4
+```
+
+but alpha is a tiny vector. It needs faster adaptation.
+
+---
+
+# 3. Alpha entropy regularization is too strong
+
+Currently:
+
+```python
+--alpha-entropy-reg 0.01
+```
+
+This encourages uniform mixtures.
+
+But your result shows the opposite problem:
+
+The model keeps old mixture.
+
+Try:
+
+```
+--alpha-entropy-reg 0.001
+```
+
+or:
+
+```
+0
+```
+
+I would start:
+
+```bash
+--alpha-entropy-reg 0.001
+```
+
+---
+
+# 4. Alpha mass regularization is probably hurting you
+
+Current:
+
+```bash
+--alpha-mass-reg 0.05
+```
+
+Your alpha mass curve tells me the constraint is too strong.
+
+This regularizer:
+
+```text
+keep alpha mass stable
+```
+
+is fighting:
+
+```text
+adapt to new task
+```
+
+For Atari I would test:
+
+```
+0.005
+```
+
+instead of:
+
+```
+0.05
+```
+
+Ten times smaller.
+
+---
+
+# 5. Alpha initialization is probably wrong
+
+You use:
+
+```bash
+--alpha-init Randn
+```
+
+From your alpha entropy curve:
+
+The first tasks start with low entropy and then suddenly jump.
+
+This suggests the initial mixture is not well behaved.
+
+I would change:
+
+```
+--alpha-init Uniform
+```
+
+Why?
+
+For a new task:
+
+You do not know whether:
+
+* task 0
+* task 1
+* task 2
+
+is useful.
+
+Uniform gives:
+
+```
+1/N
+```
+
+starting point.
+
+Then learning decides.
+
+---
+
+# 6. Pool size
+
+Current:
+
+```bash
+--pool-size 5
+```
+
+For Freeway:
+
+you have:
+
+```
+11 sequential tasks
+```
+
+with repeats.
+
+A pool of 5 means:
+
+many merges happen.
+
+Your lineage plot shows:
+
+```
+2 -> 3 source lineages
+```
+
+after some merges.
+
+I would try:
+
+```
+pool-size 8
+```
+
+or:
+
+```
+pool-size 10
+```
+
+for the final experiment.
+
+Your contribution is bounded memory, but 5 might simply be too aggressive.
+
+---
+
+# 7. Distillation seems too weak, not too strong
+
+Look at:
+
+```
+Distillation held-out KL
+```
+
+Values:
+
+```
+1e-4 ~ 7e-4
+```
+
+This is very small.
+
+Meaning:
+
+student ≈ teacher.
+
+So distillation is not destroying behavior.
+
+The issue is:
+
+the teacher itself is wrong because alpha selection is wrong.
+
+I would NOT tune:
+
+```
+distill-lr
+distill-epochs
+```
+
+yet.
+
+---
+
+# 8. PPO changes I would make (secondary)
+
+Only after alpha fixes.
+
+Current:
+
+```
+num_steps=128
+num_envs=8
+batch=1024
+```
+
+For Atari this is small.
+
+I would use:
+
+```
+num_envs=16
+num_steps=256
+```
+
+giving:
+
+```
+4096 rollout batch
+```
+
+Then:
+
+```
+num_minibatches=8
+```
+
+This usually gives more stable Atari PPO.
+
+So:
+
+```bash
+--num-envs 16
+--num-steps 256
+--num-minibatches 8
+```
+
+---
+
+# My first tuning experiment
+
+I would NOT change everything.
+
+Run this:
+
+```bash
+python run_continual_benchmark.py \
+ --task-suites freeway \
+ --condition-index 4 \
+ --seeds 1 \
+ --total-timesteps 1000000 \
+ --pool-size 8 \
+ --alpha-init Uniform \
+ --alpha-learning-rate 1e-3 \
+ --alpha-entropy-reg 0.001 \
+ --alpha-mass-reg 0.005 \
+ --distill-lr 3e-4 \
+ --distill-epochs 8
+```
+
+Keep PPO unchanged first.
+
+---
+
+# Second experiment if still bad
+
+Then:
+
+```bash
+--num-envs 16
+--num-steps 256
+--num-minibatches 8
+```
+
+---
+
+# One more thing I noticed
+
+Your orchestrator default:
+
+```python
+--alpha-factor=1e-3
+```
+
+combined with:
+
+```python
+alpha-scale
+```
+
+may be important.
+
+For weight-delta mode you have:
+
+```python
+fix_alpha_scale=True
+```
+
+and:
+
+```
+alpha scale = 5
+```
+
+I want to verify this because your alpha mass curve suggests the fixed scale may be dominating.
+
+Could you send me:
+
+1. the `training_meta.json` from this run
+2. the exact command used to launch this seed
+3. the values of:
+
+   * alpha_scale
+   * alpha_factor
+   * alpha_warmup_steps
+   * composition_space
+
+Then I can tell whether the failure is from:
+
+* alpha optimization,
+* weight-delta scaling,
+* or the merge-selection mechanism.
+
+Right now my strongest hypothesis is:
+
+**alpha adaptation is too conservative; the method is preserving old knowledge but not allowing enough new-task plasticity.**

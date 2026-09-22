@@ -57,8 +57,12 @@ TASKS = {
 # One pass is the current Atari experiment protocol.  Use
 # get_continual_sequence(..., repeats=2) if you want the same second-pass
 # retention/relearning stress test used by the HalfCheetah benchmark.
+DEFAULT_CONTINUAL_SEQUENCE_FREEWAY = (0, 1, 2, 3, 4, 0, 1, 2, 5, 6)
+DEFAULT_CONTINUAL_SEQUENCE_SPACEINVADERS = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9)
+
 DEFAULT_CONTINUAL_SEQUENCES = {
-    suite: tuple(range(len(tasks))) for suite, tasks in TASK_SUITES.items()
+    "freeway": DEFAULT_CONTINUAL_SEQUENCE_FREEWAY,
+    "space_invaders": DEFAULT_CONTINUAL_SEQUENCE_SPACEINVADERS,
 }
 
 

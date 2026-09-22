@@ -1,10 +1,13 @@
 numpy>=1.26,<3
 torch>=2.1
-gymnasium[mujoco]>=1.0,<2
-mujoco>=3.0,<4
-stable-baselines3>=2.4,<3
+gymnasium>=1.0,<2
+stable-baselines3[extra]>=2.4,<3
 tensorboard>=2.15
 matplotlib>=3.7
 tyro>=0.8
 loguru>=0.7
 tqdm>=4.66
+ale-py
+opencv-python
+tabulate
+wandb

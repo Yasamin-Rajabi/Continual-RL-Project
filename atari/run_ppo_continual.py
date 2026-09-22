@@ -1,33 +1,28 @@
-"""PPO trainer for the bounded categorical CKA-RL Atari agent.
+"""Continual Atari PPO trainer for bounded categorical CKA-RL.
 
-This is the Atari/PPO counterpart of run_sac.py.  The RL algorithm differs,
-but the continual-learning principles are intentionally preserved:
+Shared continual-learning semantics mirror the corrected HalfCheetah runner:
+- Delta is ``total_timesteps`` and the frozen tail B is INSIDE Delta;
+- exact task-start / pre-finalize / post-finalize analysis snapshots;
+- parameter or exact policy-space composition;
+- optional policy-student variant with explicit behavior-policy provenance;
+- fixed-capacity pool finalization, projection, lineage-aware merging/distillation;
+- CSV-mirrored TensorBoard scalars and reproducible checkpoint manifests.
 
-- zero-shot evaluation at task start;
-- root/base + current contribution + bounded historical pool;
-- learned alpha reuse and weight-delta warmup;
-- optional trainable shared encoder with slower LR and historical feature-drift
-  regularization in distillation conditions;
-- post-training representative-state collection;
-- exact-policy snapshot BEFORE pool topology changes;
-- set_base() on the root task, finalize() on later tasks;
-- cosine or replay-weighted symmetric categorical-KL merge selection;
-- categorical KL distillation when enabled;
-- detailed merge/lineage/pool diagnostics and start/pre/post-finalize snapshots.
-
-Training uses clipped-reward EpisodicLife Atari preprocessing.  Evaluation uses
-raw full-game rewards (clip_reward=False, episodic_life=False).
+Atari-specific behavior remains unchanged where it should:
+- clipped-reward + EpisodicLife preprocessing for PPO training;
+- raw full-game score for evaluation;
+- categorical policies and a task-local PPO value head;
+- raw uint8 retained frame stacks, normalized only when re-encoded.
 """
 from __future__ import annotations
 
 import copy
-import inspect
 import json
 import os
 import pathlib
 import random
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Literal, Optional, Tuple
 
 import gymnasium as gym
@@ -38,12 +33,15 @@ import torch.nn.functional as F
 import torch.optim as optim
 import tyro
 from loguru import logger
-from torch.utils.tensorboard import SummaryWriter
+from torch.distributions import Categorical
 from tqdm import tqdm
 
+from analysis_logging import effective_theta_vector, log_training_state, save_task_snapshot
 from atari_tasks import TASK_SUITES, get_task, get_task_name
 from cka_rl import CkaRlAgent
+from csv_summary_writer import CsvSummaryWriter
 from experiment_identity import write_manifest
+from training_protocol import TaskBudget, bounded_buffer, mixture_warmup_active
 
 _HEAD_KEYS = ("l0_weight", "l0_bias", "l2_weight", "l2_bias")
 
@@ -53,8 +51,6 @@ class Args:
     model_type: Literal["cka-rl"] = "cka-rl"
     task_suite: Literal["freeway", "space_invaders"] = "freeway"
     task_id: int = 0
-    # Unique occurrence index in the continual sequence.  task_id may repeat;
-    # seq_idx preserves occurrence-level buffer lineage.
     seq_idx: int = 0
     prev_units: Tuple[pathlib.Path, ...] = ()
     save_dir: str = "agents_atari/debug"
@@ -65,9 +61,7 @@ class Args:
     torch_deterministic: bool = True
     cuda: bool = True
 
-    # ------------------------------------------------------------------
-    # PPO settings: same family as the project's legacy CleanRL Atari PPO.
-    # ------------------------------------------------------------------
+    # PPO.
     total_timesteps: int = 1_000_000
     learning_rate: float = 2.5e-4
     num_envs: int = 8
@@ -78,7 +72,7 @@ class Args:
     num_minibatches: int = 4
     update_epochs: int = 4
     norm_adv: bool = True
-    clip_coef: float = 0.1
+    clip_coef: float = 0.2
     clip_vloss: bool = True
     ent_coef: float = 0.01
     vf_coef: float = 0.5
@@ -87,20 +81,23 @@ class Args:
 
     eval_every: int = 50_000
     num_evals: int = 5
-    # ALE has no native success flag.  If set:
-    # success = 1[raw full-game score >= threshold].
+    eval_action_mode: Literal["deterministic", "stochastic"] = "deterministic"
     success_threshold: Optional[float] = None
 
-    # ------------------------------------------------------------------
-    # Knowledge-pool / four-condition knobs.
-    # ------------------------------------------------------------------
+    # Continual composition / storage.
     fusion_mode: Literal["classic_cka", "weight_delta"] = "classic_cka"
+    composition_space: Literal["parameter", "policy"] = "parameter"
+    policy_student_replay: bool = False
+    projection_epochs: int = 16
+    projection_max_samples: int = 20_000
+
     pool_size: int = 5
     alpha_init: Literal["Randn", "Major", "Uniform"] = "Randn"
     alpha_major: float = 0.6
     alpha_factor: float = 1e-3
     fix_alpha: bool = False
     alpha_learning_rate: float = 2.5e-4
+    alpha_mass_learning_rate: Optional[float] = None
     alpha_warmup_steps: int = 5_000
     alpha_entropy_reg: float = 0.01
     alpha_mass_reg: float = 0.05
@@ -109,29 +106,26 @@ class Args:
     use_alpha_mass: bool = False
     constrain_alpha_mass: bool = True
 
-    # ------------------------------------------------------------------
     # Shared CNN encoder.
-    # ------------------------------------------------------------------
     encoder_from_base: bool = True
     train_shared: bool = False
     freeze_root_encoder: bool = False
     pretrained_encoder: Optional[str] = None
     shared_dim: int = 512
-    head_hidden_dim: int = 128
+    head_hidden_dim: int = 512
     distill_encoder_lr_mult: float = 0.1
-    # Same principle as HalfCheetah: if a historical encoder is allowed to move
-    # in a distillation condition, preserve its representation on old states.
     drift_reg: float = 1.0
 
-    # ------------------------------------------------------------------
-    # Merge / distillation.
-    # ------------------------------------------------------------------
+    # Frozen tail / merge / distillation.
+    distill_buffer_steps: Optional[int] = None
+    """Compatibility alias for distill_extra_steps."""
     distillation: bool = True
     collect_cosine_buffers: bool = False
-    # Number of TOTAL stored transitions, not vector-env steps.
     distill_extra_steps: int = 2_000
+    """Final B Atari transitions INSIDE total_timesteps; never extra interactions."""
     max_distill_buffer: int = 5_000
     similarity_samples: int = 512
+    balance_source_lineages: bool = False
     distill_max_samples: int = 2_000
     distill_epochs: int = 8
     distill_lr: float = 3e-4
@@ -139,9 +133,7 @@ class Args:
     distill_test_frac: float = 0.2
     distill_select_best_val: bool = True
 
-    # ------------------------------------------------------------------
-    # Analysis / diagnostics, mirroring run_sac.py principles.
-    # ------------------------------------------------------------------
+    # Analysis.
     analysis_log_every: int = 5_000
     save_analysis_snapshots: bool = True
     analysis_root: str = "analysis_runs_atari"
@@ -159,66 +151,71 @@ def make_train_env(task_id: int, task_suite: str):
     return thunk
 
 
-def make_vector_env(args):
-    kwargs = {}
-    # Gymnasium >=1.0 exposes autoreset_mode. SAME_STEP matches the vector-env
-    # semantics assumed by CleanRL-style PPO rollouts: after a terminal/life
-    # boundary, the returned next observation is already the reset observation
-    # while final_info retains the completed episode record.
-    if "autoreset_mode" in inspect.signature(gym.vector.SyncVectorEnv).parameters:
-        autoreset = getattr(gym.vector, "AutoresetMode", None)
-        if autoreset is not None:
-            kwargs["autoreset_mode"] = autoreset.SAME_STEP
+def make_vector_env(args, num_envs: Optional[int] = None):
+    count = int(args.num_envs if num_envs is None else num_envs)
     return gym.vector.SyncVectorEnv(
-        [make_train_env(args.task_id, args.task_suite) for _ in range(args.num_envs)],
-        **kwargs,
+        [make_train_env(args.task_id, args.task_suite) for _ in range(count)]
     )
 
 
 def _evaluation_seed(task_id: int, episode: int) -> int:
-    """Fixed per-task episode seeds, independent of the training seed.
-
-    This is important for FT: continual seed 1 and scratch seed 101 should be
-    evaluated on the same episode initializations.
-    """
     return 10_000 + 10_000 * int(task_id) + int(episode)
 
 
 @torch.no_grad()
 def evaluate(agent, args, device, global_step, writer=None):
-    """Deterministic evaluation on raw full-game Atari score."""
+    """Evaluate exact categorical behavior on raw full-game Atari score."""
     env = get_task(
         args.task_id,
         task_suite=args.task_suite,
         clip_reward=False,
         episodic_life=False,
     )
-    returns = []
-    successes = []
-    for ep in range(args.num_evals):
-        obs, _ = env.reset(seed=_evaluation_seed(args.task_id, ep))
-        ep_return = 0.0
-        while True:
-            x = (
-                torch.as_tensor(obs, dtype=torch.float32, device=device)
-                .unsqueeze(0)
-                / 255.0
-            )
-            logits = agent(x)
-            action = int(torch.argmax(logits, dim=-1).item())
-            obs, reward, terminated, truncated, _ = env.step(action)
-            ep_return += float(reward)
-            if terminated or truncated:
-                break
-        returns.append(ep_return)
-        if args.success_threshold is not None:
-            successes.append(float(ep_return >= float(args.success_threshold)))
-    env.close()
+    returns, successes = [], []
+    eval_steps = 0
 
+    cuda_devices = (
+        [device.index if device.index is not None else torch.cuda.current_device()]
+        if device.type == "cuda"
+        else []
+    )
+    try:
+        with torch.random.fork_rng(devices=cuda_devices):
+            for ep in range(int(args.num_evals)):
+                seed = _evaluation_seed(args.task_id, ep)
+                torch.manual_seed(seed)
+                obs, _ = env.reset(seed=seed)
+                ep_return = 0.0
+                while True:
+                    x = (
+                        torch.as_tensor(obs, dtype=torch.float32, device=device)
+                        .unsqueeze(0)
+                        .div_(255.0)
+                    )
+                    dist = agent.action_distribution(x)
+                    if args.eval_action_mode == "stochastic":
+                        action = int(dist.sample().item())
+                    else:
+                        action = int(dist.probs.argmax(dim=-1).item())
+                    obs, reward, terminated, truncated, _ = env.step(action)
+                    eval_steps += 1
+                    ep_return += float(reward)
+                    if terminated or truncated:
+                        break
+                returns.append(ep_return)
+                if args.success_threshold is not None:
+                    successes.append(
+                        float(ep_return >= float(args.success_threshold))
+                    )
+    finally:
+        env.close()
+
+    agent.evaluation_env_steps = getattr(agent, "evaluation_env_steps", 0) + eval_steps
     result = {
         "reward": float(np.mean(returns)),
         "return": float(np.mean(returns)),
         "success": float(np.mean(successes)) if successes else float("nan"),
+        "evaluation_interactions": int(eval_steps),
     }
     if writer is not None:
         writer.add_scalar("charts/test_episodic_return", result["reward"], global_step)
@@ -228,20 +225,17 @@ def evaluate(agent, args, device, global_step, writer=None):
 
 
 def _log_finished_episodes(writer, infos, global_step, success_threshold=None):
-    """Log training-time full-game episode records across Gymnasium layouts.
-
-    RecordEpisodeStatistics sits inside EpisodicLife/ClipReward in atari_envs.py,
-    so its episode return is the raw full-game score rather than the clipped
-    learning reward.  This log is diagnostic only; FT uses periodic test curves.
-    """
+    """Log full-game episode records across Gymnasium vector-info layouts."""
 
     def log_episode(ep_return, ep_length):
-        writer.add_scalar("charts/episodic_return", float(ep_return), global_step)
-        writer.add_scalar("charts/episodic_length", float(ep_length), global_step)
+        ep_return = float(np.asarray(ep_return).reshape(-1)[0])
+        ep_length = float(np.asarray(ep_length).reshape(-1)[0])
+        writer.add_scalar("charts/episodic_return", ep_return, global_step)
+        writer.add_scalar("charts/episodic_length", ep_length, global_step)
         if success_threshold is not None:
             writer.add_scalar(
                 "charts/success",
-                float(float(ep_return) >= float(success_threshold)),
+                float(ep_return >= float(success_threshold)),
                 global_step,
             )
 
@@ -260,12 +254,11 @@ def _log_finished_episodes(writer, infos, global_step, success_threshold=None):
         fi = infos["final_info"]
         mask = infos.get("_final_info", np.ones(1, dtype=bool))
         for idx, enabled in enumerate(mask):
-            if not enabled:
-                continue
-            if "episode" in fi:
-                ep_r = np.asarray(fi["episode"]["r"])[idx]
-                ep_l = np.asarray(fi["episode"]["l"])[idx]
-                log_episode(ep_r, ep_l)
+            if enabled and "episode" in fi:
+                log_episode(
+                    np.asarray(fi["episode"]["r"])[idx],
+                    np.asarray(fi["episode"]["l"])[idx],
+                )
         return
 
     if "episode" in infos:
@@ -277,213 +270,275 @@ def _log_finished_episodes(writer, infos, global_step, success_threshold=None):
                 log_episode(r[idx], l[idx])
 
 
-def collect_merge_buffer(agent, envs, target_rows, task_id, seq_idx, device, seed):
-    """Collect raw uint8 reference frames for behavioral KL/distillation."""
-    if target_rows <= 0:
+def collect_merge_buffer(agent, envs, steps, task_id, seq_idx, device, seed):
+    """Collect exactly ``steps`` frozen-policy transitions as raw uint8 stacks.
+
+    Callers use a one-environment vector env, so one loop iteration is exactly
+    one environment transition. This avoids silently exceeding B because of
+    vector-env parallelism.
+    """
+    if steps <= 0:
         return None, 0.0
+    if envs.num_envs != 1:
+        raise ValueError("frozen-tail collection must use exactly one environment")
+
     obs, _ = envs.reset(seed=seed)
-    obs_parts, action_parts = [], []
+    obs_rows, action_rows = [], []
     start = time.time()
-    rows = 0
     agent.eval()
-    while rows < target_rows:
+
+    for _ in range(int(steps)):
         raw = np.asarray(obs)
-        x = torch.as_tensor(raw, dtype=torch.float32, device=device) / 255.0
+        x = torch.as_tensor(raw, dtype=torch.float32, device=device).div_(255.0)
         with torch.no_grad():
             action = agent.action_distribution(x).sample()
         action_np = action.cpu().numpy()
-        obs_parts.append(raw.astype(np.uint8, copy=True))
-        action_parts.append(action_np.astype(np.int16, copy=True))
+        obs_rows.append(raw.copy())
+        action_rows.append(action_np.copy())
         obs, _, _, _, _ = envs.step(action_np)
-        rows += raw.shape[0]
 
-    obs_arr = np.concatenate(obs_parts, axis=0)[:target_rows]
-    action_arr = np.concatenate(action_parts, axis=0)[:target_rows]
+    obs_arr = np.concatenate(obs_rows, axis=0).astype(np.uint8, copy=False)
+    action_arr = np.concatenate(action_rows, axis=0).astype(np.int16, copy=False)
     buffer = {
-        "obs": obs_arr.astype(np.uint8, copy=False),
-        "actions": action_arr.astype(np.int16, copy=False),
-        "task_ids": np.full(target_rows, int(task_id), dtype=np.int16),
-        "source_ids": np.full(target_rows, int(seq_idx), dtype=np.int16),
+        "obs": obs_arr,
+        "actions": action_arr,
+        "task_ids": np.full(len(obs_arr), int(task_id), dtype=np.int32),
+        "source_ids": np.full(len(obs_arr), int(seq_idx), dtype=np.int32),
     }
+    if len(obs_arr) != int(steps):
+        raise RuntimeError(
+            f"frozen-tail accounting error: collected {len(obs_arr)} rows for B={steps}"
+        )
     return buffer, time.time() - start
 
 
-def _effective_policy_vector(agent: CkaRlAgent) -> torch.Tensor:
-    with torch.no_grad():
-        return torch.cat(
-            [tensor.reshape(-1) for tensor in agent.policy_pool._effective()], dim=0
-        )
-
-
-def _module_l2_norm(module: nn.Module) -> float:
-    with torch.no_grad():
-        params = [p.detach().reshape(-1) for p in module.parameters()]
-        if not params:
-            return 0.0
-        return float(torch.cat(params).norm().item())
-
-
-def _save_analysis_snapshot(
-    path,
-    stage,
-    step,
-    args,
-    agent,
-    *,
-    include_effective=True,
-    task_start_policy=None,
-):
-    """Save Atari equivalents of start/pre_finalize/post_finalize snapshots."""
-    path = pathlib.Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "stage": str(stage),
-        "step": int(step),
-        "args": asdict(args),
-        "encoder_state_dict": {
-            k: v.detach().cpu().clone() for k, v in agent.fc.state_dict().items()
-        },
-        "critic_state_dict": {
-            k: v.detach().cpu().clone() for k, v in agent.critic.state_dict().items()
-        },
-        "pool_length": int(agent.policy_pool.pool_length()),
-        "alpha": None if agent.alpha is None else agent.alpha.detach().cpu().clone(),
-        "alpha_scale": (
-            None
-            if agent.alpha_scale is None
-            else agent.alpha_scale.detach().cpu().clone()
-        ),
-        "alpha_mass": (
-            None if agent.alpha_mass is None else agent.alpha_mass.detach().cpu().clone()
-        ),
-        "merge_info": agent.get_merge_info(),
-        "distill_metrics": agent.get_distill_metrics(),
-    }
-    if include_effective:
-        payload["effective_policy"] = _effective_policy_vector(agent).detach().cpu()
-        if task_start_policy is not None:
-            current = payload["effective_policy"]
-            start = task_start_policy.detach().cpu()
-            payload["effective_policy_delta_l2"] = float((current - start).norm())
-    torch.save(payload, path)
-
-
-def _log_analysis_state(writer, step, agent, task_start_policy):
-    """Lightweight periodic Atari training-state diagnostics."""
-    writer.add_scalar("analysis/encoder/l2_norm", _module_l2_norm(agent.fc), step)
-    writer.add_scalar("analysis/critic/l2_norm", _module_l2_norm(agent.critic), step)
-    writer.add_scalar(
-        "analysis/pool/current_length", int(agent.policy_pool.pool_length()), step
+def _drift_penalty(agent, old_fc, past_obs_pool, batch_size, device, coefficient):
+    if old_fc is None or past_obs_pool is None or coefficient <= 0:
+        return None
+    count = min(int(batch_size), len(past_obs_pool))
+    idx = np.random.randint(0, len(past_obs_pool), size=count)
+    states = (
+        torch.as_tensor(past_obs_pool[idx], dtype=torch.float32, device=device)
+        .div_(255.0)
     )
+    with torch.no_grad():
+        old_features = old_fc(states)
+    current_features = agent.fc(states)
+    return float(coefficient) * F.mse_loss(current_features, old_features)
 
-    current = _effective_policy_vector(agent)
-    writer.add_scalar("analysis/policy/effective_l2_norm", float(current.norm()), step)
-    if task_start_policy is not None and current.numel() == task_start_policy.numel():
-        writer.add_scalar(
-            "analysis/policy/delta_from_task_start_l2",
-            float((current - task_start_policy).norm()),
-            step,
-        )
 
-    if agent.alpha is not None:
-        scale = agent.alpha_scale if agent.alpha_scale is not None else 1.0
-        probs = torch.softmax(agent.alpha.detach() * scale.detach(), dim=0)
-        entropy = -(probs * (probs + 1e-12).log()).sum()
-        writer.add_scalar("analysis/policy/alpha_entropy", float(entropy), step)
-        writer.add_scalar("analysis/policy/alpha_max", float(probs.max()), step)
+def _value_loss(args, newvalue, oldvalue, returns):
+    newvalue = newvalue.view(-1)
+    if args.clip_vloss:
+        v_unclipped = (newvalue - returns) ** 2
+        v_clipped_pred = oldvalue + torch.clamp(
+            newvalue - oldvalue, -args.clip_coef, args.clip_coef
+        )
+        v_clipped = (v_clipped_pred - returns) ** 2
+        return 0.5 * torch.max(v_unclipped, v_clipped).mean()
+    return 0.5 * ((newvalue - returns) ** 2).mean()
 
-    if agent.alpha_mass is not None:
-        writer.add_scalar(
-            "analysis/policy/alpha_mass_raw", float(agent.alpha_mass.detach().item()), step
-        )
-        writer.add_scalar(
-            "analysis/policy/alpha_mass_effective",
-            float(agent.policy_pool.effective_alpha_mass().detach().item()),
-            step,
-        )
+
+def _ppo_policy_loss(args, newlogprob, oldlogprob, advantage):
+    logratio = newlogprob - oldlogprob
+    ratio = logratio.exp()
+    pg = torch.max(
+        -advantage * ratio,
+        -advantage * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef),
+    ).mean()
+    return pg, logratio, ratio
 
 
 def validate_args(args):
+    if args.distill_buffer_steps is not None:
+        args.distill_extra_steps = int(args.distill_buffer_steps)
+
     if args.task_id < 0 or args.task_id >= len(TASK_SUITES[args.task_suite]):
         raise ValueError(f"invalid task_id={args.task_id} for {args.task_suite}")
+    budget = TaskBudget(args.total_timesteps, args.distill_extra_steps)
+
     if args.pool_size < 2:
-        raise ValueError("pool_size must be >=2")
+        raise ValueError("pool_size must be >= 2")
+    if args.num_envs < 1 or args.num_steps < 1:
+        raise ValueError("num_envs and num_steps must be >= 1")
+    if budget.training < args.num_envs:
+        raise ValueError("Delta-B must contain at least one vector-environment step")
+    if budget.training % args.num_envs != 0:
+        raise ValueError(
+            "Delta-B must be divisible by num_envs so PPO can use exactly the "
+            "requested environment-transition budget without overshoot"
+        )
+    if args.num_minibatches < 1 or args.update_epochs < 1:
+        raise ValueError("num_minibatches and update_epochs must be >= 1")
+    if args.num_envs * args.num_steps < args.num_minibatches:
+        raise ValueError("num_minibatches cannot exceed a full PPO rollout")
+    if args.learning_rate <= 0 or args.alpha_learning_rate <= 0:
+        raise ValueError("learning rates must be > 0")
+    if args.alpha_mass_learning_rate is not None and args.alpha_mass_learning_rate <= 0:
+        raise ValueError("alpha_mass_learning_rate must be > 0 when specified")
+    if not 0 < args.gamma <= 1 or not 0 <= args.gae_lambda <= 1:
+        raise ValueError("gamma must be in (0,1] and gae_lambda in [0,1]")
+    if args.clip_coef <= 0 or args.max_grad_norm <= 0:
+        raise ValueError("clip_coef and max_grad_norm must be > 0")
+    if args.ent_coef < 0 or args.vf_coef < 0:
+        raise ValueError("ent_coef and vf_coef must be >= 0")
+    if args.target_kl is not None and args.target_kl <= 0:
+        raise ValueError("target_kl must be > 0 when specified")
+    if args.eval_every < 0 or args.num_evals < 1:
+        raise ValueError("eval_every must be >= 0 and num_evals must be >= 1")
+    if args.analysis_log_every < 0:
+        raise ValueError("analysis_log_every must be >= 0")
+
     if args.fusion_mode == "classic_cka" and args.use_alpha_mass:
         raise ValueError("alpha_mass is only valid with fusion_mode='weight_delta'")
     if args.use_alpha_scale and args.fix_alpha_scale:
         raise ValueError("use_alpha_scale and fix_alpha_scale are mutually exclusive")
     if args.train_shared and args.freeze_root_encoder:
         raise ValueError("train_shared and freeze_root_encoder are contradictory")
-    if args.learning_rate <= 0 or args.alpha_learning_rate <= 0:
-        raise ValueError("learning rates must be > 0")
-    if not 0.0 < args.gamma <= 1.0:
-        raise ValueError("gamma must be in (0, 1]")
-    if not 0.0 <= args.gae_lambda <= 1.0:
-        raise ValueError("gae_lambda must be in [0, 1]")
-    if args.clip_coef <= 0 or args.max_grad_norm <= 0:
-        raise ValueError("clip_coef and max_grad_norm must be > 0")
-    if args.ent_coef < 0 or args.vf_coef < 0:
-        raise ValueError("ent_coef and vf_coef must be >= 0")
-    if args.target_kl is not None and args.target_kl <= 0:
-        raise ValueError("target_kl must be > 0 when provided")
+    if args.alpha_warmup_steps < 0:
+        raise ValueError("alpha_warmup_steps must be >= 0")
+    if args.alpha_entropy_reg < 0 or args.alpha_mass_reg < 0 or args.drift_reg < 0:
+        raise ValueError("alpha/drift regularizers must be >= 0")
     if args.distill_encoder_lr_mult <= 0:
         raise ValueError("distill_encoder_lr_mult must be > 0")
-    if args.drift_reg < 0 or args.alpha_entropy_reg < 0 or args.alpha_mass_reg < 0:
-        raise ValueError("drift/alpha regularizers must be >= 0")
-    if args.total_timesteps < 1 or args.num_envs < 1 or args.num_steps < 1:
-        raise ValueError("total_timesteps, num_envs and num_steps must be >= 1")
-    if args.num_minibatches < 1 or args.update_epochs < 1:
-        raise ValueError("num_minibatches and update_epochs must be >= 1")
-    batch_size = args.num_envs * args.num_steps
-    if batch_size % args.num_minibatches != 0:
-        raise ValueError("num_envs*num_steps must be divisible by num_minibatches")
-    if args.total_timesteps < batch_size:
-        raise ValueError(
-            "total_timesteps must be at least one PPO rollout "
-            f"({batch_size} environment steps)"
-        )
-    if args.eval_every < 0 or args.num_evals < 1:
-        raise ValueError("eval_every must be >=0 and num_evals must be >=1")
-    if args.alpha_warmup_steps < 0:
-        raise ValueError("alpha_warmup_steps must be >=0")
-    if args.similarity_samples < 2:
-        raise ValueError("similarity_samples must be >=2")
-    if args.max_distill_buffer < 2:
-        raise ValueError("max_distill_buffer must be >=2")
-    if args.distill_max_samples < 2:
-        raise ValueError("distill_max_samples must be >=2")
+
+    if args.composition_space == "policy":
+        if budget.frozen_tail < 2:
+            raise ValueError("policy composition requires B >= 2 for storage projection")
+        if args.projection_epochs < 1 or args.projection_max_samples < 2:
+            raise ValueError("policy composition requires a nonempty projection budget")
+        if args.use_alpha_mass and not args.constrain_alpha_mass:
+            raise ValueError("policy mixtures require constrained sigmoid alpha-mass")
+    if args.policy_student_replay:
+        if args.composition_space != "policy":
+            raise ValueError("policy_student_replay requires composition_space='policy'")
+        if args.fusion_mode != "weight_delta" or not args.use_alpha_mass:
+            raise ValueError("policy_student_replay requires weight_delta with alpha-mass")
+        if not args.distillation:
+            raise ValueError("policy_student_replay is the combined distillation variant")
+
+    if args.similarity_samples < 2 or args.max_distill_buffer < 2 or args.distill_max_samples < 2:
+        raise ValueError("similarity/distillation sample budgets must be >= 2")
     if args.distill_batch_size < 1:
-        raise ValueError("distill_batch_size must be >=1")
+        raise ValueError("distill_batch_size must be >= 1")
     if not 0 <= args.distill_test_frac < 1:
         raise ValueError("distill_test_frac must be in [0,1)")
     if args.distillation and args.distill_epochs < 1:
-        raise ValueError("distill_epochs must be >=1 when distillation is enabled")
-    if (args.distillation or args.collect_cosine_buffers) and args.distill_extra_steps <= 0:
-        raise ValueError(
-            "distill_extra_steps must be >0 when a merge/reference buffer is collected"
-        )
-    if args.distill_extra_steps < 0:
-        raise ValueError("distill_extra_steps must be >=0")
-    if args.analysis_log_every < 0:
-        raise ValueError("analysis_log_every must be >=0")
+        raise ValueError("distill_epochs must be >= 1 when distillation is enabled")
+    if (
+        args.distillation
+        or args.collect_cosine_buffers
+        or args.composition_space == "policy"
+    ) and budget.frozen_tail < 1:
+        raise ValueError("this configuration requires B >= 1")
+
+    return budget
+
+
+def _optimizer_parameter_groups(agent, args):
+    encoder_ids = {id(p) for p in agent.fc.parameters()}
+    route_params = []
+    if agent.alpha is not None and agent.alpha.requires_grad:
+        route_params.append(agent.alpha)
+    if agent.alpha_scale is not None and agent.alpha_scale.requires_grad:
+        route_params.append(agent.alpha_scale)
+    mass_params = []
+    if agent.alpha_mass is not None and agent.alpha_mass.requires_grad:
+        mass_params.append(agent.alpha_mass)
+    alpha_ids = {id(p) for p in route_params + mass_params}
+
+    encoder_params, other_params = [], []
+    for p in agent.parameters():
+        if not p.requires_grad or id(p) in alpha_ids:
+            continue
+        if id(p) in encoder_ids:
+            encoder_params.append(p)
+        else:
+            other_params.append(p)
+
+    encoder_lr = args.learning_rate
+    if args.prev_units and args.distillation and args.train_shared:
+        encoder_lr *= args.distill_encoder_lr_mult
+
+    groups = []
+    if other_params:
+        groups.append({"params": other_params, "lr": args.learning_rate})
+    if encoder_params:
+        groups.append({"params": encoder_params, "lr": encoder_lr})
+    if not groups:
+        raise RuntimeError("No non-routing PPO parameters are trainable")
+
+    main_optimizer = optim.Adam(groups, betas=(0.9, 0.999), eps=1e-5)
+    route_optimizer = (
+        optim.Adam(route_params, lr=args.alpha_learning_rate, betas=(0.9, 0.999), eps=1e-5)
+        if route_params
+        else None
+    )
+    mass_lr = (
+        args.alpha_learning_rate
+        if args.alpha_mass_learning_rate is None
+        else args.alpha_mass_learning_rate
+    )
+    mass_optimizer = (
+        optim.Adam(mass_params, lr=mass_lr, betas=(0.9, 0.999), eps=1e-5)
+        if mass_params
+        else None
+    )
+    return {
+        "main": main_optimizer,
+        "route": route_optimizer,
+        "mass": mass_optimizer,
+        "encoder_params": encoder_params,
+        "other_params": other_params,
+        "route_params": route_params,
+        "mass_params": mass_params,
+        "initial_main_lrs": [float(group["lr"]) for group in main_optimizer.param_groups],
+        "mass_lr": float(mass_lr),
+    }
+
+
+def _anneal_optimizers(opts, args, progress):
+    if not args.anneal_lr:
+        return
+    frac = max(0.0, 1.0 - float(progress))
+    for group, initial_lr in zip(opts["main"].param_groups, opts["initial_main_lrs"]):
+        group["lr"] = frac * initial_lr
+    if opts["route"] is not None:
+        opts["route"].param_groups[0]["lr"] = frac * args.alpha_learning_rate
+    if opts["mass"] is not None:
+        opts["mass"].param_groups[0]["lr"] = frac * opts["mass_lr"]
+
+
+def _zero_optimizers(opts):
+    opts["main"].zero_grad(set_to_none=True)
+    if opts["route"] is not None:
+        opts["route"].zero_grad(set_to_none=True)
+    if opts["mass"] is not None:
+        opts["mass"].zero_grad(set_to_none=True)
+
+
+def _step_routing_optimizers(opts):
+    if opts["route"] is not None:
+        opts["route"].step()
+    if opts["mass"] is not None:
+        opts["mass"].step()
 
 
 def main():
     args = tyro.cli(Args)
-    validate_args(args)
+    budget = validate_args(args)
 
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
-    torch.backends.cudnn.benchmark = not args.torch_deterministic
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     run_name = f"{args.task_suite}__task_{args.task_id}__cka-rl__run_ppo__{args.seed}"
     task_name = get_task_name(args.task_id, args.task_suite)
     event_dir = pathlib.Path(args.runs_root) / args.tag / run_name
     analysis_dir = pathlib.Path(args.analysis_root) / args.tag / run_name
-    writer = SummaryWriter(str(event_dir))
+    writer = CsvSummaryWriter(str(event_dir))
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n" + "\n".join(f"|{k}|{v}|" for k, v in vars(args).items()),
@@ -524,18 +579,19 @@ def main():
         distill_batch_size=args.distill_batch_size,
         distill_max_samples=args.distill_max_samples,
         similarity_samples=args.similarity_samples,
+        balance_source_lineages=args.balance_source_lineages,
         hidden_dim=args.head_hidden_dim,
         shared_dim=args.shared_dim,
         train_shared=args.train_shared,
         freeze_root_encoder=args.freeze_root_encoder,
         pretrained_encoder=args.pretrained_encoder,
+        composition_space=args.composition_space,
+        projection_epochs=args.projection_epochs,
+        projection_max_samples=args.projection_max_samples,
+        policy_student_replay=args.policy_student_replay,
     ).to(device)
-    agent.log_alphas()
 
-    # ------------------------------------------------------------------
-    # Historical representation stabilization for train_shared=True.
-    # This is the CNN analogue of the HalfCheetah drift regularizer.
-    # ------------------------------------------------------------------
+    # Optional historical encoder stabilization.
     old_fc = None
     past_obs_pool = None
     if args.seq_idx > 0 and args.train_shared and args.distillation:
@@ -543,7 +599,6 @@ def main():
         old_fc.eval()
         for p in old_fc.parameters():
             p.requires_grad_(False)
-
         past_obs = [
             entry["buffer"]["obs"]
             for entry in agent.policy_pool.pool
@@ -553,45 +608,10 @@ def main():
         ]
         if past_obs:
             past_obs_pool = np.concatenate(past_obs, axis=0)
-            logger.info(
-                f"encoder-drift reference pool: {len(past_obs_pool)} historical frames"
-            )
 
-    # Separate alpha optimizer, as in the legacy Atari CKA code.
-    alpha_params = [
-        p
-        for n, p in agent.named_parameters()
-        if p.requires_grad and "alpha" in n
-    ]
-    nonalpha_named = [
-        (n, p)
-        for n, p in agent.named_parameters()
-        if p.requires_grad and "alpha" not in n
-    ]
-    encoder_ids = {id(p) for p in agent.fc.parameters()}
-    encoder_params = [p for _, p in nonalpha_named if id(p) in encoder_ids]
-    other_params = [p for _, p in nonalpha_named if id(p) not in encoder_ids]
+    opts = _optimizer_parameter_groups(agent, args)
 
-    groups = []
-    if other_params:
-        groups.append({"params": other_params, "lr": args.learning_rate})
-    if encoder_params:
-        encoder_lr = args.learning_rate
-        if args.prev_units and args.distillation and args.train_shared:
-            encoder_lr *= args.distill_encoder_lr_mult
-        groups.append({"params": encoder_params, "lr": encoder_lr})
-    if not groups:
-        raise RuntimeError("No non-alpha PPO parameters are trainable")
-
-    optimizer = optim.Adam(groups, eps=1e-5)
-    initial_group_lrs = [float(g["lr"]) for g in optimizer.param_groups]
-    alpha_optimizer = (
-        optim.Adam(alpha_params, lr=args.alpha_learning_rate, eps=1e-5)
-        if alpha_params
-        else None
-    )
-
-    # Verify that the default/frozen continual encoder really remains fixed.
+    # Verify frozen encoder really remains fixed.
     encoder_should_be_frozen = bool(
         not args.train_shared
         and (
@@ -606,29 +626,17 @@ def main():
             raise RuntimeError("encoder should be frozen but some parameters require grad")
         optimizer_ids = {
             id(p)
-            for group in optimizer.param_groups
+            for group in opts["main"].param_groups
             for p in group["params"]
         }
-        leaked = [p for p in agent.fc.parameters() if id(p) in optimizer_ids]
-        if leaked:
+        if any(id(p) in optimizer_ids for p in agent.fc.parameters()):
             raise RuntimeError("frozen encoder parameters leaked into PPO optimizer")
         with torch.no_grad():
             encoder_fingerprint = torch.cat(
                 [p.detach().reshape(-1) for p in agent.fc.parameters()]
             ).clone()
 
-    batch_size = args.num_envs * args.num_steps
-    minibatch_size = batch_size // args.num_minibatches
-    num_iterations = args.total_timesteps // batch_size
-    actual_total_timesteps = num_iterations * batch_size
-    if actual_total_timesteps != args.total_timesteps:
-        logger.warning(
-            f"requested total_timesteps={args.total_timesteps}, but PPO uses complete "
-            f"rollouts of {batch_size} steps; actual_total_timesteps={actual_total_timesteps}"
-        )
-    writer.add_scalar("timing/requested_total_timesteps", args.total_timesteps, 0)
-    writer.add_scalar("timing/actual_total_timesteps", actual_total_timesteps, 0)
-
+    # Max-size buffers; the final PPO rollout may be shorter so Delta-B is exact.
     obs_buf = torch.zeros((args.num_steps, args.num_envs) + obs_shape, device=device)
     actions_buf = torch.zeros((args.num_steps, args.num_envs), device=device)
     logprobs_buf = torch.zeros((args.num_steps, args.num_envs), device=device)
@@ -644,53 +652,82 @@ def main():
     next_analysis = args.analysis_log_every if args.analysis_log_every > 0 else None
     start_time = time.time()
 
-    task_start_policy = _effective_policy_vector(agent).detach().clone()
+    agent.set_mixture_warmup(
+        mixture_warmup_active(
+            0, 0, args.alpha_warmup_steps, args.fusion_mode, agent.policy_pool.pool_length()
+        )
+    )
+    theta_task_start = effective_theta_vector(agent).detach().clone()
     if args.save_analysis_snapshots:
-        _save_analysis_snapshot(
+        save_task_snapshot(
             analysis_dir / "start.pt",
             "start",
             0,
             args,
             agent,
             include_effective=True,
-            task_start_policy=task_start_policy,
+            include_critic=True,
         )
-    _log_analysis_state(writer, 0, agent, task_start_policy)
-
-    # Zero-shot/task-start evaluation for transfer diagnostics.
+    log_training_state(writer, 0, agent, theta_task_start)
     evaluate(agent, args, device, 0, writer)
 
-    # Keep the most recent losses available for logging.
-    pg_loss = torch.tensor(float("nan"), device=device)
-    v_loss = torch.tensor(float("nan"), device=device)
-    entropy_loss = torch.tensor(float("nan"), device=device)
-    approx_kl = torch.tensor(float("nan"), device=device)
-    old_approx_kl = torch.tensor(float("nan"), device=device)
-    drift_loss = None
-    alpha_entropy = None
-    mass_loss = None
+    last_metrics = {
+        "pg_loss": float("nan"),
+        "value_loss": float("nan"),
+        "entropy": float("nan"),
+        "approx_kl": float("nan"),
+        "old_approx_kl": float("nan"),
+        "clipfrac": float("nan"),
+        "novel_policy_loss": float("nan"),
+        "mixture_policy_loss": float("nan"),
+    }
+    last_drift = None
+    last_alpha_entropy = None
+    last_mass_loss = None
 
-    for iteration in tqdm(range(1, num_iterations + 1)):
-        if args.anneal_lr:
-            frac = 1.0 - (iteration - 1.0) / max(num_iterations, 1)
-            for group, initial_lr in zip(optimizer.param_groups, initial_group_lrs):
-                group["lr"] = frac * initial_lr
-            if alpha_optimizer is not None:
-                alpha_optimizer.param_groups[0]["lr"] = (
-                    frac * args.alpha_learning_rate
-                )
+    total_vector_steps = budget.training // args.num_envs
+    completed_vector_steps = 0
+    pbar = tqdm(total=budget.training)
 
-        # --------------------------------------------------------------
-        # On-policy rollout.
-        # --------------------------------------------------------------
-        for step in range(args.num_steps):
-            global_step += args.num_envs
+    while completed_vector_steps < total_vector_steps:
+        remaining_vector_steps = total_vector_steps - completed_vector_steps
+        rollout_steps = min(args.num_steps, remaining_vector_steps)
+
+        # Do not let one PPO rollout straddle the routing-warmup boundary.
+        # Otherwise the behavior-policy provenance in one rollout would mix
+        # historical-only and post-warmup policies.
+        if mixture_warmup_active(
+            global_step,
+            0,
+            args.alpha_warmup_steps,
+            args.fusion_mode,
+            agent.policy_pool.pool_length(),
+        ):
+            transitions_to_boundary = max(args.alpha_warmup_steps - global_step, 1)
+            vector_steps_to_boundary = max(
+                1, (transitions_to_boundary + args.num_envs - 1) // args.num_envs
+            )
+            rollout_steps = min(rollout_steps, vector_steps_to_boundary)
+
+        current_batch = rollout_steps * args.num_envs
+        progress = global_step / max(budget.training, 1)
+        _anneal_optimizers(opts, args, progress)
+
+        mixture_warmup = mixture_warmup_active(
+            global_step,
+            0,
+            args.alpha_warmup_steps,
+            args.fusion_mode,
+            agent.policy_pool.pool_length(),
+        )
+        agent.set_mixture_warmup(mixture_warmup)
+
+        # ---------------------------- rollout ----------------------------
+        for step in range(rollout_steps):
             obs_buf[step] = next_obs
             dones_buf[step] = next_done
             with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(
-                    next_obs / 255.0
-                )
+                action, logprob, _, value = agent.get_action_and_value(next_obs / 255.0)
             actions_buf[step] = action
             logprobs_buf[step] = logprob
             values_buf[step] = value.flatten()
@@ -698,29 +735,25 @@ def main():
             next_obs_np, reward, terminations, truncations, infos = envs.step(
                 action.cpu().numpy()
             )
-            _log_finished_episodes(
-                writer, infos, global_step, args.success_threshold
-            )
+            global_step += args.num_envs
+            completed_vector_steps += 1
+            pbar.update(args.num_envs)
+            _log_finished_episodes(writer, infos, global_step, args.success_threshold)
+
             next_done_np = np.logical_or(terminations, truncations)
             rewards_buf[step] = torch.as_tensor(
                 reward, dtype=torch.float32, device=device
             )
-            next_obs = torch.as_tensor(
-                next_obs_np, dtype=torch.float32, device=device
-            )
-            next_done = torch.as_tensor(
-                next_done_np, dtype=torch.float32, device=device
-            )
+            next_obs = torch.as_tensor(next_obs_np, dtype=torch.float32, device=device)
+            next_done = torch.as_tensor(next_done_np, dtype=torch.float32, device=device)
 
-        # --------------------------------------------------------------
-        # GAE / returns.
-        # --------------------------------------------------------------
+        # ----------------------------- GAE -------------------------------
         with torch.no_grad():
             next_value = agent.get_value(next_obs / 255.0).reshape(1, -1)
-            advantages = torch.zeros_like(rewards_buf)
+            advantages = torch.zeros((rollout_steps, args.num_envs), device=device)
             lastgaelam = 0
-            for t in reversed(range(args.num_steps)):
-                if t == args.num_steps - 1:
+            for t in reversed(range(rollout_steps)):
+                if t == rollout_steps - 1:
                     nextnonterminal = 1.0 - next_done
                     nextvalues = next_value
                 else:
@@ -733,300 +766,318 @@ def main():
                 )
                 advantages[t] = lastgaelam = (
                     delta
-                    + args.gamma
-                    * args.gae_lambda
-                    * nextnonterminal
-                    * lastgaelam
+                    + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
                 )
-            returns = advantages + values_buf
+            returns = advantages + values_buf[:rollout_steps]
 
-        b_obs = obs_buf.reshape((-1,) + obs_shape)
-        b_logprobs = logprobs_buf.reshape(-1)
-        b_actions = actions_buf.reshape(-1).long()
+        b_obs = obs_buf[:rollout_steps].reshape((-1,) + obs_shape)
+        b_old_logprobs = logprobs_buf[:rollout_steps].reshape(-1)
+        b_actions = actions_buf[:rollout_steps].reshape(-1).long()
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
-        b_values = values_buf.reshape(-1)
-        inds = np.arange(batch_size)
+        b_values = values_buf[:rollout_steps].reshape(-1)
+        inds = np.arange(current_batch)
         clipfracs = []
 
-        # --------------------------------------------------------------
-        # PPO updates.
-        # --------------------------------------------------------------
+        # ----------------------------- PPO -------------------------------
+        stop_for_kl = False
         for _epoch in range(args.update_epochs):
             np.random.shuffle(inds)
-            for start in range(0, batch_size, minibatch_size):
-                mb = inds[start : start + minibatch_size]
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(
-                    b_obs[mb] / 255.0, b_actions[mb]
-                )
-                logratio = newlogprob - b_logprobs[mb]
-                ratio = logratio.exp()
+            minibatches = [x for x in np.array_split(inds, min(args.num_minibatches, current_batch)) if len(x)]
+            for mb_np in minibatches:
+                mb = torch.as_tensor(mb_np, dtype=torch.long, device=device)
+                mb_adv = b_advantages[mb]
+                if args.norm_adv and mb_adv.numel() > 1:
+                    mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
+
+                last_drift = None
+                last_alpha_entropy = None
+                last_mass_loss = None
+
+                if args.policy_student_replay:
+                    # The rollout was generated by the EXECUTION MIXTURE. The
+                    # novel student therefore uses the recorded mixture
+                    # log-probability as its behavior-policy denominator; it is
+                    # never treated as though the student generated the action.
+                    newvalue = agent.get_value(b_obs[mb] / 255.0)
+                    v_loss = _value_loss(args, newvalue, b_values[mb], b_returns[mb])
+
+                    if not mixture_warmup:
+                        novel_logits = agent.novel_policy_logits(b_obs[mb] / 255.0)
+                        novel_dist = Categorical(logits=novel_logits)
+                        novel_logprob = novel_dist.log_prob(b_actions[mb])
+                        novel_pg, _, _ = _ppo_policy_loss(
+                            args, novel_logprob, b_old_logprobs[mb], mb_adv
+                        )
+                        novel_entropy = novel_dist.entropy().mean()
+                        main_loss = novel_pg - args.ent_coef * novel_entropy + args.vf_coef * v_loss
+                        last_drift = _drift_penalty(
+                            agent, old_fc, past_obs_pool, len(mb_np), device, args.drift_reg
+                        )
+                        if last_drift is not None:
+                            main_loss = main_loss + last_drift
+                    else:
+                        novel_pg = None
+                        novel_entropy = None
+                        main_loss = args.vf_coef * v_loss
+
+                    opts["main"].zero_grad(set_to_none=True)
+                    main_loss.backward()
+                    if mixture_warmup:
+                        for p in opts["encoder_params"]:
+                            p.grad = None
+                    nn.utils.clip_grad_norm_(
+                        [p for group in opts["main"].param_groups for p in group["params"]],
+                        args.max_grad_norm,
+                    )
+                    opts["main"].step()
+
+                    # Routing update against the actual stored behavior mixture.
+                    dist = agent.routing_action_distribution(b_obs[mb] / 255.0)
+                    mix_logprob = dist.log_prob(b_actions[mb])
+                    mix_pg, logratio, ratio = _ppo_policy_loss(
+                        args, mix_logprob, b_old_logprobs[mb], mb_adv
+                    )
+                    mix_entropy = dist.entropy().mean()
+                    route_loss = mix_pg - args.ent_coef * mix_entropy
+
+                    if mixture_warmup and args.alpha_entropy_reg > 0 and agent.alpha is not None:
+                        scale = agent.alpha_scale if agent.alpha_scale is not None else 1.0
+                        probs = torch.softmax(agent.alpha * scale, dim=0)
+                        last_alpha_entropy = -(probs * torch.log(probs + 1e-8)).sum()
+                        route_loss = route_loss - args.alpha_entropy_reg * last_alpha_entropy
+                    if (
+                        not mixture_warmup
+                        and agent.alpha_mass is not None
+                        and agent.alpha_mass.requires_grad
+                        and args.alpha_mass_reg > 0
+                    ):
+                        eff_mass = agent.policy_pool.effective_alpha_mass()
+                        last_mass_loss = args.alpha_mass_reg * (eff_mass ** 2) * ((eff_mass - 1.0) ** 2)
+                        route_loss = route_loss + last_mass_loss.mean()
+
+                    if opts["route"] is not None or opts["mass"] is not None:
+                        if opts["route"] is not None:
+                            opts["route"].zero_grad(set_to_none=True)
+                        if opts["mass"] is not None:
+                            opts["mass"].zero_grad(set_to_none=True)
+                        route_loss.backward()
+                        routing_params = opts["route_params"] + opts["mass_params"]
+                        if routing_params:
+                            nn.utils.clip_grad_norm_(routing_params, args.max_grad_norm)
+                        _step_routing_optimizers(opts)
+
+                    pg_loss = mix_pg
+                    entropy_loss = mix_entropy
+                    last_metrics["novel_policy_loss"] = (
+                        float(novel_pg.detach()) if novel_pg is not None else float("nan")
+                    )
+                    last_metrics["mixture_policy_loss"] = float(mix_pg.detach())
+                else:
+                    _, newlogprob, entropy, newvalue = agent.get_action_and_value(
+                        b_obs[mb] / 255.0, b_actions[mb]
+                    )
+                    pg_loss, logratio, ratio = _ppo_policy_loss(
+                        args, newlogprob, b_old_logprobs[mb], mb_adv
+                    )
+                    v_loss = _value_loss(args, newvalue, b_values[mb], b_returns[mb])
+                    entropy_loss = entropy.mean()
+                    loss = pg_loss - args.ent_coef * entropy_loss + args.vf_coef * v_loss
+
+                    last_drift = _drift_penalty(
+                        agent, old_fc, past_obs_pool, len(mb_np), device, args.drift_reg
+                    )
+                    if last_drift is not None:
+                        loss = loss + last_drift
+                    if mixture_warmup and args.alpha_entropy_reg > 0 and agent.alpha is not None:
+                        scale = agent.alpha_scale if agent.alpha_scale is not None else 1.0
+                        probs = torch.softmax(agent.alpha * scale, dim=0)
+                        last_alpha_entropy = -(probs * torch.log(probs + 1e-8)).sum()
+                        loss = loss - args.alpha_entropy_reg * last_alpha_entropy
+                    if (
+                        not mixture_warmup
+                        and agent.alpha_mass is not None
+                        and agent.alpha_mass.requires_grad
+                        and args.alpha_mass_reg > 0
+                    ):
+                        eff_mass = agent.policy_pool.effective_alpha_mass()
+                        last_mass_loss = args.alpha_mass_reg * (eff_mass ** 2) * ((eff_mass - 1.0) ** 2)
+                        loss = loss + last_mass_loss.mean()
+
+                    _zero_optimizers(opts)
+                    loss.backward()
+                    if mixture_warmup:
+                        for p in (
+                            agent.policy_pool.own_l0_weight,
+                            agent.policy_pool.own_l0_bias,
+                            agent.policy_pool.own_l2_weight,
+                            agent.policy_pool.own_l2_bias,
+                            *opts["encoder_params"],
+                        ):
+                            p.grad = None
+                        if agent.alpha_mass is not None:
+                            agent.alpha_mass.grad = None
+                    nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                    opts["main"].step()
+                    _step_routing_optimizers(opts)
+
                 with torch.no_grad():
                     old_approx_kl = (-logratio).mean()
                     approx_kl = ((ratio - 1.0) - logratio).mean()
                     clipfracs.append(
-                        ((ratio - 1.0).abs() > args.clip_coef)
-                        .float()
-                        .mean()
-                        .item()
+                        ((ratio - 1.0).abs() > args.clip_coef).float().mean().item()
                     )
-
-                mb_adv = b_advantages[mb]
-                if args.norm_adv:
-                    mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
-
-                pg_loss = torch.max(
-                    -mb_adv * ratio,
-                    -mb_adv
-                    * torch.clamp(
-                        ratio, 1 - args.clip_coef, 1 + args.clip_coef
-                    ),
-                ).mean()
-
-                newvalue = newvalue.view(-1)
-                if args.clip_vloss:
-                    v_unclipped = (newvalue - b_returns[mb]) ** 2
-                    v_clipped_pred = b_values[mb] + torch.clamp(
-                        newvalue - b_values[mb],
-                        -args.clip_coef,
-                        args.clip_coef,
-                    )
-                    v_clipped = (v_clipped_pred - b_returns[mb]) ** 2
-                    v_loss = 0.5 * torch.max(v_unclipped, v_clipped).mean()
-                else:
-                    v_loss = 0.5 * ((newvalue - b_returns[mb]) ** 2).mean()
-
-                entropy_loss = entropy.mean()
-                loss = (
-                    pg_loss
-                    - args.ent_coef * entropy_loss
-                    + args.vf_coef * v_loss
-                )
-
-                # Historical encoder drift regularization: same continual
-                # principle as run_sac.py, with uint8 Atari frames normalized
-                # exactly as the policy input.
-                drift_loss = None
-                if (
-                    args.distillation
-                    and old_fc is not None
-                    and past_obs_pool is not None
-                    and args.drift_reg > 0
-                ):
-                    drift_count = min(len(mb), len(past_obs_pool))
-                    drift_idx = np.random.randint(
-                        0, len(past_obs_pool), size=drift_count
-                    )
-                    s_past = (
-                        torch.as_tensor(
-                            past_obs_pool[drift_idx],
-                            dtype=torch.float32,
-                            device=device,
-                        )
-                        / 255.0
-                    )
-                    with torch.no_grad():
-                        phi_old = old_fc(s_past)
-                    phi_curr = agent.fc(s_past)
-                    drift_loss = args.drift_reg * F.mse_loss(phi_curr, phi_old)
-                    loss = loss + drift_loss
-
-                # Preserve HalfCheetah weight-delta mixture warmup principle.
-                mixture_warmup = bool(
-                    args.fusion_mode == "weight_delta"
-                    and global_step < args.alpha_warmup_steps
-                    and agent.alpha is not None
-                    and agent.alpha.numel() > 1
-                )
-                alpha_entropy = None
-                if mixture_warmup and args.alpha_entropy_reg > 0:
-                    scale = (
-                        agent.alpha_scale
-                        if agent.alpha_scale is not None
-                        else 1.0
-                    )
-                    probs = torch.softmax(agent.alpha * scale, dim=0)
-                    alpha_entropy = -(
-                        probs * torch.log(probs + 1e-8)
-                    ).sum()
-                    loss = loss - args.alpha_entropy_reg * alpha_entropy
-
-                mass_loss = None
-                if (
-                    not mixture_warmup
-                    and agent.alpha_mass is not None
-                    and agent.alpha_mass.requires_grad
-                    and args.alpha_mass_reg > 0
-                ):
-                    eff_mass = agent.policy_pool.effective_alpha_mass()
-                    mass_loss = (
-                        args.alpha_mass_reg
-                        * (eff_mass**2)
-                        * ((eff_mass - 1.0) ** 2)
-                    )
-                    loss = loss + mass_loss.mean()
-
-                optimizer.zero_grad(set_to_none=True)
-                if alpha_optimizer is not None:
-                    alpha_optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-
-                # During the weight-delta warmup, learn historical mixture
-                # coefficients before allowing the new policy residual/mass to move.
-                if mixture_warmup:
-                    for p in (
-                        agent.policy_pool.own_l0_weight,
-                        agent.policy_pool.own_l0_bias,
-                        agent.policy_pool.own_l2_weight,
-                        agent.policy_pool.own_l2_bias,
-                    ):
-                        if p.grad is not None:
-                            p.grad.zero_()
-                    if (
-                        agent.alpha_mass is not None
-                        and agent.alpha_mass.grad is not None
-                    ):
-                        agent.alpha_mass.grad.zero_()
-
-                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
-                optimizer.step()
-                if alpha_optimizer is not None:
-                    alpha_optimizer.step()
-
-            if args.target_kl is not None and approx_kl > args.target_kl:
+                if args.target_kl is not None and approx_kl > args.target_kl:
+                    stop_for_kl = True
+                    break
+            if stop_for_kl:
                 break
 
-        # --------------------------------------------------------------
-        # PPO / continual diagnostics.
-        # --------------------------------------------------------------
+        # --------------------------- diagnostics -------------------------
         y_pred = b_values.detach().cpu().numpy()
         y_true = b_returns.detach().cpu().numpy()
         var_y = np.var(y_true)
-        explained_var = (
-            np.nan if var_y == 0 else 1.0 - np.var(y_true - y_pred) / var_y
+        explained_var = np.nan if var_y == 0 else 1.0 - np.var(y_true - y_pred) / var_y
+
+        last_metrics.update(
+            {
+                "pg_loss": float(pg_loss.detach()),
+                "value_loss": float(v_loss.detach()),
+                "entropy": float(entropy_loss.detach()),
+                "approx_kl": float(approx_kl.detach()),
+                "old_approx_kl": float(old_approx_kl.detach()),
+                "clipfrac": float(np.mean(clipfracs)) if clipfracs else float("nan"),
+            }
         )
 
-        writer.add_scalar(
-            "charts/learning_rate", optimizer.param_groups[0]["lr"], global_step
-        )
-        if alpha_optimizer is not None:
-            writer.add_scalar(
-                "charts/alpha_learning_rate",
-                alpha_optimizer.param_groups[0]["lr"],
-                global_step,
-            )
-        writer.add_scalar("losses/value_loss", float(v_loss.item()), global_step)
-        writer.add_scalar("losses/policy_loss", float(pg_loss.item()), global_step)
-        writer.add_scalar("losses/entropy", float(entropy_loss.item()), global_step)
-        writer.add_scalar(
-            "losses/old_approx_kl", float(old_approx_kl.item()), global_step
-        )
-        writer.add_scalar("losses/approx_kl", float(approx_kl.item()), global_step)
-        writer.add_scalar(
-            "losses/clipfrac",
-            float(np.mean(clipfracs)) if clipfracs else float("nan"),
-            global_step,
-        )
-        writer.add_scalar(
-            "losses/explained_variance", float(explained_var), global_step
-        )
-        if drift_loss is not None:
-            writer.add_scalar(
-                "losses/encoder_drift_reg", float(drift_loss.item()), global_step
-            )
-        if alpha_entropy is not None:
-            writer.add_scalar(
-                "losses/knowledge_alpha_entropy",
-                float(alpha_entropy.item()),
-                global_step,
-            )
-        if mass_loss is not None:
-            writer.add_scalar(
-                "losses/alpha_mass_reg", float(mass_loss.mean().item()), global_step
-            )
-        writer.add_scalar(
-            "charts/SPS",
-            int(global_step / max(time.time() - start_time, 1e-9)),
-            global_step,
-        )
+        writer.add_scalar("charts/learning_rate", opts["main"].param_groups[0]["lr"], global_step)
+        if opts["route"] is not None:
+            writer.add_scalar("charts/alpha_learning_rate", opts["route"].param_groups[0]["lr"], global_step)
+        if opts["mass"] is not None:
+            writer.add_scalar("charts/alpha_mass_learning_rate", opts["mass"].param_groups[0]["lr"], global_step)
+        writer.add_scalar("losses/value_loss", last_metrics["value_loss"], global_step)
+        writer.add_scalar("losses/policy_loss", last_metrics["pg_loss"], global_step)
+        writer.add_scalar("losses/entropy", last_metrics["entropy"], global_step)
+        writer.add_scalar("losses/old_approx_kl", last_metrics["old_approx_kl"], global_step)
+        writer.add_scalar("losses/approx_kl", last_metrics["approx_kl"], global_step)
+        writer.add_scalar("losses/clipfrac", last_metrics["clipfrac"], global_step)
+        writer.add_scalar("losses/explained_variance", float(explained_var), global_step)
+        if args.policy_student_replay:
+            if np.isfinite(last_metrics["novel_policy_loss"]):
+                writer.add_scalar("losses/novel_policy_loss", last_metrics["novel_policy_loss"], global_step)
+            if np.isfinite(last_metrics["mixture_policy_loss"]):
+                writer.add_scalar("losses/mixture_weight_policy_loss", last_metrics["mixture_policy_loss"], global_step)
+        if last_drift is not None:
+            writer.add_scalar("losses/encoder_drift_reg", float(last_drift.detach()), global_step)
+        if last_alpha_entropy is not None:
+            writer.add_scalar("losses/knowledge_alpha_entropy", float(last_alpha_entropy.detach()), global_step)
+        if last_mass_loss is not None:
+            writer.add_scalar("losses/alpha_mass_reg", float(last_mass_loss.mean().detach()), global_step)
+        writer.add_scalar("charts/SPS", int(global_step / max(time.time() - start_time, 1e-9)), global_step)
 
         if next_eval is not None and global_step >= next_eval:
             evaluate(agent, args, device, global_step, writer)
-            while next_eval <= global_step:
+            while next_eval is not None and next_eval <= global_step:
                 next_eval += args.eval_every
-
         if next_analysis is not None and global_step >= next_analysis:
-            _log_analysis_state(writer, global_step, agent, task_start_policy)
-            writer.add_scalar("analysis/checkpoint_marker", 1.0, global_step)
-            while next_analysis <= global_step:
+            log_training_state(writer, global_step, agent, theta_task_start)
+            while next_analysis is not None and next_analysis <= global_step:
                 next_analysis += args.analysis_log_every
 
-    # ------------------------------------------------------------------
-    # End-of-task checks and exact policy evaluation.
-    # ------------------------------------------------------------------
+    pbar.close()
+    if global_step != budget.training:
+        raise RuntimeError(
+            f"optimization budget mismatch: got {global_step}, expected {budget.training}"
+        )
+
     train_loop_seconds = time.time() - start_time
-    writer.add_scalar("timing/train_loop_seconds", train_loop_seconds, global_step)
+    writer.add_scalar("timing/train_loop_seconds", train_loop_seconds, budget.total)
     logger.info(
         f"TRAIN_LOOP_SECONDS={train_loop_seconds:.2f} | "
-        f"steps={global_step} | SPS={global_step / max(train_loop_seconds, 1e-9):.2f}"
+        f"optimization_transitions={budget.training}"
     )
 
     if encoder_should_be_frozen:
         with torch.no_grad():
-            current_encoder = torch.cat(
-                [p.detach().reshape(-1) for p in agent.fc.parameters()]
-            )
-            encoder_max_drift = float(
-                (current_encoder - encoder_fingerprint).abs().max().item()
-            )
-        writer.add_scalar(
-            "analysis/encoder/max_drift", encoder_max_drift, global_step
-        )
+            current_encoder = torch.cat([p.detach().reshape(-1) for p in agent.fc.parameters()])
+            encoder_max_drift = float((current_encoder - encoder_fingerprint).abs().max().item())
+        writer.add_scalar("analysis/encoder/max_drift", encoder_max_drift, budget.total)
         if encoder_max_drift != 0.0:
-            raise RuntimeError(
-                f"frozen shared encoder drifted by {encoder_max_drift}"
-            )
+            raise RuntimeError(f"frozen shared encoder drifted by {encoder_max_drift}")
 
-    _log_analysis_state(writer, global_step, agent, task_start_policy)
-    final_eval = evaluate(agent, args, device, global_step, writer)
+    # Exact pre-tail active policy at the end of the optimization phase.
+    agent.set_mixture_warmup(
+        mixture_warmup_active(
+            budget.training,
+            0,
+            args.alpha_warmup_steps,
+            args.fusion_mode,
+            agent.policy_pool.pool_length(),
+        )
+    )
+    evaluate(agent, args, device, budget.training, writer)
+    log_training_state(writer, budget.training, agent, theta_task_start)
+
+    # Every condition consumes the same frozen B interactions; only some retain them.
+    needs_buffer = bool(
+        args.distillation
+        or args.collect_cosine_buffers
+        or args.composition_space == "policy"
+    )
+    tail_buffer = None
+    buffer_seconds = 0.0
+    if budget.frozen_tail:
+        tail_envs = make_vector_env(args, num_envs=1)
+        try:
+            tail_buffer, buffer_seconds = collect_merge_buffer(
+                agent,
+                tail_envs,
+                budget.frozen_tail,
+                args.task_id,
+                args.seq_idx,
+                device,
+                args.seed + 123_456,
+            )
+        finally:
+            tail_envs.close()
+    merge_buffer = bounded_buffer(tail_buffer, args.max_distill_buffer) if needs_buffer else None
+
+    final_step = budget.total
+    writer.add_scalar("timing/merge_buffer_seconds", buffer_seconds, final_step)
+    writer.add_scalar("analysis/buffer/rows", 0 if merge_buffer is None else len(merge_buffer["obs"]), final_step)
+    writer.add_scalar("budget/optimization_phase_env_steps", budget.training, final_step)
+    writer.add_scalar("budget/frozen_tail_env_steps", budget.frozen_tail, final_step)
+    writer.add_scalar("budget/total_learning_env_steps", budget.total, final_step)
+
+    final_eval = evaluate(agent, args, device, final_step, writer)
+    agent.set_own_buffer(merge_buffer)
 
     run_dir = pathlib.Path(args.save_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
-
-    # Exact just-trained policy is saved BEFORE pool topology changes.
+    # Exact active policy before pool topology changes.
     agent.save_policy_snapshot(str(run_dir))
-
-    # Collect representative states after training, without changing weights.
-    needs_buffer = bool(args.distillation or args.collect_cosine_buffers)
-    merge_buffer = None
-    buffer_seconds = 0.0
-    if needs_buffer:
-        merge_buffer, buffer_seconds = collect_merge_buffer(
-            agent,
-            envs,
-            args.distill_extra_steps,
-            args.task_id,
-            args.seq_idx,
-            device,
-            args.seed + 77_777,
+    with (run_dir / "interaction_budget.json").open("w") as f:
+        json.dump(
+            {
+                "Delta": budget.total,
+                "optimization_phase_steps": budget.training,
+                "frozen_tail_steps": budget.frozen_tail,
+                "monitor_evaluation_steps": getattr(agent, "evaluation_env_steps", 0),
+                "evaluation_updates_policy": False,
+            },
+            f,
+            indent=2,
         )
-    writer.add_scalar("timing/merge_buffer_seconds", buffer_seconds, global_step)
-    writer.add_scalar(
-        "analysis/buffer/rows",
-        0 if merge_buffer is None else len(merge_buffer["obs"]),
-        global_step,
-    )
-    agent.set_own_buffer(merge_buffer)
 
     if args.save_analysis_snapshots:
-        _save_analysis_snapshot(
+        save_task_snapshot(
             analysis_dir / "pre_finalize.pt",
             "pre_finalize",
-            global_step,
+            final_step,
             args,
             agent,
             include_effective=True,
-            task_start_policy=task_start_policy,
+            include_critic=True,
         )
 
     t_finalize = time.time()
@@ -1035,42 +1086,32 @@ def main():
     else:
         agent.set_base()
     finalize_seconds = time.time() - t_finalize
-    writer.add_scalar("timing/finalize_seconds", finalize_seconds, global_step)
-    writer.add_scalar(
-        "analysis/pool/final_length", agent.policy_pool.pool_length(), global_step
-    )
+    writer.add_scalar("timing/finalize_seconds", finalize_seconds, final_step)
+    writer.add_scalar("analysis/pool/final_length", agent.policy_pool.pool_length(), final_step)
 
-    # Detailed merge diagnostics, matching run_sac.py's auditability.
+    for key, value in getattr(agent, "last_projection_metrics", {}).items():
+        if value is not None:
+            writer.add_scalar(key, float(value), final_step)
+    with (run_dir / "projection_metrics.json").open("w") as f:
+        json.dump(getattr(agent, "last_projection_metrics", {}), f, indent=2)
+
     info = agent.get_merge_info()
     if info:
-        scalar_keys = (
-            "idx1",
-            "idx2",
-            "similarity_states",
-            "cosine_similarity",
-            "pairwise_cosine_min",
-            "pairwise_cosine_mean",
-            "pairwise_cosine_max",
-            "symmetric_kl",
-            "pairwise_kl_min",
-            "pairwise_kl_mean",
-            "pairwise_kl_max",
-            "selected_state_kl_p95",
-            "selected_state_kl_max",
-            "pool_size_before",
-            "pool_size_after",
-        )
-        for key in scalar_keys:
+        for key in (
+            "idx1", "idx2", "similarity_states",
+            "cosine_similarity", "pairwise_cosine_min", "pairwise_cosine_mean", "pairwise_cosine_max",
+            "symmetric_kl", "pairwise_kl_min", "pairwise_kl_mean", "pairwise_kl_max",
+            "selected_state_kl_p95", "selected_state_kl_max",
+            "pool_size_before", "pool_size_after",
+        ):
             value = info.get(key)
             if value is not None and np.isscalar(value):
-                writer.add_scalar(f"analysis/merge/{key}", float(value), global_step)
-        if "used_distillation" in info:
-            writer.add_scalar(
-                "analysis/merge/used_distillation",
-                float(bool(info["used_distillation"])),
-                global_step,
-            )
-
+                writer.add_scalar(f"analysis/merge/{key}", float(value), final_step)
+        writer.add_scalar("analysis/merge/used_distillation", float(bool(info.get("used_distillation", False))), final_step)
+        writer.add_scalar("analysis/merge/balance_source_lineages", float(bool(info.get("balance_source_lineages", False))), final_step)
+        writer.add_scalar("analysis/merge/source_lineages_parent_1", len(info.get("parent_1_source_lineage", {})), final_step)
+        writer.add_scalar("analysis/merge/source_lineages_parent_2", len(info.get("parent_2_source_lineage", {})), final_step)
+        writer.add_scalar("analysis/merge/source_lineages_merged", len(info.get("merged_source_lineage", {})), final_step)
         lineage = {
             "task_ids": {
                 "parent_1": info.get("parent_1_lineage", {}),
@@ -1083,59 +1124,40 @@ def main():
                 "merged": info.get("merged_source_lineage", {}),
             },
         }
-        writer.add_text(
-            "analysis/merge/lineage", json.dumps(lineage, sort_keys=True), global_step
-        )
-        writer.add_text(
-            "analysis/merge/info", json.dumps(info, sort_keys=True), global_step
-        )
-        logger.info(f"MERGE_LINEAGE={json.dumps(lineage, sort_keys=True)}")
+        writer.add_text("analysis/merge/lineage", json.dumps(lineage, sort_keys=True), final_step)
+        writer.add_text("analysis/merge/info", json.dumps(info, sort_keys=True), final_step)
 
-    # Pool slot norms are useful for checking growth/degeneracy, especially in
-    # weight_delta conditions.
     with torch.no_grad():
         for i, entry in enumerate(agent.policy_pool.pool):
             vec = torch.cat([entry[k].reshape(-1) for k in _HEAD_KEYS])
-            writer.add_scalar(
-                f"analysis/pool/norm_slot_{i}", float(vec.norm().item()), global_step
-            )
+            writer.add_scalar(f"analysis/pool/norm_slot_{i}", float(vec.norm()), final_step)
         if agent.alpha_mass is not None:
-            raw_mass = float(agent.alpha_mass.detach().item())
-            effective_mass = float(
-                agent.policy_pool.effective_alpha_mass().detach().item()
-            )
-            writer.add_scalar("analysis/alpha_mass_raw", raw_mass, global_step)
-            writer.add_scalar("analysis/alpha_mass", effective_mass, global_step)
-            writer.add_scalar(
-                "analysis/alpha_mass_effective", effective_mass, global_step
-            )
+            raw_mass = float(agent.alpha_mass.item())
+            effective_mass = float(agent.policy_pool.effective_alpha_mass().item())
+            writer.add_scalar("analysis/alpha_mass_raw", raw_mass, final_step)
+            writer.add_scalar("analysis/alpha_mass", effective_mass, final_step)
+            writer.add_scalar("analysis/alpha_mass_effective", effective_mass, final_step)
 
     for name, value in agent.get_distill_metrics().items():
         if value is not None:
-            writer.add_scalar(f"distillation/{name}", float(value), global_step)
-            logger.info(f"distillation/{name}={value}")
+            writer.add_scalar(f"distillation/{name}", float(value), final_step)
 
-    writer.add_scalar(
-        "charts/final_episodic_return", final_eval["reward"], global_step
-    )
-    writer.add_scalar("charts/final_return", final_eval["reward"], global_step)
+    writer.add_scalar("charts/final_episodic_return", final_eval["reward"], final_step)
     if np.isfinite(final_eval["success"]):
-        writer.add_scalar("charts/final_success", final_eval["success"], global_step)
-
-    if args.save_analysis_snapshots:
-        _save_analysis_snapshot(
-            analysis_dir / "post_finalize.pt",
-            "post_finalize",
-            global_step,
-            args,
-            agent,
-            # After finalize, pool topology changed and the pre-finalize alpha
-            # vector is no longer the authoritative current-policy mixture.
-            include_effective=False,
-            task_start_policy=task_start_policy,
-        )
+        writer.add_scalar("charts/final_success", final_eval["success"], final_step)
 
     agent.save(str(run_dir))
+    if args.save_analysis_snapshots:
+        save_task_snapshot(
+            analysis_dir / "post_finalize.pt",
+            "post_finalize",
+            final_step,
+            args,
+            agent,
+            include_effective=False,
+            include_critic=False,
+        )
+
     manifest = write_manifest(
         run_dir,
         vars(args),

@@ -46,6 +46,17 @@ def parse_args():
     p.add_argument("--retention-eval-episodes", type=int, default=10)
     p.add_argument("--test-adapt-steps", type=int, default=0)
     p.add_argument("--test-adapt-lr", type=float, default=1e-2)
+    p.add_argument(
+        "--frozen-eval-policy", choices=["pool", "snapshot"], default="pool"
+    )
+    p.add_argument(
+        "--eval-action-mode", choices=["deterministic", "stochastic"],
+        default="deterministic",
+    )
+    p.add_argument(
+        "--skip-forward-transfer", action="store_true",
+        help="Compute A_N/FG/BWT without scratch denominators; FT remains NaN.",
+    )
     p.add_argument("--success-thresholds-json", default=None)
 
     p.add_argument("--save-root", default="agents_atari_continual")
@@ -78,6 +89,8 @@ def parse_args():
         p.error("total_timesteps and retention_eval_episodes must be >= 1")
     if args.test_adapt_steps < 0 or args.test_adapt_lr <= 0:
         p.error("test_adapt_steps must be >= 0 and test_adapt_lr must be > 0")
+    if args.test_adapt_steps and args.frozen_eval_policy != "pool":
+        p.error("Test-time adaptation requires --frozen-eval-policy pool")
 
     args.success_thresholds = (
         {} if not args.success_thresholds_json else _load_json_or_path(args.success_thresholds_json)
@@ -87,19 +100,46 @@ def parse_args():
 
 
 def _usable_scratch_seeds(args, suite):
+    """Return scratch seeds with all FT learning curves present.
+
+    Post-hoc FT consumes TensorBoard/CSV curves; checkpoint/runtime identity is
+    a training/resume concern and is intentionally not re-checked here.
+    """
+    if args.skip_forward_transfer:
+        return []
+
     usable = []
     for seed in args.scratch_seeds:
         ok = True
-        for task_id in sorted(set(args.task_sequence)):
-            path = scratch_baselines.scratch_checkpoint_dir(
-                args.scratch_save_root, suite, task_id, args.total_timesteps, seed
+        for _seq_idx, task_id in _first_unseen_positions(args.task_sequence):
+            directory = pathlib.Path(
+                scratch_baselines.scratch_event_dir(
+                    args.runs_root,
+                    suite,
+                    task_id,
+                    args.total_timesteps,
+                    seed,
+                )
             )
-            if not scratch_baselines.checkpoint_complete(path):
+            has_curve = (directory / "scalars.csv").is_file() or any(
+                directory.glob("events.out.tfevents.*")
+            )
+            if not has_curve:
                 ok = False
                 break
         if ok:
             usable.append(seed)
     return usable
+
+
+def _first_unseen_positions(task_sequence):
+    seen = set()
+    result = []
+    for seq_idx, task_id in enumerate(task_sequence):
+        if task_id not in seen and seq_idx > 0:
+            result.append((seq_idx, task_id))
+        seen.add(task_id)
+    return result
 
 
 def main():
@@ -158,9 +198,14 @@ def main():
         if not args.skip_survey_metrics:
             scratch_seeds = _usable_scratch_seeds(args, suite)
             if not scratch_seeds:
+                reason = (
+                    "--skip-forward-transfer was set"
+                    if args.skip_forward_transfer
+                    else "no complete scratch learning-curve denominator is available"
+                )
                 print(
-                    f"No complete scratch denominator available for {suite}; "
-                    "A_N/FG/BWT will be computed and FT metrics will be NaN."
+                    f"{reason} for {suite}; A_N/FG/BWT will be computed and "
+                    "FT metrics will be NaN."
                 )
             survey_payloads = {condition: [] for condition in conditions}
             for condition in conditions:

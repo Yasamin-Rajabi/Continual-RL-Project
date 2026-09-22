@@ -68,6 +68,19 @@ SEQUENCE_METRICS = {
     "analysis/pool/final_length": ("Final policy-pool length", "pool_length"),
     "analysis/buffer/rows": ("Stored reference rows", "buffer_rows"),
     "analysis/encoder/max_drift": ("Frozen encoder max drift", "encoder_max_drift"),
+    "analysis/merge/balance_source_lineages": ("Lineage-balanced merge sampling enabled", "merge_balance_source_lineages"),
+    "analysis/merge/source_lineages_parent_1": ("Source lineages in merge parent 1", "merge_source_lineages_parent_1"),
+    "analysis/merge/source_lineages_parent_2": ("Source lineages in merge parent 2", "merge_source_lineages_parent_2"),
+    "analysis/merge/source_lineages_merged": ("Source lineages in retained merged buffer", "merge_source_lineages_merged"),
+    "distillation/policy/distill_source_lineages": ("Distillation source-lineage count", "distill_source_lineages"),
+    "distillation/policy/distill_balance_source_lineages": ("Lineage-balanced distillation enabled", "distill_balance_source_lineages"),
+    "policy/projection_initial_val_mixture_kl": ("Policy projection initial validation KL", "projection_initial_val_kl"),
+    "policy/projection_val_mixture_kl": ("Policy projection best validation KL", "projection_val_kl"),
+    "policy/projection_train_mixture_kl": ("Policy projection train KL", "projection_train_kl"),
+    "policy/projection_best_epoch": ("Policy projection best epoch", "projection_best_epoch"),
+    "policy/projection_rows": ("Policy projection rows", "projection_rows"),
+    "policy/projection_components": ("Policy projection mixture components", "projection_components"),
+    "policy/storage_used_novel_expert": ("Stored standalone novel expert", "storage_used_novel_expert"),
 }
 
 
@@ -341,16 +354,21 @@ def plot_retention(args, suite, conditions, all_payloads):
 
 
 def _load_merge_info(args, suite, condition, seed, seq_idx, task_id):
-    # Preferred: post-finalize analysis snapshot written by run_ppo_continual.py.
-    path = analysis_snapshot_path(args.analysis_root, suite, condition, seed, seq_idx, task_id)
-    if path.exists():
-        try:
-            snap = torch.load(path, map_location="cpu", weights_only=False)
-            info = snap.get("merge_info")
-            if info:
-                return info
-        except Exception:
-            pass
+    # Prefer the optional analysis snapshot when present, otherwise use the
+    # continuation policy_pool.pt fallback below.
+    analysis_root = getattr(args, "analysis_root", None)
+    if analysis_root is not None:
+        path = analysis_snapshot_path(
+            analysis_root, suite, condition, seed, seq_idx, task_id
+        )
+        if path.exists():
+            try:
+                snap = torch.load(path, map_location="cpu", weights_only=False)
+                info = snap.get("merge_info")
+                if info:
+                    return info
+            except Exception:
+                pass
     # Fallback: continuation policy_pool.pt also stores last_merge_info.
     run_dir = checkpoint_dir(args.save_root, suite, condition, seed, seq_idx, task_id)
     pool_path = pathlib.Path(run_dir) / "policy_pool.pt"
@@ -564,7 +582,8 @@ def write_survey_metrics_csv(args, suite, conditions, survey_payloads):
     keys = (
         "A_N_reward", "FG_reward", "BWT_reward", "FT_reward",
         "A_N_success", "FG_success", "BWT_success", "FT_success",
-        "success_thresholds_complete", "FT_reward_complete", "FT_success_complete",
+        "ft_available", "success_thresholds_complete",
+        "FT_reward_complete", "FT_success_complete",
     )
     rows = []
     for condition in conditions:

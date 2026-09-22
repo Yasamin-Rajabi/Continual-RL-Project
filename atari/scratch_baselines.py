@@ -9,7 +9,7 @@ policy-head architecture.
 
 Important invariants
 --------------------
-* ``--total-timesteps`` MUST match the continual benchmark.
+* ``--total-timesteps`` and the frozen-tail budget B MUST match the continual benchmark.
 * PPO hyperparameters and encoder settings MUST match the continual benchmark.
 * Scratch seeds should be disjoint from continual-run seeds.
 * ``success_threshold`` affects FT_success because it defines the logged
@@ -40,7 +40,7 @@ from experiment_identity import (
 SCRATCH_SAVE_ROOT = "scratch_models_atari"
 # A multi-seed denominator is substantially less noisy for FT than one scratch
 # run.  Keep these disjoint from the continual defaults [1,2,3].
-DEFAULT_SCRATCH_SEEDS = [101, 102, 103]
+DEFAULT_SCRATCH_SEEDS = [101, 103]
 
 
 def scratch_run_name(suite: str, task_id: int, seed: int) -> str:
@@ -143,7 +143,7 @@ def _expected_training_config(
         "num_minibatches": int(_arg(args, "num_minibatches", 4)),
         "update_epochs": int(_arg(args, "update_epochs", 4)),
         "norm_adv": bool(_arg(args, "norm_adv", True)),
-        "clip_coef": float(_arg(args, "clip_coef", 0.1)),
+        "clip_coef": float(_arg(args, "clip_coef", 0.2)),
         "clip_vloss": bool(_arg(args, "clip_vloss", True)),
         "ent_coef": float(_arg(args, "ent_coef", 0.01)),
         "vf_coef": float(_arg(args, "vf_coef", 0.5)),
@@ -153,15 +153,23 @@ def _expected_training_config(
         "num_evals": int(_arg(args, "num_evals", 5)),
         "success_threshold": _threshold(success_thresholds, suite, task_id),
 
-        # Root CKA policy.  Alpha/pool settings do not affect a root with no
-        # history, but we make them explicit for reproducibility.
+        # Root CKA policy. Scratch is always the parameter-space root policy;
+        # there is no historical mixture and no policy-student variant.
         "fusion_mode": "classic_cka",
+        "composition_space": "parameter",
+        "policy_student_replay": False,
+        "eval_action_mode": str(_arg(args, "eval_action_mode", "deterministic")),
         "pool_size": int(_arg(args, "pool_size", 5)),
         "alpha_init": str(_arg(args, "alpha_init", "Randn")),
         "alpha_major": float(_arg(args, "alpha_major", 0.6)),
         "alpha_factor": float(_arg(args, "alpha_factor", 1e-3)),
         "fix_alpha": bool(_arg(args, "fix_alpha", False)),
         "alpha_learning_rate": float(_arg(args, "alpha_learning_rate", 2.5e-4)),
+        "alpha_mass_learning_rate": float(
+            _arg(args, "alpha_learning_rate", 2.5e-4)
+            if _arg(args, "alpha_mass_learning_rate", None) is None
+            else _arg(args, "alpha_mass_learning_rate")
+        ),
         "alpha_warmup_steps": int(_arg(args, "alpha_warmup_steps", 5_000)),
         "alpha_entropy_reg": float(_arg(args, "alpha_entropy_reg", 0.01)),
         "alpha_mass_reg": float(_arg(args, "alpha_mass_reg", 0.05)),
@@ -176,16 +184,19 @@ def _expected_training_config(
         "freeze_root_encoder": bool(_arg(args, "freeze_root_encoder", False)),
         "pretrained_encoder": _arg(args, "pretrained_encoder", None),
         "shared_dim": int(_arg(args, "shared_dim", 512)),
-        "head_hidden_dim": int(_arg(args, "head_hidden_dim", 128)),
+        "head_hidden_dim": int(_arg(args, "head_hidden_dim", 512)),
         "distill_encoder_lr_mult": float(_arg(args, "distill_encoder_lr_mult", 0.1)),
         "drift_reg": float(_arg(args, "drift_reg", 1.0)),
 
-        # No historical pair exists in a scratch root, so these are disabled.
+        # No historical pair exists in a scratch root, so merging is disabled.
+        # B is nevertheless kept identical to the continual task budget: it is
+        # the frozen final tail INSIDE Delta, not extra interaction.
         "distillation": False,
         "collect_cosine_buffers": False,
-        "distill_extra_steps": 0,
+        "distill_extra_steps": int(_arg(args, "distill_extra_steps", 2_000)),
         "max_distill_buffer": int(_arg(args, "max_distill_buffer", 5_000)),
         "similarity_samples": int(_arg(args, "similarity_samples", 512)),
+        "balance_source_lineages": False,
         "distill_max_samples": int(_arg(args, "distill_max_samples", 2_000)),
         "distill_epochs": int(_arg(args, "distill_epochs", 8)),
         "distill_lr": float(_arg(args, "distill_lr", 3e-4)),
@@ -305,6 +316,9 @@ def train_one_baseline(
         sys.executable,
         "run_ppo_continual.py",
         "--model-type=cka-rl",
+        "--composition-space=parameter",
+        "--no-policy-student-replay",
+        f"--eval-action-mode={expected['eval_action_mode']}",
         f"--task-suite={suite}",
         f"--task-id={task_id}",
         "--seq-idx=0",
@@ -337,6 +351,7 @@ def train_one_baseline(
         f"--alpha-major={expected['alpha_major']}",
         f"--alpha-factor={expected['alpha_factor']}",
         f"--alpha-learning-rate={expected['alpha_learning_rate']}",
+        f"--alpha-mass-learning-rate={expected['alpha_mass_learning_rate']}",
         f"--alpha-warmup-steps={expected['alpha_warmup_steps']}",
         f"--alpha-entropy-reg={expected['alpha_entropy_reg']}",
         f"--alpha-mass-reg={expected['alpha_mass_reg']}",
@@ -356,9 +371,10 @@ def train_one_baseline(
         # buffer collection while keeping all distillation metadata explicit.
         "--no-distillation",
         "--no-collect-cosine-buffers",
-        "--distill-extra-steps=0",
+        f"--distill-extra-steps={expected['distill_extra_steps']}",
         f"--max-distill-buffer={expected['max_distill_buffer']}",
         f"--similarity-samples={expected['similarity_samples']}",
+        "--no-balance-source-lineages",
         f"--distill-max-samples={expected['distill_max_samples']}",
         f"--distill-epochs={expected['distill_epochs']}",
         f"--distill-lr={expected['distill_lr']}",
@@ -442,7 +458,7 @@ def parse_args():
     p.add_argument(
         "--norm-adv", action=argparse.BooleanOptionalAction, default=True
     )
-    p.add_argument("--clip-coef", type=float, default=0.1)
+    p.add_argument("--clip-coef", type=float, default=0.2)
     p.add_argument(
         "--clip-vloss", action=argparse.BooleanOptionalAction, default=True
     )
@@ -452,6 +468,10 @@ def parse_args():
     p.add_argument("--target-kl", type=float, default=None)
     p.add_argument("--eval-every", type=int, default=50_000)
     p.add_argument("--num-evals", type=int, default=5)
+    p.add_argument(
+        "--eval-action-mode", choices=["deterministic", "stochastic"],
+        default="deterministic",
+    )
     p.add_argument(
         "--torch-deterministic",
         action=argparse.BooleanOptionalAction,
@@ -469,6 +489,10 @@ def parse_args():
         "--fix-alpha", action=argparse.BooleanOptionalAction, default=False
     )
     p.add_argument("--alpha-learning-rate", type=float, default=2.5e-4)
+    p.add_argument(
+        "--alpha-mass-learning-rate", type=float, default=None,
+        help="Default reuses --alpha-learning-rate; retained for manifest parity.",
+    )
     p.add_argument("--alpha-warmup-steps", type=int, default=5_000)
     p.add_argument("--alpha-entropy-reg", type=float, default=0.01)
     p.add_argument("--alpha-mass-reg", type=float, default=0.05)
@@ -491,11 +515,20 @@ def parse_args():
     )
     p.add_argument("--pretrained-encoder", default=None)
     p.add_argument("--shared-dim", type=int, default=512)
-    p.add_argument("--head-hidden-dim", type=int, default=128)
+    p.add_argument("--head-hidden-dim", type=int, default=512)
     p.add_argument("--distill-encoder-lr-mult", type=float, default=0.1)
     p.add_argument("--drift-reg", type=float, default=1.0)
 
-    # These do not affect scratch root training, but keeping the same defaults
+    # B remains inside the total interaction budget even for scratch runs so
+    # the FT denominator uses the same Delta/B protocol as continual training.
+    p.add_argument(
+        "--distill-extra-steps",
+        type=int,
+        default=2_000,
+        help="Frozen final B transitions INSIDE total-timesteps.",
+    )
+
+    # These do not affect scratch root merging, but keeping the same defaults
     # makes manifests and imported benchmark calls unambiguous.
     p.add_argument("--max-distill-buffer", type=int, default=5_000)
     p.add_argument("--similarity-samples", type=int, default=512)
@@ -530,6 +563,10 @@ def parse_args():
         p.error("total_timesteps, num_envs and num_steps must be >= 1")
     if args.learning_rate <= 0:
         p.error("--learning-rate must be > 0")
+    if args.alpha_learning_rate <= 0:
+        p.error("--alpha-learning-rate must be > 0")
+    if args.alpha_mass_learning_rate is not None and args.alpha_mass_learning_rate <= 0:
+        p.error("--alpha-mass-learning-rate must be > 0 when provided")
     if not 0.0 < args.gamma <= 1.0 or not 0.0 <= args.gae_lambda <= 1.0:
         p.error("gamma must be in (0,1] and gae_lambda in [0,1]")
     if args.clip_coef <= 0 or args.max_grad_norm <= 0:
@@ -549,6 +586,8 @@ def parse_args():
         p.error("num_envs * num_steps must be divisible by num_minibatches")
     if args.eval_every <= 0 or args.num_evals < 1:
         p.error("eval_every and num_evals must be positive")
+    if not 0 <= args.distill_extra_steps < args.total_timesteps:
+        p.error("Require 0 <= B < Delta: distill-extra-steps is inside total-timesteps")
     if args.pool_size < 2:
         p.error("--pool-size must be >= 2")
     if args.train_shared and args.freeze_root_encoder:

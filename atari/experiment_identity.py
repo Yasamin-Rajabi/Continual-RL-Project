@@ -1,12 +1,17 @@
 """Run/checkpoint identity helpers for reproducible continual Atari PPO experiments.
 
-A checkpoint is reusable only when:
-1) training/evaluation settings that affect the learned policy or FT curves match,
-2) source files implementing Atari training/dynamics match, and
-3) parent/pretrained checkpoint identities match.
+A checkpoint is reusable only when three things still match:
+1. the training-relevant CLI configuration,
+2. the source files implementing training/environment dynamics, and
+3. the parent/pretrained checkpoints the run actually depended on.
+
+Pure logging/output changes are excluded from the training fingerprint so
+switching TensorBoard writers or adding scalar logs does not invalidate an
+otherwise identical trained checkpoint.
 """
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.metadata
 import json
@@ -16,9 +21,8 @@ from typing import Any, Mapping, Sequence
 MANIFEST_NAME = "run_manifest.json"
 MANIFEST_SCHEMA_VERSION = 2
 
-# Settings that can alter optimization, continuation state, merge behavior, or
-# the periodic evaluation curves used for FT. Pure output/plot settings are
-# intentionally excluded.
+# Only knobs that can change the learned PPO policy/pool, continuation state, or
+# the periodic learning curves used for Forward Transfer belong here.
 TRAINING_KEYS = (
     "model_type",
     "task_suite",
@@ -27,7 +31,16 @@ TRAINING_KEYS = (
     "seed",
     "torch_deterministic",
     "cuda",
-    # PPO
+
+    # New shared composition-space semantics.
+    "fusion_mode",
+    "composition_space",
+    "policy_student_replay",
+    "projection_epochs",
+    "projection_max_samples",
+    "eval_action_mode",
+
+    # PPO.
     "total_timesteps",
     "learning_rate",
     "num_envs",
@@ -44,18 +57,20 @@ TRAINING_KEYS = (
     "vf_coef",
     "max_grad_norm",
     "target_kl",
-    # periodic evaluation curves used by FT
+
+    # Periodic evaluation curves used by FT.
     "eval_every",
     "num_evals",
     "success_threshold",
-    # knowledge-pool method
-    "fusion_mode",
+
+    # Knowledge pool / routing.
     "pool_size",
     "alpha_init",
     "alpha_major",
     "alpha_factor",
     "fix_alpha",
     "alpha_learning_rate",
+    "alpha_mass_learning_rate",
     "alpha_warmup_steps",
     "alpha_entropy_reg",
     "alpha_mass_reg",
@@ -63,7 +78,8 @@ TRAINING_KEYS = (
     "fix_alpha_scale",
     "use_alpha_mass",
     "constrain_alpha_mass",
-    # shared encoder
+
+    # Shared encoder.
     "encoder_from_base",
     "train_shared",
     "freeze_root_encoder",
@@ -71,12 +87,14 @@ TRAINING_KEYS = (
     "head_hidden_dim",
     "distill_encoder_lr_mult",
     "drift_reg",
-    # merge / distillation
+
+    # Merge / distillation / frozen-tail protocol.
     "distillation",
     "collect_cosine_buffers",
     "distill_extra_steps",
     "max_distill_buffer",
     "similarity_samples",
+    "balance_source_lineages",
     "distill_max_samples",
     "distill_epochs",
     "distill_lr",
@@ -85,16 +103,21 @@ TRAINING_KEYS = (
     "distill_select_best_val",
 )
 
-# Files that can change an Atari trajectory or the continuation state. Keep
-# HalfCheetah-only files out of this fingerprint.
+# Files that can affect the Atari training trajectory, bounded-pool state, or
+# the stored analysis needed for lineage/KL diagnostics. Plotting-only and
+# checkpoint-evaluation-only files are intentionally excluded.
 SOURCE_CANDIDATES = (
     "run_ppo_continual.py",
     "cka_rl.py",
+    "policy_composition.py",
+    "policy_space.py",
+    "training_protocol.py",
     "knowledge_pools.py",
     "shared_arch.py",
-    "atari_envs.py",
+    "policy_utils.py",
     "atari_tasks.py",
-    "experiment_identity.py",
+    "atari_envs.py",
+    "analysis_logging.py",
 )
 
 
@@ -115,7 +138,10 @@ def _jsonable(value: Any):
 
 def _canonical_json(value: Any) -> str:
     return json.dumps(
-        _jsonable(value), sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        _jsonable(value),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
     )
 
 
@@ -130,10 +156,70 @@ def sha256_file(path) -> str | None:
     return h.hexdigest()
 
 
+class _RunPpoLoggingStripper(ast.NodeTransformer):
+    """Strip pure scalar-writer plumbing from run_ppo_continual.py identity.
+
+    Training/evaluation calls remain fingerprinted. Only the writer import,
+    writer construction, and direct writer.* output calls are removed.
+    """
+
+    _WRITER_METHODS = {"add_scalar", "add_text", "flush", "close"}
+
+    def visit_ImportFrom(self, node):
+        if node.module in {"torch.utils.tensorboard", "csv_summary_writer"}:
+            return None
+        return self.generic_visit(node)
+
+    def visit_Assign(self, node):
+        if any(
+            isinstance(target, ast.Name) and target.id == "writer"
+            for target in node.targets
+        ):
+            value = node.value
+            if isinstance(value, ast.Call):
+                func = value.func
+                if (
+                    isinstance(func, ast.Name)
+                    and func.id in {"SummaryWriter", "CsvSummaryWriter"}
+                ):
+                    return None
+        return self.generic_visit(node)
+
+    def visit_Expr(self, node):
+        value = node.value
+        if isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute):
+            owner = value.func.value
+            if (
+                isinstance(owner, ast.Name)
+                and owner.id == "writer"
+                and value.func.attr in self._WRITER_METHODS
+            ):
+                return None
+        return self.generic_visit(node)
+
+
+def _semantic_source_bytes(name: str, path: pathlib.Path) -> bytes:
+    """Canonical source bytes used by the training identity fingerprint."""
+    if name != "run_ppo_continual.py":
+        return path.read_bytes()
+
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(path))
+    tree = _RunPpoLoggingStripper().visit(tree)
+    ast.fix_missing_locations(tree)
+    return ast.dump(
+        tree,
+        annotate_fields=True,
+        include_attributes=False,
+    ).encode("utf-8")
+
+
 def source_fingerprint(root=None) -> str:
+    """Fingerprint Atari training semantics while ignoring pure writer changes."""
     root = pathlib.Path(root or pathlib.Path(__file__).resolve().parent)
     h = hashlib.sha256()
     found = 0
+
     for name in SOURCE_CANDIDATES:
         path = root / name
         if not path.exists():
@@ -141,15 +227,17 @@ def source_fingerprint(root=None) -> str:
         found += 1
         h.update(name.encode("utf-8"))
         h.update(b"\0")
-        h.update(path.read_bytes())
+        h.update(_semantic_source_bytes(name, path))
         h.update(b"\0")
+
     if found == 0:
         raise RuntimeError(f"no Atari training source files found under {root}")
     return h.hexdigest()
 
 
 def runtime_versions() -> dict:
-    packages = (
+    result = {}
+    for package in (
         "python",
         "torch",
         "numpy",
@@ -157,9 +245,7 @@ def runtime_versions() -> dict:
         "ale-py",
         "stable-baselines3",
         "tyro",
-    )
-    result = {}
-    for package in packages:
+    ):
         if package == "python":
             import sys
             result[package] = sys.version.split()[0]
@@ -172,11 +258,21 @@ def runtime_versions() -> dict:
 
 
 def training_config(mapping: Mapping[str, Any]) -> dict:
-    return {
+    config = {
         key: _jsonable(mapping[key])
         for key in TRAINING_KEYS
         if key in mapping
     }
+
+    # Match the HalfCheetah convention: a missing/None dedicated mass LR means
+    # "reuse the alpha LR", so explicit equality and the default are identical.
+    if (
+        "alpha_mass_learning_rate" in config
+        and config["alpha_mass_learning_rate"] is None
+    ):
+        config["alpha_mass_learning_rate"] = config.get("alpha_learning_rate")
+
+    return config
 
 
 def load_manifest(run_dir) -> dict | None:
@@ -215,7 +311,9 @@ def build_manifest(
         "source_fingerprint": source_fingerprint(root),
         "runtime_versions": runtime_versions(),
         "pretrained_encoder_sha256": (
-            None if pretrained_encoder is None else sha256_file(pretrained_encoder)
+            None
+            if pretrained_encoder is None
+            else sha256_file(pretrained_encoder)
         ),
         "parent_signatures": parent_signatures(parent_dirs),
     }
@@ -258,14 +356,26 @@ def checkpoint_matches(
     parent_dirs=(),
     pretrained_encoder=None,
     root=None,
+    check_runtime: bool = True,
 ) -> tuple[bool, str]:
+    """Return (matches, reason) for resumable orchestration."""
     manifest = load_manifest(run_dir)
     if manifest is None:
         return False, "missing/invalid Atari run_manifest.json"
 
     expected = training_config(expected_mapping)
     actual = manifest.get("training_config", {})
+
     for key, value in expected.items():
+        # Before the dedicated mass-LR knob exists in an Atari manifest, its
+        # effective behavior is exactly alpha_learning_rate.
+        if (
+            key == "alpha_mass_learning_rate"
+            and key not in actual
+            and value == actual.get("alpha_learning_rate")
+        ):
+            continue
+
         if actual.get(key) != value:
             return (
                 False,
@@ -273,16 +383,19 @@ def checkpoint_matches(
                 f"saved={actual.get(key)!r}, expected={value!r}",
             )
 
-    current_source = source_fingerprint(root)
-    if manifest.get("source_fingerprint") != current_source:
+    if manifest.get("source_fingerprint") != source_fingerprint(root):
         return False, "Atari training source fingerprint changed"
 
-    current_runtime = runtime_versions()
-    if manifest.get("runtime_versions") != current_runtime:
-        return False, "Python/package runtime versions changed"
+    # Post-hoc metric code can deliberately skip the current-runtime check while
+    # still comparing manifests produced by the original training runtimes.
+    if check_runtime:
+        if manifest.get("runtime_versions") != runtime_versions():
+            return False, "Python/package runtime versions changed"
 
     expected_pretrained = (
-        None if pretrained_encoder is None else sha256_file(pretrained_encoder)
+        None
+        if pretrained_encoder is None
+        else sha256_file(pretrained_encoder)
     )
     if manifest.get("pretrained_encoder_sha256") != expected_pretrained:
         return False, "pretrained encoder contents changed"

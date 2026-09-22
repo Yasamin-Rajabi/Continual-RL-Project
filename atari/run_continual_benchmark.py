@@ -1,16 +1,17 @@
-"""Four-way continual Atari benchmark for Freeway and Space Invaders modes.
+"""Continual Atari benchmark for Freeway and Space Invaders modes.
 
-The four experimental conditions preserve the same two method axes used by the
-HalfCheetah benchmark:
+The four legacy experimental conditions preserve the same two method axes used
+by the HalfCheetah benchmark, and can now be crossed with parameter-space or
+exact categorical policy-space composition:
 
     baseline     = classic CKA vectors + arithmetic merge
     distil_only  = classic CKA vectors + categorical-KL distillation merge
     weight_only  = weight-delta vectors + alpha-mass + arithmetic merge
     combined     = weight-delta vectors + alpha-mass + categorical-KL distillation merge
 
-For the distillation conditions, merge-pair selection uses the replay-weighted
-symmetric categorical KL implemented by cka_rl.py.  For the non-distillation
-conditions, pair selection remains parameter-space cosine similarity.
+For the distillation conditions, merge-pair selection uses symmetric
+categorical KL on balanced stored states. For non-distillation conditions,
+pair selection remains parameter-space cosine similarity.
 
 This file is orchestration only.  It launches run_ppo_continual.py once per
 sequence position, validates resumable checkpoints, calls metrics.py for
@@ -112,7 +113,7 @@ def parse_args():
         default=["freeway", "space_invaders"],
         choices=sorted(TASK_SUITES.keys()),
     )
-    p.add_argument("--seeds", nargs="+", type=int, default=[1, 2, 3])
+    p.add_argument("--seeds", nargs="+", type=int, default=[101, 102, 103])
     p.add_argument(
         "--task-sequence",
         nargs="+",
@@ -138,23 +139,18 @@ def parse_args():
     p.add_argument("--learning-rate", type=float, default=2.5e-4)
     p.add_argument("--num-envs", type=int, default=8)
     p.add_argument("--num-steps", type=int, default=128)
-    p.add_argument(
-        "--anneal-lr", action=argparse.BooleanOptionalAction, default=True
-    )
+    p.add_argument("--anneal-lr", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--gae-lambda", type=float, default=0.95)
     p.add_argument("--num-minibatches", type=int, default=4)
     p.add_argument("--update-epochs", type=int, default=4)
-    p.add_argument(
-        "--norm-adv", action=argparse.BooleanOptionalAction, default=True
-    )
-    p.add_argument("--clip-coef", type=float, default=0.1)
-    p.add_argument(
-        "--clip-vloss", action=argparse.BooleanOptionalAction, default=True
-    )
+    p.add_argument("--norm-adv", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--clip-coef", type=float, default=0.2)
+    p.add_argument("--clip-vloss", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--ent-coef", type=float, default=0.01)
     p.add_argument("--vf-coef", type=float, default=0.5)
     p.add_argument("--max-grad-norm", type=float, default=0.5)
+
     p.add_argument("--target-kl", type=float, default=None)
     p.add_argument("--eval-every", type=int, default=50_000)
     p.add_argument("--num-evals", type=int, default=5)
@@ -169,18 +165,18 @@ def parse_args():
     # Knowledge pool / method settings
     # ------------------------------------------------------------------
     p.add_argument("--pool-size", type=int, default=5)
-    p.add_argument(
-        "--alpha-init", choices=["Randn", "Major", "Uniform"], default="Randn"
-    )
+    p.add_argument("--alpha-init", choices=["Randn", "Major", "Uniform"], default="Randn")
     p.add_argument("--alpha-major", type=float, default=0.6)
     p.add_argument("--alpha-factor", type=float, default=1e-3)
-    p.add_argument(
-        "--fix-alpha", action=argparse.BooleanOptionalAction, default=False
-    )
+    p.add_argument("--fix-alpha", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--alpha-learning-rate", type=float, default=2.5e-4)
-    p.add_argument("--alpha-warmup-steps", type=int, default=5_000)
-    p.add_argument("--alpha-entropy-reg", type=float, default=0.01)
-    p.add_argument("--alpha-mass-reg", type=float, default=0.05)
+    p.add_argument(
+        "--alpha-mass-learning-rate", type=float, default=None,
+        help="Learning rate for the raw alpha-mass gate; default reuses --alpha-learning-rate.",
+    )
+    p.add_argument("--alpha-warmup-steps", type=int, default=60_000)
+    p.add_argument("--alpha-entropy-reg", type=float, default=0.0001)
+    p.add_argument("--alpha-mass-reg", type=float, default=0.005)
     p.add_argument(
         "--constrain-alpha-mass",
         action=argparse.BooleanOptionalAction,
@@ -213,7 +209,7 @@ def parse_args():
         "--encoder-from-base", action=argparse.BooleanOptionalAction, default=True
     )
     p.add_argument(
-        "--train-shared", action=argparse.BooleanOptionalAction, default=False
+        "--train-shared", action=argparse.BooleanOptionalAction, default=True
     )
     p.add_argument(
         "--freeze-root-encoder",
@@ -222,7 +218,7 @@ def parse_args():
     )
     p.add_argument("--pretrained-encoder", default=None)
     p.add_argument("--shared-dim", type=int, default=512)
-    p.add_argument("--head-hidden-dim", type=int, default=128)
+    p.add_argument("--head-hidden-dim", type=int, default=512)
     p.add_argument("--distill-encoder-lr-mult", type=float, default=0.1)
     p.add_argument("--drift-reg", type=float, default=1.0)
 
@@ -230,17 +226,42 @@ def parse_args():
     p.add_argument(
         "--distill-extra-steps",
         type=int,
-        default=2_000,
-        help="Number of TOTAL Atari transitions retained per task.",
+        default=20_000,
+        help=(
+            "Frozen final B Atari transitions INSIDE total-timesteps. "
+            "PPO optimization receives Delta-B transitions."
+        ),
     )
+    p.add_argument(
+        "--composition-spaces",
+        nargs="+",
+        choices=["parameter", "policy"],
+        default=["parameter", "policy"],
+        help="Use parameter alone to disable exact categorical policy-space runs.",
+    )
+    p.add_argument(
+        "--policy-student-replay",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Combined policy-space variant: execution uses the exact mixture "
+            "while a standalone novel categorical expert is trained for storage."
+        ),
+    )
+    p.add_argument("--projection-epochs", type=int, default=16)
+    p.add_argument("--projection-max-samples", type=int, default=20_000)
     p.add_argument(
         "--collect-cosine-buffers",
         action=argparse.BooleanOptionalAction,
         default=False,
     )
-    p.add_argument("--max-distill-buffer", type=int, default=5_000)
+    p.add_argument("--max-distill-buffer", type=int, default=30_000)
     p.add_argument("--similarity-samples", type=int, default=512)
-    p.add_argument("--distill-max-samples", type=int, default=2_000)
+    p.add_argument(
+        "--balance-source-lineages", action=argparse.BooleanOptionalAction, default=True,
+        help="Balance behavioral-KL/distillation/merge-buffer sampling across original source_ids.",
+    )
+    p.add_argument("--distill-max-samples", type=int, default=10_000)
     p.add_argument("--distill-epochs", type=int, default=8)
     p.add_argument("--distill-lr", type=float, default=3e-4)
     p.add_argument("--distill-batch-size", type=int, default=256)
@@ -255,8 +276,19 @@ def parse_args():
     # Evaluation / survey metrics
     # ------------------------------------------------------------------
     p.add_argument("--retention-eval-episodes", type=int, default=10)
-    p.add_argument("--test-adapt-steps", type=int, default=0)
+    p.add_argument("--test-adapt-steps", type=int, default=50_000)
     p.add_argument("--test-adapt-lr", type=float, default=1e-2)
+    p.add_argument(
+        "--frozen-eval-policy", choices=["pool", "snapshot"], default="pool"
+    )
+    p.add_argument(
+        "--eval-action-mode", choices=["deterministic", "stochastic"],
+        default="deterministic",
+    )
+    p.add_argument(
+        "--skip-forward-transfer", action="store_true",
+        help="Compute A_N/FG/BWT without scratch denominators; FT remains NaN.",
+    )
     p.add_argument(
         "--success-thresholds-json",
         default=None,
@@ -272,7 +304,7 @@ def parse_args():
     p.add_argument("--runs-root", default="runs_atari")
     p.add_argument("--plots-root", default="plots_atari_continual")
     p.add_argument("--analysis-root", default="analysis_runs_atari")
-    p.add_argument("--analysis-log-every", type=int, default=5_000)
+    p.add_argument("--analysis-log-every", type=int, default=40_000)
     p.add_argument(
         "--save-analysis-snapshots",
         action=argparse.BooleanOptionalAction,
@@ -296,7 +328,7 @@ def parse_args():
         "--condition-index",
         nargs="+",
         type=int,
-        default=[0],
+        default=[1, 4],
         choices=[0, 1, 2, 3, 4],
         help=(
             "0 = all four conditions; otherwise choose one or more of "
@@ -371,6 +403,21 @@ def parse_args():
         p.error("test_adapt_steps must be >=0 and test_adapt_lr must be >0")
     if args.analysis_log_every < 0:
         p.error("--analysis-log-every must be >= 0")
+    if args.alpha_mass_learning_rate is not None and args.alpha_mass_learning_rate <= 0:
+        p.error("--alpha-mass-learning-rate must be > 0 when provided")
+    if not 0 <= args.distill_extra_steps < args.total_timesteps:
+        p.error("Require 0 <= B < Delta: distill-extra-steps is inside total-timesteps")
+    if args.projection_epochs < 1 or args.projection_max_samples < 2:
+        p.error("projection-epochs >= 1 and projection-max-samples >= 2 are required")
+    if args.test_adapt_steps and args.frozen_eval_policy != "pool":
+        p.error("Test-time adaptation requires --frozen-eval-policy pool")
+    if args.policy_student_replay:
+        if list(dict.fromkeys(args.composition_spaces)) != ["policy"]:
+            p.error("--policy-student-replay requires --composition-spaces policy only")
+        if args.condition_index != [4]:
+            p.error("--policy-student-replay is defined for --condition-index 4 (combined) only")
+        if not args.weight_use_alpha_mass:
+            p.error("--policy-student-replay requires alpha-mass")
     batch_size = args.num_envs * args.num_steps
     if batch_size % args.num_minibatches != 0:
         p.error("num_envs * num_steps must be divisible by num_minibatches")
@@ -427,12 +474,22 @@ def _expected_training_config(args, suite, task_id, seq_idx, seed, cfg):
         "eval_every": int(args.eval_every),
         "num_evals": int(args.num_evals),
         "fusion_mode": cfg["fusion_mode"],
+        "composition_space": cfg.get("composition_space", "parameter"),
+        "policy_student_replay": bool(args.policy_student_replay),
+        "projection_epochs": int(args.projection_epochs),
+        "projection_max_samples": int(args.projection_max_samples),
+        "eval_action_mode": args.eval_action_mode,
         "pool_size": int(args.pool_size),
         "alpha_init": args.alpha_init,
         "alpha_major": float(args.alpha_major),
         "alpha_factor": float(args.alpha_factor),
         "fix_alpha": bool(args.fix_alpha),
         "alpha_learning_rate": float(args.alpha_learning_rate),
+        "alpha_mass_learning_rate": float(
+            args.alpha_learning_rate
+            if args.alpha_mass_learning_rate is None
+            else args.alpha_mass_learning_rate
+        ),
         "alpha_warmup_steps": int(args.alpha_warmup_steps),
         "alpha_entropy_reg": float(args.alpha_entropy_reg),
         "alpha_mass_reg": float(args.alpha_mass_reg),
@@ -452,6 +509,7 @@ def _expected_training_config(args, suite, task_id, seq_idx, seed, cfg):
         "distill_extra_steps": int(args.distill_extra_steps),
         "max_distill_buffer": int(args.max_distill_buffer),
         "similarity_samples": int(args.similarity_samples),
+        "balance_source_lineages": bool(args.balance_source_lineages),
         "distill_max_samples": int(args.distill_max_samples),
         "distill_epochs": int(args.distill_epochs),
         "distill_lr": float(args.distill_lr),
@@ -553,11 +611,17 @@ def train_chain(args, suite, condition, raw_cfg, seed):
             f"--eval-every={args.eval_every}",
             f"--num-evals={args.num_evals}",
             f"--fusion-mode={cfg['fusion_mode']}",
+            f"--composition-space={cfg.get('composition_space', 'parameter')}",
+            "--policy-student-replay" if args.policy_student_replay else "--no-policy-student-replay",
+            f"--projection-epochs={args.projection_epochs}",
+            f"--projection-max-samples={args.projection_max_samples}",
+            f"--eval-action-mode={args.eval_action_mode}",
             f"--pool-size={args.pool_size}",
             f"--alpha-init={args.alpha_init}",
             f"--alpha-major={args.alpha_major}",
             f"--alpha-factor={args.alpha_factor}",
             f"--alpha-learning-rate={args.alpha_learning_rate}",
+            f"--alpha-mass-learning-rate={args.alpha_learning_rate if args.alpha_mass_learning_rate is None else args.alpha_mass_learning_rate}",
             f"--alpha-warmup-steps={args.alpha_warmup_steps}",
             f"--alpha-entropy-reg={args.alpha_entropy_reg}",
             f"--alpha-mass-reg={args.alpha_mass_reg}",
@@ -570,6 +634,7 @@ def train_chain(args, suite, condition, raw_cfg, seed):
             f"--distill-extra-steps={args.distill_extra_steps}",
             f"--max-distill-buffer={args.max_distill_buffer}",
             f"--similarity-samples={args.similarity_samples}",
+            "--balance-source-lineages" if args.balance_source_lineages else "--no-balance-source-lineages",
             f"--distill-max-samples={args.distill_max_samples}",
             f"--distill-epochs={args.distill_epochs}",
             f"--distill-lr={args.distill_lr}",
@@ -679,50 +744,6 @@ def _call_optional_diagnostic_plots(args, suite, conditions):
         fn(args, suite, conditions)
 
 
-def _audit_scratch_baselines(args, suite):
-    """Return (usable_seeds, problems) for FT denominators.
-
-    Unlike HalfCheetah, Atari has one actor architecture for all four conditions
-    because raw observations are never concatenated to encoder features.  There
-    is therefore no plain/distill_skip scratch-variant split.
-    """
-    problems = []
-    usable_seeds = []
-
-    for scratch_seed in args.scratch_seeds:
-        seed_ok = True
-        for task_id in sorted(set(args.task_sequence)):
-            scratch_dir = scratch_baselines.scratch_checkpoint_dir(
-                args.scratch_save_root,
-                suite,
-                task_id,
-                args.total_timesteps,
-                scratch_seed,
-            )
-            if not scratch_baselines.checkpoint_complete(scratch_dir):
-                problems.append(
-                    (task_id, scratch_seed, "missing/incomplete checkpoint", scratch_dir)
-                )
-                seed_ok = False
-                continue
-
-            matches, reason = scratch_baselines.checkpoint_matches(
-                scratch_dir,
-                suite,
-                task_id,
-                args.total_timesteps,
-                scratch_seed,
-                args,
-            )
-            if not matches:
-                problems.append((task_id, scratch_seed, reason, scratch_dir))
-                seed_ok = False
-
-        if seed_ok:
-            usable_seeds.append(scratch_seed)
-
-    return usable_seeds, problems
-
 
 def main():
     args = parse_args()
@@ -762,7 +783,20 @@ def main():
             name = all_condition_names[idx - 1]
             if name not in conditions:
                 conditions.append(name)
-    selected_conditions = {name: CONDITIONS[name] for name in conditions}
+    selected_conditions = {}
+    for name in conditions:
+        for space in dict.fromkeys(args.composition_spaces):
+            if space == "parameter":
+                label = name
+            elif args.policy_student_replay:
+                label = name + "_policy_student"
+            else:
+                label = name + "_policy"
+            selected_conditions[label] = {
+                **CONDITIONS[name],
+                "composition_space": space,
+            }
+    conditions = list(selected_conditions)
     print(f"Conditions: {conditions}")
 
     for suite in args.task_suites:
@@ -801,55 +835,24 @@ def main():
             plots.write_summary_csv(args, suite, conditions, all_payloads)
 
         # --------------------------------------------------------------
-        # Survey metrics: A_N/FG/BWT always remain meaningful from continual
-        # checkpoints.  FT additionally needs compatible scratch baselines.
-        # The previous Atari launcher skipped ALL survey metrics when scratch
-        # baselines were absent; that unnecessarily discarded A_N/FG/BWT.
+        # Survey metrics. A_N/FG/BWT do not depend on scratch runs. FT reads
+        # scratch learning curves only; metrics.py leaves FT as NaN when they
+        # are unavailable or --skip-forward-transfer is set.
         # --------------------------------------------------------------
         if not args.skip_survey_metrics:
-            usable_scratch_seeds, scratch_problems = _audit_scratch_baselines(
-                args, suite
-            )
-
-            if scratch_problems:
-                print("\n!!! Scratch-baseline issue(s) detected:")
-                for task_id, scratch_seed, reason, path in scratch_problems[:20]:
-                    print(
-                        f"    task {task_id}, seed {scratch_seed}: {reason} ({path})"
-                    )
-                if len(scratch_problems) > 20:
-                    print(f"    ... and {len(scratch_problems) - 20} more")
-
-            if not usable_scratch_seeds:
-                print(
-                    f"\n!!! No fully compatible scratch seed is available for {suite}. "
-                    "A_N/FG/BWT will still be computed; FT_reward and FT_success "
-                    "will be NaN.  Train scratch baselines with, for example:\n"
-                    f"    {sys.executable} scratch_baselines.py "
-                    f"--task-suites {suite} "
-                    f"--total-timesteps {args.total_timesteps} "
-                    f"--seeds {' '.join(map(str, args.scratch_seeds))} "
-                    f"--save-root {args.scratch_save_root} "
-                    f"--runs-root {args.runs_root}\n"
-                )
-
+            scratch_seeds = [] if args.skip_forward_transfer else [
+                int(x) for x in args.scratch_seeds
+            ]
             survey_payloads = {condition: [] for condition in conditions}
             for condition in conditions:
                 for seed in args.seeds:
                     survey_payloads[condition].append(
                         metrics.compute_survey_metrics(
-                            args,
-                            suite,
-                            condition,
-                            seed,
-                            device,
-                            usable_scratch_seeds,
-                            args.total_timesteps,
+                            args, suite, condition, seed, device,
+                            scratch_seeds, args.total_timesteps,
                         )
                     )
 
-            # Keep the per-seed cache files written by metrics.py and also save
-            # one convenient aggregate JSON for inspection/reproducibility.
             out_path = (
                 pathlib.Path(args.plots_root)
                 / suite
