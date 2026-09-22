@@ -17,6 +17,7 @@ Atari-specific behavior remains unchanged where it should:
 from __future__ import annotations
 
 import copy
+import gc
 import json
 import os
 import pathlib
@@ -276,55 +277,113 @@ def collect_merge_buffer(agent, envs, steps, task_id, seq_idx, device, seed):
     Callers use a one-environment vector env, so one loop iteration is exactly
     one environment transition. This avoids silently exceeding B because of
     vector-env parallelism.
+
+    The destination arrays are preallocated up front and written into row by
+    row; the previous version appended per-step chunks to a Python list and
+    then ``np.concatenate``d the whole thing, which briefly doubled the
+    memory cost of this buffer (list of chunks + the concatenated copy) for
+    no benefit, since the final row count is already known exactly.
     """
     if steps <= 0:
         return None, 0.0
     if envs.num_envs != 1:
         raise ValueError("frozen-tail collection must use exactly one environment")
 
+    steps = int(steps)
     obs, _ = envs.reset(seed=seed)
-    obs_rows, action_rows = [], []
     start = time.time()
     agent.eval()
 
-    for _ in range(int(steps)):
+    obs_arr = None
+    action_arr = np.empty(steps, dtype=np.int16)
+    for i in range(steps):
         raw = np.asarray(obs)
+        if obs_arr is None:
+            obs_arr = np.empty((steps,) + raw.shape[1:], dtype=np.uint8)
         x = torch.as_tensor(raw, dtype=torch.float32, device=device).div_(255.0)
         with torch.no_grad():
             action = agent.action_distribution(x).sample()
         action_np = action.cpu().numpy()
-        obs_rows.append(raw.copy())
-        action_rows.append(action_np.copy())
+        obs_arr[i] = raw[0]
+        action_arr[i] = action_np[0]
         obs, _, _, _, _ = envs.step(action_np)
 
-    obs_arr = np.concatenate(obs_rows, axis=0).astype(np.uint8, copy=False)
-    action_arr = np.concatenate(action_rows, axis=0).astype(np.int16, copy=False)
     buffer = {
         "obs": obs_arr,
         "actions": action_arr,
-        "task_ids": np.full(len(obs_arr), int(task_id), dtype=np.int32),
-        "source_ids": np.full(len(obs_arr), int(seq_idx), dtype=np.int32),
+        "task_ids": np.full(steps, int(task_id), dtype=np.int32),
+        "source_ids": np.full(steps, int(seq_idx), dtype=np.int32),
     }
-    if len(obs_arr) != int(steps):
-        raise RuntimeError(
-            f"frozen-tail accounting error: collected {len(obs_arr)} rows for B={steps}"
-        )
     return buffer, time.time() - start
 
 
-def _drift_penalty(agent, old_fc, past_obs_pool, batch_size, device, coefficient):
-    if old_fc is None or past_obs_pool is None or coefficient <= 0:
+class HistoricalFrameSampler:
+    """Uniform sampling over historical pool frames WITHOUT concatenating them.
+
+    The drift regularizer used to sample from ``np.concatenate(all pool
+    buffers)``, which materialized a second full copy of every historical
+    replay frame across the whole pool (pool_size * buffer rows of 4x84x84
+    uint8) and kept it resident for the entire task. Sampling directly from
+    the original per-slot arrays is mathematically identical (uniform over
+    the same underlying rows) and allocates nothing beyond the sampled batch.
+    """
+
+    def __init__(self, arrays):
+        self.arrays = [a for a in arrays if a is not None and len(a) > 0]
+        if not self.arrays:
+            raise ValueError("HistoricalFrameSampler requires at least one non-empty array")
+        sizes = np.asarray([len(a) for a in self.arrays], dtype=np.int64)
+        self.offsets = np.concatenate([[0], np.cumsum(sizes)])
+        self.total = int(self.offsets[-1])
+        self.row_shape = tuple(self.arrays[0].shape[1:])
+        self.dtype = self.arrays[0].dtype
+
+    def __len__(self):
+        return self.total
+
+    def sample(self, n: int) -> np.ndarray:
+        n = int(n)
+        flat = np.random.randint(0, self.total, size=n)
+        slot = np.searchsorted(self.offsets, flat, side="right") - 1
+        local = flat - self.offsets[slot]
+        out = np.empty((n,) + self.row_shape, dtype=self.dtype)
+        for s in np.unique(slot):
+            mask = slot == s
+            out[mask] = self.arrays[int(s)][local[mask]]
+        return out
+
+
+def _drift_penalty(agent, old_fc, drift_sampler, batch_size, device, coefficient):
+    if old_fc is None or drift_sampler is None or coefficient <= 0:
         return None
-    count = min(int(batch_size), len(past_obs_pool))
-    idx = np.random.randint(0, len(past_obs_pool), size=count)
+    count = min(int(batch_size), len(drift_sampler))
     states = (
-        torch.as_tensor(past_obs_pool[idx], dtype=torch.float32, device=device)
+        torch.as_tensor(drift_sampler.sample(count), dtype=torch.float32, device=device)
         .div_(255.0)
     )
     with torch.no_grad():
         old_features = old_fc(states)
     current_features = agent.fc(states)
     return float(coefficient) * F.mse_loss(current_features, old_features)
+
+
+def _rss_gib() -> float:
+    """Current resident set size in GiB, or nan when /proc is unavailable."""
+    try:
+        with open("/proc/self/statm") as f:
+            pages = int(f.read().split()[1])
+        return pages * os.sysconf("SC_PAGE_SIZE") / (1024 ** 3)
+    except Exception:
+        return float("nan")
+
+
+def _log_rss(writer, stage: str, step: int) -> float:
+    """Record host RSS so an OOM kill can be located in the run timeline."""
+    rss = _rss_gib()
+    if np.isfinite(rss):
+        writer.add_scalar(f"memory/rss_gib/{stage}", rss, step)
+        logger.info(f"RSS[{stage}]={rss:.2f} GiB")
+    return rss
 
 
 def _value_loss(args, newvalue, oldvalue, returns):
@@ -593,7 +652,7 @@ def main():
 
     # Optional historical encoder stabilization.
     old_fc = None
-    past_obs_pool = None
+    drift_sampler = None
     if args.seq_idx > 0 and args.train_shared and args.distillation:
         old_fc = copy.deepcopy(agent.fc).to(device)
         old_fc.eval()
@@ -607,7 +666,13 @@ def main():
             and len(entry["buffer"]["obs"]) > 0
         ]
         if past_obs:
-            past_obs_pool = np.concatenate(past_obs, axis=0)
+            # Zero-copy view over the pool slots; see HistoricalFrameSampler.
+            drift_sampler = HistoricalFrameSampler(past_obs)
+            logger.info(
+                f"encoder-drift reference pool: {len(drift_sampler)} historical frames "
+                "(sampled in place, not concatenated)"
+            )
+        del past_obs
 
     opts = _optimizer_parameter_groups(agent, args)
 
@@ -637,7 +702,12 @@ def main():
             ).clone()
 
     # Max-size buffers; the final PPO rollout may be shorter so Delta-B is exact.
-    obs_buf = torch.zeros((args.num_steps, args.num_envs) + obs_shape, device=device)
+    # Frames are stored as uint8 and normalized only at point of use: a 4x
+    # reduction of the rollout buffer and of every host->device transfer,
+    # with bit-identical inputs to the network.
+    obs_buf = torch.zeros(
+        (args.num_steps, args.num_envs) + obs_shape, dtype=torch.uint8, device=device
+    )
     actions_buf = torch.zeros((args.num_steps, args.num_envs), device=device)
     logprobs_buf = torch.zeros((args.num_steps, args.num_envs), device=device)
     rewards_buf = torch.zeros((args.num_steps, args.num_envs), device=device)
@@ -645,7 +715,7 @@ def main():
     values_buf = torch.zeros((args.num_steps, args.num_envs), device=device)
 
     next_obs_np, _ = envs.reset(seed=args.seed)
-    next_obs = torch.as_tensor(next_obs_np, dtype=torch.float32, device=device)
+    next_obs = torch.as_tensor(np.asarray(next_obs_np), device=device)
     next_done = torch.zeros(args.num_envs, device=device)
     global_step = 0
     next_eval = args.eval_every if args.eval_every > 0 else None
@@ -727,7 +797,7 @@ def main():
             obs_buf[step] = next_obs
             dones_buf[step] = next_done
             with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(next_obs / 255.0)
+                action, logprob, _, value = agent.get_action_and_value(next_obs.float() / 255.0)
             actions_buf[step] = action
             logprobs_buf[step] = logprob
             values_buf[step] = value.flatten()
@@ -744,12 +814,12 @@ def main():
             rewards_buf[step] = torch.as_tensor(
                 reward, dtype=torch.float32, device=device
             )
-            next_obs = torch.as_tensor(next_obs_np, dtype=torch.float32, device=device)
+            next_obs = torch.as_tensor(np.asarray(next_obs_np), device=device)
             next_done = torch.as_tensor(next_done_np, dtype=torch.float32, device=device)
 
         # ----------------------------- GAE -------------------------------
         with torch.no_grad():
-            next_value = agent.get_value(next_obs / 255.0).reshape(1, -1)
+            next_value = agent.get_value(next_obs.float() / 255.0).reshape(1, -1)
             advantages = torch.zeros((rollout_steps, args.num_envs), device=device)
             lastgaelam = 0
             for t in reversed(range(rollout_steps)):
@@ -799,11 +869,11 @@ def main():
                     # novel student therefore uses the recorded mixture
                     # log-probability as its behavior-policy denominator; it is
                     # never treated as though the student generated the action.
-                    newvalue = agent.get_value(b_obs[mb] / 255.0)
+                    newvalue = agent.get_value(b_obs[mb].float() / 255.0)
                     v_loss = _value_loss(args, newvalue, b_values[mb], b_returns[mb])
 
                     if not mixture_warmup:
-                        novel_logits = agent.novel_policy_logits(b_obs[mb] / 255.0)
+                        novel_logits = agent.novel_policy_logits(b_obs[mb].float() / 255.0)
                         novel_dist = Categorical(logits=novel_logits)
                         novel_logprob = novel_dist.log_prob(b_actions[mb])
                         novel_pg, _, _ = _ppo_policy_loss(
@@ -812,7 +882,7 @@ def main():
                         novel_entropy = novel_dist.entropy().mean()
                         main_loss = novel_pg - args.ent_coef * novel_entropy + args.vf_coef * v_loss
                         last_drift = _drift_penalty(
-                            agent, old_fc, past_obs_pool, len(mb_np), device, args.drift_reg
+                            agent, old_fc, drift_sampler, len(mb_np), device, args.drift_reg
                         )
                         if last_drift is not None:
                             main_loss = main_loss + last_drift
@@ -833,7 +903,7 @@ def main():
                     opts["main"].step()
 
                     # Routing update against the actual stored behavior mixture.
-                    dist = agent.routing_action_distribution(b_obs[mb] / 255.0)
+                    dist = agent.routing_action_distribution(b_obs[mb].float() / 255.0)
                     mix_logprob = dist.log_prob(b_actions[mb])
                     mix_pg, logratio, ratio = _ppo_policy_loss(
                         args, mix_logprob, b_old_logprobs[mb], mb_adv
@@ -875,7 +945,7 @@ def main():
                     last_metrics["mixture_policy_loss"] = float(mix_pg.detach())
                 else:
                     _, newlogprob, entropy, newvalue = agent.get_action_and_value(
-                        b_obs[mb] / 255.0, b_actions[mb]
+                        b_obs[mb].float() / 255.0, b_actions[mb]
                     )
                     pg_loss, logratio, ratio = _ppo_policy_loss(
                         args, newlogprob, b_old_logprobs[mb], mb_adv
@@ -885,7 +955,7 @@ def main():
                     loss = pg_loss - args.ent_coef * entropy_loss + args.vf_coef * v_loss
 
                     last_drift = _drift_penalty(
-                        agent, old_fc, past_obs_pool, len(mb_np), device, args.drift_reg
+                        agent, old_fc, drift_sampler, len(mb_np), device, args.drift_reg
                     )
                     if last_drift is not None:
                         loss = loss + last_drift
@@ -997,6 +1067,17 @@ def main():
         f"optimization_transitions={budget.training}"
     )
 
+    # The merge/distillation/projection phase below is the memory peak of the
+    # whole run (it touches every retained pool buffer at once). Nothing from
+    # the PPO loop is needed any more, so release it first.
+    del old_fc, drift_sampler, obs_buf, actions_buf, logprobs_buf, rewards_buf, dones_buf, values_buf
+    old_fc = None
+    drift_sampler = None
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    _log_rss(writer, "post_train_loop", budget.training)
+
     if encoder_should_be_frozen:
         with torch.no_grad():
             current_encoder = torch.cat([p.detach().reshape(-1) for p in agent.fc.parameters()])
@@ -1040,6 +1121,7 @@ def main():
             )
         finally:
             tail_envs.close()
+    _log_rss(writer, "post_collect_merge_buffer", budget.total)
     merge_buffer = bounded_buffer(tail_buffer, args.max_distill_buffer) if needs_buffer else None
 
     final_step = budget.total
@@ -1081,11 +1163,14 @@ def main():
         )
 
     t_finalize = time.time()
+    _log_rss(writer, "pre_finalize", final_step)
     if args.prev_units:
         agent.finalize()
     else:
         agent.set_base()
+    gc.collect()
     finalize_seconds = time.time() - t_finalize
+    _log_rss(writer, "post_finalize", final_step)
     writer.add_scalar("timing/finalize_seconds", finalize_seconds, final_step)
     writer.add_scalar("analysis/pool/final_length", agent.policy_pool.pool_length(), final_step)
 

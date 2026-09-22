@@ -312,12 +312,34 @@ class HeadPool(nn.Module):
             return None
         n = len(buffer["obs"])
         if n <= max_rows:
-            return {k: v.copy() if isinstance(v, np.ndarray) else v for k, v in buffer.items()}
+            # Nothing is being trimmed, so nothing needs to be duplicated.
+            # Every array here is only ever read, never mutated in place, by
+            # the rest of this module, so handing back the same objects is
+            # safe and avoids an unconditional full-buffer copy (this used to
+            # cost a full extra copy of up to `max_rows` Atari frames on every
+            # call, even when it changed nothing).
+            return dict(buffer)
         idx = np.random.choice(n, size=max_rows, replace=False)
         return {
             k: (v[idx] if isinstance(v, np.ndarray) and len(v) == n else v)
             for k, v in buffer.items()
         }
+
+    @staticmethod
+    def _gather_two(buf1, buf2, key, idx1_local, idx2_local):
+        """Gather rows from two buffers straight into one preallocated array.
+
+        Building `buf1[key][idx1]` and `buf2[key][idx2]` and then
+        concatenating them (the previous approach) keeps three full-size
+        arrays alive at once. Gathering with `np.take(..., out=...)` keeps
+        only the destination alive, which matters a lot for multi-gigabyte
+        uint8 Atari frame stacks.
+        """
+        a, b = buf1[key], buf2[key]
+        out = np.empty((len(idx1_local) + len(idx2_local),) + a.shape[1:], dtype=a.dtype)
+        np.take(a, idx1_local, axis=0, out=out[: len(idx1_local)])
+        np.take(b, idx2_local, axis=0, out=out[len(idx1_local) :])
+        return out
 
     @staticmethod
     def merge_buffers(buf1, buf2, max_rows: int, balance_source_lineages: bool = False):
@@ -344,9 +366,20 @@ class HeadPool(nn.Module):
                 raise RuntimeError(
                     "--balance-source-lineages requires source_ids in every retained buffer"
                 )
-            combined = {key: np.concatenate([buf1[key], buf2[key]], axis=0) for key in keys}
-            idx = balanced_lineage_indices(combined["source_ids"], max_rows)
-            return {key: combined[key][idx] for key in keys}
+            # Only concatenate the (tiny) integer lineage arrays to compute the
+            # balanced selection; never materialize a combined copy of every
+            # per-frame array (that used to be a second full-size copy of both
+            # parent buffers, on top of the two parents already resident).
+            combined_source_ids = np.concatenate(
+                [buf1["source_ids"], buf2["source_ids"]], axis=0
+            )
+            idx = balanced_lineage_indices(combined_source_ids, max_rows)
+            idx1_local = idx[idx < n1]
+            idx2_local = idx[idx >= n1] - n1
+            return {
+                key: HeadPool._gather_two(buf1, buf2, key, idx1_local, idx2_local)
+                for key in keys
+            }
 
         half = max_rows // 2
         take1 = min(n1, half)
@@ -358,6 +391,6 @@ class HeadPool(nn.Module):
         idx1 = np.random.choice(n1, size=take1, replace=False)
         idx2 = np.random.choice(n2, size=take2, replace=False)
         return {
-            key: np.concatenate([buf1[key][idx1], buf2[key][idx2]], axis=0)
+            key: HeadPool._gather_two(buf1, buf2, key, idx1, idx2)
             for key in keys
         }

@@ -688,28 +688,37 @@ class CkaRlAgent(PolicySpaceMixin, nn.Module):
                     raise RuntimeError(
                         "--balance-source-lineages requires source_ids"
                     )
-            obs_all = np.concatenate(
-                [buf1["obs"], buf2["obs"]], axis=0
-            )
-            teacher_all = np.concatenate(
-                [
-                    np.zeros(len(buf1["obs"]), dtype=np.int64),
-                    np.ones(len(buf2["obs"]), dtype=np.int64),
-                ]
-            )
+            n1, n2 = len(buf1["obs"]), len(buf2["obs"])
+            # Only the (tiny) integer lineage ids need concatenating to pick a
+            # balanced selection. The previous version also concatenated the
+            # full 'obs' arrays of both parents just to index a handful of
+            # rows back out of them -- a full extra copy of up to both
+            # parent buffers (many GB of Atari frames) for a result that
+            # keeps at most distill_max_samples rows.
             source_all = np.concatenate(
                 [
                     np.asarray(buf1["source_ids"]).reshape(-1),
                     np.asarray(buf2["source_ids"]).reshape(-1),
                 ]
             )
-            take = min(len(obs_all), self.distill_max_samples)
+            take = min(n1 + n2, self.distill_max_samples)
             idx = balanced_lineage_indices(source_all, take)
-            return (
-                obs_all[idx],
-                teacher_all[idx],
-                source_all[idx].astype(np.int64, copy=False),
+            idx1_local = idx[idx < n1]
+            idx2_local = idx[idx >= n1] - n1
+            obs = HeadPool._gather_two(buf1, buf2, "obs", idx1_local, idx2_local)
+            teacher_ids = np.concatenate(
+                [
+                    np.zeros(len(idx1_local), dtype=np.int64),
+                    np.ones(len(idx2_local), dtype=np.int64),
+                ]
             )
+            source_ids = np.concatenate(
+                [
+                    np.asarray(buf1["source_ids"]).reshape(-1)[idx1_local],
+                    np.asarray(buf2["source_ids"]).reshape(-1)[idx2_local],
+                ]
+            ).astype(np.int64, copy=False)
+            return obs, teacher_ids, source_ids
 
         max_each = max(1, self.distill_max_samples // 2)
         obs_parts, teacher_ids, source_ids = [], [], []
