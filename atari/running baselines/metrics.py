@@ -227,6 +227,12 @@ def build_retention_matrix(args, env, method, seed, device):
         for eval_task in eval_task_ids:
             if eval_task not in seen:
                 continue
+
+            is_last_stage = (stage_idx == len(task_sequence) - 1)
+            is_diagonal = (eval_task == trained_task)
+            if not (is_diagonal or is_last_stage):
+                continue
+
             result = evaluate_checkpoint(
                 method,
                 checkpoints,
@@ -236,7 +242,7 @@ def build_retention_matrix(args, env, method, seed, device):
                 args.retention_eval_episodes,
                 seed,
                 device,
-                test_adapt_steps=args.test_adapt_steps,
+                test_adapt_steps=0 if is_diagonal else args.test_adapt_steps,
                 test_adapt_lr=args.test_adapt_lr,
                 action_mode=args.eval_action_mode,
                 success_threshold=success_threshold(args.success_thresholds, env, eval_task),

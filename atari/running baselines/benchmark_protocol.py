@@ -154,17 +154,16 @@ def scratch_checkpoint_dir(save_root, env: str, method: str, task_id: int, total
 
 
 def scratch_event_dir(runs_root, env: str, method: str, task_id: int, total_timesteps: int, seed: int) -> pathlib.Path:
-    env = canonical_env_name(env)
-    method = canonical_method(method)
+    env_lower = canonical_env_name(env).lower()  
+    
     return (
         pathlib.Path(runs_root)
         / "scratch"
-        / env
-        / method
+        / env_lower
         / f"task_{int(task_id)}"
         / f"steps_{int(total_timesteps)}"
         / f"seed_{int(seed)}"
-        / run_name(env, task_id, method, seed)
+        / f"{env_lower}__task_{int(task_id)}__cka-rl__run_ppo__{int(seed)}"
     )
 
 
