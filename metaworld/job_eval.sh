@@ -4,7 +4,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
-#SBATCH --time=48:00:00
+#SBATCH --time=18:00:00
 #SBATCH --gres=gpu:1
 #SBATCH --partition=h100
 #SBATCH --qos=normal
@@ -52,13 +52,13 @@ fi
 cd "$REPO_DIR"
 
 PROJECT_ROOT="${PROJECT_ROOT:-$HOME/Cont/Continual-RL-Project}"
-IMAGE="${ETHOS_IMAGE:-$HOME/containers/ethos_crl_torch280.sif}"
+IMAGE="${ETHOS_IMAGE:-$HOME/containers/ethos_crl_torch280_mj237.sif}"
 BASE_STORAGE="${BASE_STORAGE:-$PROJECT_ROOT/crl_experiments}"
 EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-$BASE_STORAGE/ethos_student_metaworld_paper10_500k}"
 LOG_ROOT="$EXPERIMENT_ROOT/logs"
 SCRATCH_ROOT_BASE="$EXPERIMENT_ROOT/scratch"
 SCRATCH_SEEDS=(101 102 103)
-EVAL_MODES=(deterministic stochastic)
+EVAL_MODES=(deterministic)
 
 clean_host_python_env() {
     if [[ -n "${VIRTUAL_ENV:-}" ]]; then
@@ -141,21 +141,19 @@ if [[ ! -f sanity_check_pool.py ]]; then
     exit 2
 fi
 
-VARIANTS=(baseline combined combined_policy combined_policy_student)
+# VARIANTS=(baseline combined_policy)
+VARIANTS=(combined_policy)
 
 COMMON_ARGS=(
-    --skip-training
-    --skip-invalid-seeds
     --task-suites mw_paper10
-    --seeds 1 2 3
     --total-timesteps 500000
     --pool-size 8
     --batch-size 128
     --policy-lr 1e-3
     --alpha-lr 5e-3
     --alpha-mass-lr 5e-3
-    --alpha-mass-reg 0.05
-    --alpha-warmup-steps 5000
+    --alpha-mass-reg 0.0
+    --alpha-warmup-steps 10000
     --alpha-entropy-reg 0.01
     --drift-reg 1.0
     --distill-encoder-lr-mult 0.1
@@ -165,20 +163,20 @@ COMMON_ARGS=(
     --alpha 0.2
     --autotune
     --autotune-init-from-alpha
-    --learning-starts 5000
-    --random-actions-end 5000
+    --learning-starts 10000
+    --random-actions-end 10000
     --eval-every 10000
     --num-evals 5
     --retention-eval-episodes 5
-    --test-adapt-steps 5000
+    --test-adapt-steps 10000
     --frozen-eval-policy pool
     --no-distill-observation-skip
-    --distill-buffer-steps 10000
-    --similarity-samples 2048
-    --no-balance-source-lineages
-    --max-distill-buffer 50000
-    --distill-max-samples 20000
-    --distill-epochs 16
+    --distill-buffer-steps 20000
+    --similarity-samples 4096
+    --balance-source-lineages
+    --max-distill-buffer 100000
+    --distill-max-samples 40000
+    --distill-epochs 32
     --distill-lr 5e-4
     --distill-batch-size 256
     --distill-test-frac 0.2
@@ -298,7 +296,12 @@ echo "[main] output:       $RUN_ROOT"
 echo "[main] container:    $IMAGE"
 echo "============================================================"
 
-run_in_container python -u "$REPO_DIR/sanity_check_pool.py"
+# sanity_check_pool.py uses a fixed /tmp path. Serialize it per node so
+# concurrently scheduled evaluation jobs cannot collide.
+(
+    flock -x 9
+    run_in_container python -u "$REPO_DIR/sanity_check_pool.py"
+) 9>/tmp/cka_pool_sanity.lock
 
 run_in_container python -u "$REPO_DIR/run_continual_benchmark.py" \
     "${COMMON_ARGS[@]}" \

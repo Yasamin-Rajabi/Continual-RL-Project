@@ -2,7 +2,7 @@
 #SBATCH --job-name=causal
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
 #SBATCH --time=48:00:00
 #SBATCH --gres=gpu:1
@@ -64,7 +64,7 @@ cd "$REPO_DIR"
 PROJECT_ROOT="${PROJECT_ROOT:-$HOME/Cont/Continual-RL-Project}"
 IMAGE="${ETHOS_IMAGE:-$HOME/containers/ethos_crl_torch280_mj237.sif}"
 BASE_STORAGE="${BASE_STORAGE:-$PROJECT_ROOT/crl_experiments}"
-EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-$BASE_STORAGE/ethos_student_metaworld_paper10_500k}"
+EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-$BASE_STORAGE/ethos_student_metaworld_paper6_1000k}"
 LOG_ROOT="$EXPERIMENT_ROOT/logs"
 SCRATCH_ROOT_BASE="$EXPERIMENT_ROOT/scratch"
 SCRATCH_SEEDS=(101 102 103)
@@ -152,13 +152,14 @@ if [[ ! -f sanity_check_pool.py ]]; then
     exit 2
 fi
 
-# VARIANTS=(baseline combined_policy)
-VARIANTS=(combined_policy)
+VARIANTS=(baseline combined_policy)
+# VARIANTS=(combined_policy)
 
 COMMON_ARGS=(
-    --task-suites mw_paper10
-    --total-timesteps 500000
-    --pool-size 8
+    # --task-suites mw_paper10
+    --task-suites mw_paper6
+    --total-timesteps 1000000
+    --pool-size 5
     --batch-size 128
     --policy-lr 1e-3
     --alpha-lr 5e-3
@@ -176,7 +177,7 @@ COMMON_ARGS=(
     --autotune-init-from-alpha
     --learning-starts 10000
     --random-actions-end 10000
-    --eval-every 10000
+    --eval-every 100000
     --num-evals 5
     --retention-eval-episodes 5
     --test-adapt-steps 10000
@@ -228,7 +229,7 @@ if [[ "$MODE" != "--worker" && "$MODE" != "--aggregate-worker" ]]; then
 
     if [[ "$AGGREGATE" -eq 1 ]]; then
         echo "============================================================"
-        echo "Submitting MetaWorld paper10 aggregation/evaluation jobs"
+        echo "Submitting MetaWorld paper6 aggregation/evaluation jobs"
         echo "Methods: ${VARIANTS[*]}"
         echo "Modes: ${EVAL_MODES[*]}"
         echo "Seeds: ${MAIN_SEEDS[*]}"
@@ -256,7 +257,7 @@ if [[ "$MODE" != "--worker" && "$MODE" != "--aggregate-worker" ]]; then
     fi
 
     echo "============================================================"
-    echo "Submitting MetaWorld paper10 main runs with one SLURM job per seed"
+    echo "Submitting MetaWorld paper6 main runs with one SLURM job per seed"
     echo "Methods: ${VARIANTS[*]}"
     echo "Modes: ${EVAL_MODES[*]}"
     echo "Seeds: ${MAIN_SEEDS[*]}"
@@ -313,26 +314,33 @@ mkdir -p "$RUN_ROOT/agents" "$RUN_ROOT/runs" "$RUN_ROOT/plots" "$RUN_ROOT/analys
 prepare_container_runtime
 verify_container_runtime
 
-if [[ ! -d "$SCRATCH_MODE_ROOT/runs/scratch" ]]; then
-    echo "ERROR: scratch TensorBoard logs are missing: $SCRATCH_MODE_ROOT/runs/scratch" >&2
-    exit 3
-fi
-EXPECTED_SCRATCH_LINK="$(realpath "$SCRATCH_MODE_ROOT/runs/scratch")"
-if [[ -L "$RUN_ROOT/runs/scratch" ]]; then
-    CURRENT_SCRATCH_LINK="$(readlink -f "$RUN_ROOT/runs/scratch")"
-    if [[ "$CURRENT_SCRATCH_LINK" != "$EXPECTED_SCRATCH_LINK" ]]; then
-        echo "ERROR: $RUN_ROOT/runs/scratch points to $CURRENT_SCRATCH_LINK, expected $EXPECTED_SCRATCH_LINK" >&2
+if [[ "$MODE" == "--aggregate-worker" ]]; then
+    if [[ ! -d "$SCRATCH_MODE_ROOT/runs/scratch" ]]; then
+        echo "ERROR: scratch TensorBoard logs are missing: $SCRATCH_MODE_ROOT/runs/scratch" >&2
         exit 3
     fi
-elif [[ -e "$RUN_ROOT/runs/scratch" ]]; then
-    echo "ERROR: $RUN_ROOT/runs/scratch exists and is not a symlink" >&2
-    exit 3
-else
-    if ! ln -s "$EXPECTED_SCRATCH_LINK" "$RUN_ROOT/runs/scratch" 2>/dev/null; then
-        # Another seed job may have created the same correct symlink concurrently.
-        if [[ ! -L "$RUN_ROOT/runs/scratch" ]] ||            [[ "$(readlink -f "$RUN_ROOT/runs/scratch")" != "$EXPECTED_SCRATCH_LINK" ]]; then
-            echo "ERROR: could not create scratch symlink safely: $RUN_ROOT/runs/scratch" >&2
+
+    EXPECTED_SCRATCH_LINK="$(realpath "$SCRATCH_MODE_ROOT/runs/scratch")"
+
+    if [[ -L "$RUN_ROOT/runs/scratch" ]]; then
+        CURRENT_SCRATCH_LINK="$(readlink -f "$RUN_ROOT/runs/scratch")"
+
+        if [[ "$CURRENT_SCRATCH_LINK" != "$EXPECTED_SCRATCH_LINK" ]]; then
+            echo "ERROR: $RUN_ROOT/runs/scratch points to $CURRENT_SCRATCH_LINK, expected $EXPECTED_SCRATCH_LINK" >&2
             exit 3
+        fi
+
+    elif [[ -e "$RUN_ROOT/runs/scratch" ]]; then
+        echo "ERROR: $RUN_ROOT/runs/scratch exists and is not a symlink" >&2
+        exit 3
+
+    else
+        if ! ln -s "$EXPECTED_SCRATCH_LINK" "$RUN_ROOT/runs/scratch" 2>/dev/null; then
+            if [[ ! -L "$RUN_ROOT/runs/scratch" ]] || \
+               [[ "$(readlink -f "$RUN_ROOT/runs/scratch")" != "$EXPECTED_SCRATCH_LINK" ]]; then
+                echo "ERROR: could not create scratch symlink safely: $RUN_ROOT/runs/scratch" >&2
+                exit 3
+            fi
         fi
     fi
 fi
@@ -348,7 +356,7 @@ case "$VARIANT" in
 esac
 
 echo "============================================================"
-echo "[main] environment:  MetaWorld paper10"
+echo "[main] environment:  MetaWorld paper6"
 echo "[main] variant:      $VARIANT"
 echo "[main] evaluation:   $EVAL_MODE"
 if [[ "$MODE" == "--worker" ]]; then
@@ -421,7 +429,7 @@ else
 
     echo "============================================================"
     echo "[done aggregate] $VARIANT / $EVAL_MODE / seeds ${MAIN_SEEDS[*]}"
-    echo "[done aggregate] survey metrics: $RUN_ROOT/plots/mw_paper10/survey_metrics.csv"
+    echo "[done aggregate] survey metrics: $RUN_ROOT/plots/mw_paper6/survey_metrics.csv"
     echo "[done aggregate] plots: $RUN_ROOT/plots"
     echo "============================================================"
 fi

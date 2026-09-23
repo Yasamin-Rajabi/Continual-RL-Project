@@ -110,6 +110,25 @@ _PAPER10 = tuple(MetaWorldTask(name, "paper", "CKA-RL appendix C.1 task list") f
     "hammer-v2", "push-wall-v2", "faucet-close-v2", "push-back-v2", "stick-pull-v2",
     "handle-press-side-v2", "push-v2", "shelf-place-v2", "window-close-v2", "peg-unplug-side-v2",
 ))
+
+# Reduced paper suite: six tasks drawn only from mw_paper10.
+# The first three preserve the documented Continual World transfer-with-distractor
+# triplet. The remaining three add distinct manipulation types while avoiding
+# redundant push variants and the two very-hard tasks in the full paper10 set.
+_PAPER6: Tuple[MetaWorldTask, ...] = (
+    MetaWorldTask("window-close-v2", "paper",
+                  "mw_paper10 subset; CW triplet source"),
+    MetaWorldTask("handle-press-side-v2", "paper",
+                  "mw_paper10 subset; CW triplet distractor"),
+    MetaWorldTask("peg-unplug-side-v2", "paper",
+                  "mw_paper10 subset; CW triplet target"),
+    MetaWorldTask("faucet-close-v2", "paper",
+                  "mw_paper10 subset; articulated-object manipulation"),
+    MetaWorldTask("hammer-v2", "paper",
+                  "mw_paper10 subset; tool-use manipulation"),
+    MetaWorldTask("push-wall-v2", "paper",
+                  "mw_paper10 subset; pushing manipulation"),
+)
 _LEGACY7 = tuple(MetaWorldTask(name, "legacy", "Original meta-world folder task list") for name in (
     "hammer-v2", "faucet-close-v2", "stick-pull-v2", "handle-press-side-v2", "push-v2",
     "window-close-v2", "peg-unplug-side-v2",
@@ -117,6 +136,7 @@ _LEGACY7 = tuple(MetaWorldTask(name, "legacy", "Original meta-world folder task 
 
 TASK_SUITES: Dict[str, List[MetaWorldTask]] = {
     "mw_paper10": list(_PAPER10),
+    "mw_paper6": list(_PAPER6),
     "mw_legacy7": list(_LEGACY7),
     "mw_easy4": list(_EASY4),
     "mw_easy6": list(_EASY6),
@@ -131,6 +151,7 @@ SMOKE_CONTINUAL_SEQUENCE = (0, 1, 0)
 
 SEQUENCES = {
     "mw_paper10": tuple(range(10)) * 2,
+    "mw_paper6": tuple(range(6)) * 2,
     "mw_legacy7": tuple(range(7)) * 2 + (1, 3, 5),
     "mw_easy4": DEFAULT_CONTINUAL_SEQUENCE,
     "mw_easy6": EASY6_CONTINUAL_SEQUENCE,
@@ -168,7 +189,7 @@ def get_task(task_id: int, task_suite: str = "mw_easy4", render: bool = False):
     # task_id, not a random seed: with frozen goal placements the seed IS the
     # task, so train and eval envs must agree. See metaworld_envs.
     return make_env(spec.name, task_id=task_id, render=render,
-                    freeze_goal=task_suite not in ("mw_paper10", "mw_legacy7"))
+                    freeze_goal=task_suite not in ("mw_paper10", "mw_paper6", "mw_legacy7"))
 
 
 if __name__ == "__main__":

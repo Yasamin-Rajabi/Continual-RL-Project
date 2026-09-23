@@ -34,7 +34,7 @@ from tasks import get_task, get_task_name
 @dataclass
 class Args:
     model_type: Literal["cka-rl"] = "cka-rl"
-    task_suite: Literal["mw_easy4", "mw_easy6", "mw_smoke2", "mw_paper10", "mw_legacy7"] = "mw_easy4"
+    task_suite: Literal["mw_easy4", "mw_easy6", "mw_smoke2", "mw_paper10", "mw_paper6", "mw_legacy7"] = "mw_easy4"
     fusion_mode: Literal["classic_cka", "weight_delta"] = "classic_cka"
     eval_action_mode: Literal["deterministic", "stochastic"] = "deterministic"
     composition_space: Literal["parameter", "policy"] = "parameter"

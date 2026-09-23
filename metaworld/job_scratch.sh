@@ -2,7 +2,7 @@
 #SBATCH --job-name=causal
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
 #SBATCH --time=48:00:00
 #SBATCH --gres=gpu:1
@@ -23,7 +23,7 @@ cd "$REPO_DIR"
 PROJECT_ROOT="${PROJECT_ROOT:-$HOME/Cont/Continual-RL-Project}"
 IMAGE="${ETHOS_IMAGE:-$HOME/containers/ethos_crl_torch280.sif}"
 BASE_STORAGE="${BASE_STORAGE:-$PROJECT_ROOT/crl_experiments}"
-EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-$BASE_STORAGE/ethos_student_metaworld_paper10_500k}"
+EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-$BASE_STORAGE/ethos_student_metaworld_paper6_1000k}"
 LOG_ROOT="$EXPERIMENT_ROOT/logs"
 SCRATCH_ROOT_BASE="$EXPERIMENT_ROOT/scratch"
 SCRATCH_SEEDS=(101 102 103)
@@ -107,10 +107,10 @@ if [[ ! -f scratch_baselines.py ]]; then
 fi
 
 SCRATCH_ARGS=(
-    --task-suites mw_paper10
+    --task-suites mw_paper6
     --seeds 1 2 3
-    --total-timesteps 500000
-    --pool-size 8
+    --total-timesteps 1000000
+    --pool-size 5
     --batch-size 128
     --policy-lr 1e-3
     --alpha-lr 5e-3
@@ -127,7 +127,7 @@ SCRATCH_ARGS=(
     --autotune-init-from-alpha
     --learning-starts 10000
     --random-actions-end 10000
-    --eval-every 10000
+    --eval-every 100000
     --num-evals 5
     --no-distill-observation-skip
     --distill-buffer-steps 20000
@@ -151,7 +151,7 @@ if [[ "$MODE" != "--worker" ]]; then
     mkdir -p "$LOG_ROOT" "$SCRATCH_ROOT_BASE"
     SCRIPT_PATH="$(realpath "$0")"
     echo "============================================================"
-    echo "Submitting MetaWorld paper10 FT scratch baselines"
+    echo "Submitting MetaWorld paper6 FT scratch baselines"
     echo "Modes: ${EVAL_MODES[*]}"
     echo "Scratch seeds: ${SCRATCH_SEEDS[*]}"
     echo "Container: $IMAGE"
@@ -192,10 +192,10 @@ prepare_container_runtime
 verify_container_runtime
 
 echo "============================================================"
-echo "[scratch] environment: MetaWorld paper10"
+echo "[scratch] environment: MetaWorld paper6"
 echo "[scratch] mode:        $EVAL_MODE"
 echo "[scratch] seed:        $SCRATCH_SEED"
-echo "[scratch] suite:       mw_paper10"
+echo "[scratch] suite:       mw_paper6"
 echo "[scratch] root:        $SCRATCH_MODE_ROOT"
 echo "[scratch] container:   $IMAGE"
 echo "============================================================"
