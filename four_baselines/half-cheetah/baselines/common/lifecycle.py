@@ -198,6 +198,27 @@ class ContinualAgent(nn.Module):
         """
         return None
 
+    def prepare_for_evaluation(self) -> None:
+        """Put the agent into the state its snapshot was exported in.
+
+        Default is a no-op, because most baselines never leave it. MaskNet does:
+        ``on_task_start`` resets the sigmoid slope to the soft end of the ramp,
+        which is right for training and wrong for re-exporting an already
+        finished task. Anything that reloads a chain state and exports without
+        training calls this first.
+        """
+        return None
+
+    def auxiliary_loss(self) -> Optional[torch.Tensor]:
+        """An extra term added to the actor objective, or None.
+
+        Default is None. MaskNet uses it for the capacity-sparsity penalty that
+        keeps early tasks from claiming the whole backbone. Routed through the
+        shared loop rather than a special case inside one baseline, so every
+        method's actor update is still literally the same code path.
+        """
+        return None
+
     def on_phase_boundary(self, step: int, budget) -> None:
         """Called every optimization step with the step index and TaskBudget.
 
@@ -255,6 +276,19 @@ class ContinualAgent(nn.Module):
     def shared_encoder(self) -> nn.Module:
         """Return the ``shared_arch.shared`` encoder for the snapshot."""
         raise NotImplementedError
+
+    def effective_hidden_dim(self) -> int:
+        """Width of the hidden layer in the EXPORTED two-layer head.
+
+        Usually ``hidden_dim``. ProgNet overrides it: its exported head stacks
+        the active column's hidden units together with every earlier column's,
+        because that stacked form is what its lateral connections flatten into
+        exactly (see prognet.py). ``FrozenCkaPolicy`` places no constraint on
+        this width -- it just does linear, ReLU, linear -- so the only thing
+        that has to be right is that the snapshot validator checks against the
+        width the agent actually exports.
+        """
+        return self.hidden_dim
 
     # ------------------------------------------------------------------
     # Chain state. Do not override; use extra_state / load_extra_state.

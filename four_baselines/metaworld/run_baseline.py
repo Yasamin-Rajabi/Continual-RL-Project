@@ -120,7 +120,11 @@ class Args:
     prognet_adapter_dim: int = 64
     packnet_keep_fraction: float = 0.5
     packnet_retrain_fraction: float = 0.3
-    masknet_gate_init: float = 2.0
+    masknet_gate_init: float = 0.0
+    """Mean of the gate-logit initialisation. Zero puts every gate at one half
+    at the start of the ramp. A positive value saturates the gates open once the
+    slope anneals, which lets the first task claim the whole backbone and
+    starves every later one; see baselines/common/masks.py."""
     masknet_sparsity_reg: float = 0.0
 
     verify_snapshot_tolerance: float = 1e-5

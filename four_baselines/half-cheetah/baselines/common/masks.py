@@ -34,26 +34,39 @@ import torch.nn as nn
 FREE = 0
 
 
-def prunable_parameters(module: nn.Module) -> List[Tuple[str, nn.Parameter]]:
+def prunable_parameters(module: nn.Module,
+                        exclude_prefixes: Tuple[str, ...] = ()) -> List[Tuple[str, nn.Parameter]]:
     """Return the weight tensors PackNet/MaskNet operate on.
 
     Biases and 1-D parameters are excluded: pruning them buys almost no
     capacity and destabilizes the head far more than it saves.
+
+    ``exclude_prefixes`` keeps whole submodules out. PackNet passes ``("fc.",)``
+    to leave the shared encoder alone. Pruning it would be actively harmful
+    there: the encoder is frozen after the root task, so weights pruned out of
+    it can never be reclaimed by a later task, and the only effect is to
+    permanently throw away half the shared representation that every task
+    depends on.
     """
     result = []
     for name, param in module.named_parameters():
-        if param.dim() >= 2:
-            result.append((name, param))
+        if param.dim() < 2:
+            continue
+        if any(name.startswith(prefix) for prefix in exclude_prefixes):
+            continue
+        result.append((name, param))
     return result
 
 
 class OwnershipBook:
     """Tracks which capacity slice owns each weight of each parameter."""
 
-    def __init__(self, module: nn.Module):
+    def __init__(self, module: nn.Module,
+                 exclude_prefixes: Tuple[str, ...] = ()):
+        self.exclude_prefixes = tuple(exclude_prefixes)
         self._owner: Dict[str, torch.Tensor] = {
             name: torch.full_like(param, FREE, dtype=torch.int16)
-            for name, param in prunable_parameters(module)
+            for name, param in prunable_parameters(module, self.exclude_prefixes)
         }
 
     # -- state -------------------------------------------------------
@@ -82,6 +95,15 @@ class OwnershipBook:
         return self._owner.keys()
 
     # -- queries -----------------------------------------------------
+    def owner_tensor(self, name: str) -> torch.Tensor:
+        """The raw ownership tensor, for callers building their own masks.
+
+        PackNet needs "owned by me OR free" and "owned by a slice at or before
+        mine", neither of which is one of the named queries below, so it reads
+        this rather than reaching into a private attribute.
+        """
+        return self._owner[name]
+
     def free_mask(self, name: str) -> torch.Tensor:
         """Boolean mask of weights owned by nobody."""
         return self._owner[name] == FREE
@@ -188,7 +210,12 @@ def restore_frozen_weights(module: nn.Module, book: OwnershipBook,
             frozen = book.frozen_mask(name, active_slice=active_slice)
             if not bool(frozen.any()):
                 continue
-            param.data = torch.where(frozen, reference[name].to(param.device), param.data)
+            # copy_ rather than rebinding param.data: Adam keys its state on the
+            # Parameter object and reads p.data in place, so swapping the tensor
+            # out from under it is asking for trouble on some versions.
+            param.data.copy_(
+                torch.where(frozen, reference[name].to(param.device), param.data)
+            )
 
 
 def snapshot_weights(module: nn.Module) -> Dict[str, torch.Tensor]:
@@ -212,33 +239,60 @@ class TaskGates(nn.Module):
     ``num_slices`` grows as unseen tasks arrive. A recurring task selects its
     existing gate rather than adding one, so gate count equals the number of
     UNIQUE tasks, not the sequence length.
+
+    INITIALISATION IS LOAD-BEARING
+    ------------------------------
+    Logits start near zero with a small random spread, NOT at a constant
+    positive bias. A constant positive init looks friendlier -- every unit
+    starts open, so the first task learns freely -- but it is a trap. Once the
+    sigmoid slope is annealed up, every gate saturates at one, the first task
+    ends up claiming the entire backbone, and every later task finds nothing
+    unclaimed. The method degenerates into "train task 0, then freeze", and it
+    does so quietly: no error, no obviously broken curve, just later tasks that
+    never learn.
+
+    Starting at zero gives a gate of one half everywhere, so signal still flows
+    early, and the random spread is what lets units differentiate at all --
+    identical logits would receive identical gradients forever and no task
+    could ever specialise.
     """
 
-    def __init__(self, num_slices: int, width: int, *, init_bias: float = 2.0):
+    def __init__(self, num_slices: int, width: int, *, init_bias: float = 0.0,
+                 init_std: float = 0.1):
         super().__init__()
         if num_slices < 1 or width < 1:
             raise ValueError("num_slices and width must be >= 1")
         self.width = int(width)
-        # Positive init so every unit starts roughly open and the task has to
-        # learn what to switch off. Starting near zero silences the backbone
-        # and the task never gets a learning signal.
-        self.logits = nn.Parameter(torch.full((int(num_slices), int(width)), float(init_bias)))
+        self.init_std = float(init_std)
+        self.logits = nn.Parameter(
+            torch.randn(int(num_slices), int(width)) * self.init_std + float(init_bias)
+        )
 
     @property
     def num_slices(self) -> int:
         return int(self.logits.shape[0])
 
-    def grow(self, additional: int = 1, *, init_bias: float = 2.0) -> None:
+    def grow(self, additional: int = 1, *, init_bias: float = 0.0) -> None:
         """Append ``additional`` new gate rows, preserving existing ones."""
         if additional < 1:
             return
         with torch.no_grad():
-            extra = torch.full(
-                (int(additional), self.width), float(init_bias),
+            extra = torch.randn(
+                int(additional), self.width,
                 device=self.logits.device, dtype=self.logits.dtype,
-            )
+            ) * self.init_std + float(init_bias)
             grown = torch.cat([self.logits.data, extra], dim=0)
         self.logits = nn.Parameter(grown)
+
+    def gate_at(self, slice_index: int, slope: float) -> torch.Tensor:
+        """Gate for one slice at an explicit sigmoid slope.
+
+        Taking the slope as an argument rather than reading a shared one matters
+        when comparing a finished task against a running one: a finished task's
+        gate has to be read at the slope it was hardened at, not at whatever
+        the current task's ramp happens to have reached.
+        """
+        return torch.sigmoid(float(slope) * self.logits[int(slice_index)])
 
     def gate(self, slice_index: int) -> torch.Tensor:
         if not 0 <= int(slice_index) < self.num_slices:

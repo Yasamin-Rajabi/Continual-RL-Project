@@ -80,7 +80,8 @@ def export_snapshot(agent) -> Dict[str, Any]:
                 )
             _validate_head(
                 head_name, heads[head_name],
-                in_dim=256, hidden_dim=agent.hidden_dim, act_dim=agent.act_dim,
+                in_dim=256, hidden_dim=agent.effective_hidden_dim(),
+                act_dim=agent.act_dim,
             )
         encoder = agent.shared_encoder()
         return {

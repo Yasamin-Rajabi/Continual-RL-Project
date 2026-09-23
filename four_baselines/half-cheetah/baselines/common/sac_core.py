@@ -444,6 +444,9 @@ def train_task(agent, ctx, args, writer, device) -> Dict[str, float]:
             if global_step % args.policy_frequency == 0:
                 for _ in range(args.policy_frequency):
                     actor_loss = actor.actor_objective(data.observations, qf1, qf2, alpha)
+                    auxiliary = agent.auxiliary_loss()
+                    if auxiliary is not None:
+                        actor_loss = actor_loss + auxiliary
                     actor_optimizer.zero_grad()
                     actor_loss.backward()
                     # Parameter isolation: mask gradients, step, then restore
