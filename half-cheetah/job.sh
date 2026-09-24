@@ -155,7 +155,7 @@ if [[ ! -f sanity_check_pool.py ]]; then
 fi
 
 # VARIANTS=(baseline combined combined_policy combined_policy_student)
-VARIANTS=(baseline)
+VARIANTS=(combined_policy)
 
 COMMON_ARGS=(
     --task-suites halfcheetah_wind_vel

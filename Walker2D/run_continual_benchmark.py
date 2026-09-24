@@ -103,6 +103,8 @@ def parse_args():
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--tau", type=float, default=0.005)
     p.add_argument("--pool-size", type=int, default=5)
+    p.add_argument("--merge-ablation", choices=["kl_merge", "random_merge", "kl_discard"], default="kl_merge",
+                   help="Pool overflow ablation: KL pair + distill, random pair + distill, or KL pair with discard only.")
     p.add_argument("--eval-every", type=int, default=10_000)
     p.add_argument("--num-evals", type=int, default=5)
     p.add_argument("--retention-eval-episodes", type=int, default=3)
@@ -288,6 +290,7 @@ def _expected_training_config(args, suite, task_id, seq_idx, seed, cfg):
         "autotune": bool(args.autotune),
         "autotune_init_from_alpha": bool(args.autotune_init_from_alpha),
         "pool_size": int(args.pool_size),
+        "merge_ablation": str(args.merge_ablation),
         "eval_every": int(args.eval_every),
         "num_evals": int(args.num_evals),
         "encoder_from_base": bool(args.encoder_from_base),

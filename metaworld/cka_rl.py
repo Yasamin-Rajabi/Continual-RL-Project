@@ -75,6 +75,7 @@ class CkaRlAgent(PolicySpaceMixin, nn.Module):
         projection_epochs=16,
         projection_max_samples=20000,
         policy_student_replay=False,
+        merge_ablation="kl_merge",
     ):
         super().__init__()
         if composition_space not in ("parameter", "policy"):
@@ -83,6 +84,9 @@ class CkaRlAgent(PolicySpaceMixin, nn.Module):
             raise ValueError("A probability mixture requires a bounded sigmoid alpha-mass")
         self.composition_space = composition_space
         self.policy_student_replay = bool(policy_student_replay)
+        if merge_ablation not in ("kl_merge", "random_merge", "kl_discard"):
+            raise ValueError("invalid merge_ablation")
+        self.merge_ablation = str(merge_ablation)
         if self.policy_student_replay and (composition_space != "policy" or not use_alpha_mass or fusion_mode != "weight_delta"):
             raise ValueError("policy_student_replay requires policy composition, weight_delta, and alpha-mass")
         self.projection_epochs = int(projection_epochs)
@@ -408,6 +412,13 @@ class CkaRlAgent(PolicySpaceMixin, nn.Module):
             f"[cosine merge] pair=({idx1},{idx2}) cosine={selected:.6f}"
         )
         return idx1, idx2, stats
+
+    def _select_random_pair(self):
+        n = self.mean_pool.pool_length()
+        if n < 2:
+            raise RuntimeError("cannot select a merge pair from fewer than two pool entries")
+        i, j = np.random.choice(n, size=2, replace=False)
+        return int(i), int(j), {"similarity_metric": "random", "selected_random_pair": True}
 
     def _select_behavioral_pair(self):
         n = self.mean_pool.pool_length()
@@ -762,10 +773,25 @@ class CkaRlAgent(PolicySpaceMixin, nn.Module):
         if not self.mean_pool.needs_merge():
             return
 
-        if self.distillation:
+        if self.merge_ablation == "random_merge":
+            idx1, idx2, merge_info = self._select_random_pair()
+        elif self.merge_ablation == "kl_merge" and self.distillation:
+            idx1, idx2, merge_info = self._select_behavioral_pair()
+        elif self.merge_ablation == "kl_discard":
+            idx1, idx2, merge_info = self._select_behavioral_pair()
+        elif self.distillation:
             idx1, idx2, merge_info = self._select_behavioral_pair()
         else:
             idx1, idx2, merge_info = self._select_cosine_pair()
+
+        if self.merge_ablation == "kl_discard":
+            remove = idx2
+            self.mean_pool.pool.pop(remove)
+            self.logstd_pool.pool.pop(remove)
+            merge_info.update({"used_distillation": False, "discard_only": True, "discarded_index": int(remove)})
+            self.last_merge_info = merge_info
+            self._assert_pool_alignment()
+            return
 
         if self.distillation:
             mean_params, log_params, distill_metrics = self._distill_pair(idx1, idx2)

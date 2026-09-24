@@ -288,6 +288,7 @@ def _expected_training_config(args, suite, task_id, seq_idx, seed, cfg):
         "autotune": bool(args.autotune),
         "autotune_init_from_alpha": bool(args.autotune_init_from_alpha),
         "pool_size": int(args.pool_size),
+        "merge_ablation": str(args.merge_ablation),
         "eval_every": int(args.eval_every),
         "num_evals": int(args.num_evals),
         "encoder_from_base": bool(args.encoder_from_base),

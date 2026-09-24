@@ -26,7 +26,7 @@ EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-$BASE_STORAGE/ethos_student_walker2d_150k}"
 LOG_ROOT="$EXPERIMENT_ROOT/logs"
 SCRATCH_ROOT_BASE="$EXPERIMENT_ROOT/scratch"
 SCRATCH_SEEDS=(101 102 103)
-EVAL_MODES=(deterministic stochastic)
+EVAL_MODES=(deterministic)
 
 clean_host_python_env() {
     if [[ -n "${VIRTUAL_ENV:-}" ]]; then
@@ -107,14 +107,14 @@ fi
 
 SCRATCH_ARGS=(
     --task-suites walker2d_dynamics
-    --seeds 1 2 3
     --total-timesteps 150000
     --pool-size 5
     --batch-size 256
     --policy-lr 3e-4
     --alpha-lr 5e-3
-    --alpha-mass-reg 0.05
-    --alpha-warmup-steps 5000
+    --alpha-mass-lr 5e-3
+    --alpha-mass-reg 0.0
+    --alpha-warmup-steps 10000
     --alpha-entropy-reg 0.01
     --drift-reg 1.0
     --distill-encoder-lr-mult 0.1
@@ -124,13 +124,18 @@ SCRATCH_ARGS=(
     --alpha 0.2
     --autotune
     --autotune-init-from-alpha
-    --learning-starts 5000
+    --learning-starts 10000
     --random-actions-end 5000
     --eval-every 5000
     --num-evals 5
+    --retention-eval-episodes 5
+    --test-adapt-steps 5000
+    --frozen-eval-policy pool
     --no-distill-observation-skip
-    --distill-buffer-steps 5000
+    --distill-buffer-steps 7000
     --similarity-samples 2048
+    # --no-balance-source-lineages
+    --balance-source-lineages
     --max-distill-buffer 50000
     --distill-max-samples 20000
     --distill-epochs 16
@@ -143,6 +148,10 @@ SCRATCH_ARGS=(
     --no-freeze-root-encoder
     --encoder-from-base
     --no-encoder-linear-out
+    --no-condition-alpha-scale
+    --no-use-alpha-scale
+    --no-fix-alpha-scale
+    --weight-use-alpha-mass
     --constrain-alpha-mass
 )
 
