@@ -404,6 +404,7 @@ def train_chain(args, suite, condition, cfg, seed):
             f"--distill-batch-size={args.distill_batch_size}",
             f"--distill-test-frac={args.distill_test_frac}",
             f"--analysis-log-every={args.analysis_log_every}",
+            f"--merge-ablation={args.merge_ablation}",
             f"--fusion-mode={cfg['fusion_mode']}",
             f"--composition-space={cfg.get('composition_space', 'parameter')}",
             "--policy-student-replay" if args.policy_student_replay else "--no-policy-student-replay",

@@ -1,0 +1,27 @@
+[
+  {
+    "donor_path": "pointmaze/src/baselines/cbp_modules.py",
+    "original_sha256": "cc3797c9e902e47721a651970a9f72f5cb73da96c4e9f6a2dd40861261f7cf78",
+    "target": "vendor/cbp_modules.py"
+  },
+  {
+    "donor_path": "pointmaze/src/baselines/componet_modules.py",
+    "original_sha256": "a59a92cdde878bacc6212f2ea58290e796053fa8b847f44ed6ca55e4d0913262",
+    "target": "vendor/componet_modules.py"
+  },
+  {
+    "donor_path": "pointmaze/src/baselines/mask_modules.py",
+    "original_sha256": "99ed9ad7510247aa04c08347503a139946a400331da8c0e77b3d02f877429ff9",
+    "target": "vendor/mask_modules.py"
+  },
+  {
+    "donor_path": "pointmaze/src/baselines/agents.py:ProgressiveColumn",
+    "original_sha256": "e9cbe65dd9a2b5f96bdd7481ce263abb64d4ceadf93c94943410f58903f0f9ea",
+    "target": "vendor/progressive_column.py"
+  },
+  {
+    "donor_path": "four_baselines/half-cheetah/baselines/common/sac_core.py",
+    "original_sha256": "c1f30bd10502c2c29144d3d8a9d55ef13378780a4cab6b5f6b6b1941a30834d3",
+    "target": "baseline_sac.py"
+  }
+]

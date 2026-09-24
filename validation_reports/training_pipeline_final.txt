@@ -1,0 +1,15 @@
+============================= test session starts ==============================
+platform linux -- Python 3.13.5, pytest-9.0.2, pluggy-1.6.0 -- /opt/pyvenv/bin/python
+cachedir: .pytest_cache
+rootdir: /mnt/data/crl_integration/work
+collecting ... collected 7 items
+
+tests_paper/test_training_pipeline.py::test_train_reload_csv_and_evaluate_real_torch_fake_env[ft_n] PASSED [ 14%]
+tests_paper/test_training_pipeline.py::test_train_reload_csv_and_evaluate_real_torch_fake_env[prognet] PASSED [ 28%]
+tests_paper/test_training_pipeline.py::test_train_reload_csv_and_evaluate_real_torch_fake_env[packnet] PASSED [ 42%]
+tests_paper/test_training_pipeline.py::test_train_reload_csv_and_evaluate_real_torch_fake_env[masknet] PASSED [ 57%]
+tests_paper/test_training_pipeline.py::test_train_reload_csv_and_evaluate_real_torch_fake_env[crelus] PASSED [ 71%]
+tests_paper/test_training_pipeline.py::test_train_reload_csv_and_evaluate_real_torch_fake_env[componet] PASSED [ 85%]
+tests_paper/test_training_pipeline.py::test_train_reload_csv_and_evaluate_real_torch_fake_env[cbpnet] PASSED [100%]
+
+============================== 7 passed in 30.53s ==============================

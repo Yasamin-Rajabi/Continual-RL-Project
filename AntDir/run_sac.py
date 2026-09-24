@@ -34,7 +34,7 @@ from tasks import get_task, get_task_name
 @dataclass
 class Args:
     model_type: Literal["cka-rl"] = "cka-rl"
-    task_suite: Literal["walker2d_dynamics", "walker2d_mixed_dynamics"] = "walker2d_dynamics"
+    task_suite: Literal["ant_dir"] = "ant_dir"
     fusion_mode: Literal["classic_cka", "weight_delta"] = "classic_cka"
     eval_action_mode: Literal["deterministic", "stochastic"] = "deterministic"
     composition_space: Literal["parameter", "policy"] = "parameter"
@@ -55,7 +55,7 @@ class Args:
     torch_deterministic: bool = True
     cuda: bool = True
     track: bool = False
-    wandb_project_name: str = "cka-walker2d"
+    wandb_project_name: str = "cka-antdir"
     wandb_entity: Optional[str] = None
     capture_video: bool = False
 
@@ -66,7 +66,7 @@ class Args:
     seq_idx: int = 0
     eval_every: int = 10_000
     num_evals: int = 5
-    total_timesteps: int = 200_000
+    total_timesteps: int = 300_000
     buffer_size: int = int(1e6)
     gamma: float = 0.99
     tau: float = 0.005
@@ -243,15 +243,12 @@ def eval_agent(agent, test_env, num_evals, global_step, writer, device):
 
 def _eval_agent_impl(agent, test_env, num_evals, global_step, writer, device):
     returns, success_rates, mean_velocity_errors, mean_x_velocities = [], [], [], []
-    episode_lengths, fall_flags = [], []
     for ep in range(num_evals):
         obs, _ = test_env.reset(seed=10_000 + ep)
         ep_return = 0.0
         ep_success = []
         ep_velocity_error = []
         ep_x_velocity = []
-        ep_steps = 0
-        ended_by_fall = False
         while True:
             obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
             action = (agent.get_action(obs_t)[0] if getattr(agent, "evaluation_action_mode", "deterministic") == "stochastic"
@@ -259,9 +256,6 @@ def _eval_agent_impl(agent, test_env, num_evals, global_step, writer, device):
             agent.evaluation_env_steps = getattr(agent, "evaluation_env_steps", 0) + 1
             obs, reward, terminated, truncated, info = test_env.step(action[0].cpu().numpy())
             ep_return += float(reward)
-            ep_steps += 1
-            if terminated:
-                ended_by_fall = True
             if "success" in info:
                 ep_success.append(float(info["success"]))
             if "velocity_error" in info:
@@ -274,8 +268,6 @@ def _eval_agent_impl(agent, test_env, num_evals, global_step, writer, device):
         success_rates.append(float(np.mean(ep_success)) if ep_success else np.nan)
         mean_velocity_errors.append(float(np.mean(ep_velocity_error)) if ep_velocity_error else np.nan)
         mean_x_velocities.append(float(np.mean(ep_x_velocity)) if ep_x_velocity else np.nan)
-        episode_lengths.append(float(ep_steps))
-        fall_flags.append(float(ended_by_fall))
 
     def finite_mean(values):
         arr = np.asarray(values, dtype=np.float64)
@@ -287,21 +279,16 @@ def _eval_agent_impl(agent, test_env, num_evals, global_step, writer, device):
         "success": finite_mean(success_rates),
         "velocity_error": finite_mean(mean_velocity_errors),
         "x_velocity": finite_mean(mean_x_velocities),
-        "episode_length": finite_mean(episode_lengths),
-        "fall_rate": finite_mean(fall_flags),
     }
     print(
         f"\nTEST: return={metrics['return']:.3f}, success={metrics['success']:.3f}, "
         f"velocity_error={metrics['velocity_error']:.4f}, "
-        f"x_velocity={metrics['x_velocity']:.4f}, "
-        f"ep_len={metrics['episode_length']:.1f}, fall_rate={metrics['fall_rate']:.3f}\n"
+        f"x_velocity={metrics['x_velocity']:.4f}\n"
     )
     writer.add_scalar("charts/test_episodic_return", metrics["return"], global_step)
     writer.add_scalar("charts/test_success", metrics["success"], global_step)
     writer.add_scalar("charts/test_velocity_error", metrics["velocity_error"], global_step)
     writer.add_scalar("charts/test_x_velocity", metrics["x_velocity"], global_step)
-    writer.add_scalar("charts/test_episode_length", metrics["episode_length"], global_step)
-    writer.add_scalar("charts/test_fall_rate", metrics["fall_rate"], global_step)
     return metrics
 
 
@@ -1082,8 +1069,6 @@ if __name__ == "__main__":
         writer.add_scalar("charts/final_success", final_eval["success"], global_step)
         writer.add_scalar("charts/final_velocity_error", final_eval["velocity_error"], global_step)
         writer.add_scalar("charts/final_x_velocity", final_eval["x_velocity"], global_step)
-        writer.add_scalar("charts/final_episode_length", final_eval["episode_length"], global_step)
-        writer.add_scalar("charts/final_fall_rate", final_eval["fall_rate"], global_step)
         actor.model.save(dirname=run_dir)
         manifest = write_manifest(
             run_dir, vars(args), parent_dirs=args.prev_units,

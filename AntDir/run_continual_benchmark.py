@@ -1,4 +1,4 @@
-"""Four-way continual benchmark for HalfCheetahVel and HalfCheetahWindVel.
+"""Continual AntDir benchmark using the existing modular SAC engine.
 
 Defaults run baseline and combined in parameter and policy composition spaces.
 Legacy ablations remain selectable using --condition-index 0, 2, or 3.
@@ -79,7 +79,7 @@ def parse_args():
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument(
         "--task-suites", nargs="+",
-        default=["halfcheetah_vel", "halfcheetah_wind_vel"],
+        default=["ant_dir"],
         choices=sorted(TASK_SUITES.keys()),
     )
     p.add_argument("--seeds", nargs="+", type=int, default=[1, 2, 3])
@@ -136,9 +136,9 @@ def parse_args():
     p.add_argument("--distill-batch-size", type=int, default=256)
     p.add_argument("--distill-test-frac", type=float, default=0.2)
     p.add_argument("--analysis-log-every", type=int, default=5_000)
-    p.add_argument("--save-root", default="agents_halfcheetah")
+    p.add_argument("--save-root", default="agents_antdir")
     p.add_argument("--runs-root", default="runs")
-    p.add_argument("--plots-root", default="plots_halfcheetah_continual")
+    p.add_argument("--plots-root", default="plots_antdir_continual")
     p.add_argument("--analysis-root", default="analysis_runs")
     p.add_argument("--skip-training", action="store_true")
     p.add_argument(
@@ -201,7 +201,7 @@ def parse_args():
 
     if args.quick_test:
         # Exercises at least one merge without committing to the full paper run.
-        args.task_suites = ["halfcheetah_vel"]
+        args.task_suites = ["ant_dir"]
         args.seeds = [1]
         args.task_sequence = [0, 1, 2, 3]
         args.total_timesteps = 20_000

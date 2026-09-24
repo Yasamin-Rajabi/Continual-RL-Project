@@ -418,7 +418,7 @@ class CkaRlAgent(PolicySpaceMixin, nn.Module):
         if n < 2:
             raise RuntimeError("cannot select a merge pair from fewer than two pool entries")
         i, j = np.random.choice(n, size=2, replace=False)
-        return int(i), int(j), {"similarity_metric": "random", "selected_random_pair": True}
+        return int(i), int(j), {"idx1": int(i), "idx2": int(j), "similarity_metric": "random", "selected_random_pair": True}
 
     def _select_behavioral_pair(self):
         n = self.mean_pool.pool_length()
@@ -785,10 +785,21 @@ class CkaRlAgent(PolicySpaceMixin, nn.Module):
             idx1, idx2, merge_info = self._select_cosine_pair()
 
         if self.merge_ablation == "kl_discard":
-            remove = idx2
+            # Unbiased, seed-reproducible discard among the minimum-KL pair.
+            # The survivor and its buffer are retained without modification.
+            # Do not relabel discarded source states as belonging to the survivor.
+            remove = int(np.random.choice([idx1, idx2]))
+            survivor = idx2 if remove == idx1 else idx1
             self.mean_pool.pool.pop(remove)
             self.logstd_pool.pool.pop(remove)
-            merge_info.update({"used_distillation": False, "discard_only": True, "discarded_index": int(remove)})
+            merge_info.update({
+                "idx1": int(idx1), "idx2": int(idx2),
+                "used_distillation": False, "discard_only": True,
+                "merge_ablation": "kl_discard", "discarded_index": int(remove),
+                "surviving_index_before_removal": int(survivor),
+                "pool_size_before": int(self.mean_pool.pool_length() + 1),
+                "pool_size_after": int(self.mean_pool.pool_length()),
+            })
             self.last_merge_info = merge_info
             self._assert_pool_alignment()
             return

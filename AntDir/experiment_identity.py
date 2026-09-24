@@ -21,9 +21,7 @@ from typing import Any, Mapping, Sequence
 MANIFEST_NAME = "run_manifest.json"
 MANIFEST_SCHEMA_VERSION = 2
 
-DEFAULT_ABLATION_SOURCE_TRANSITIONS = {
-    'fe8828f4b89557941eb07f4bebb9cb7211d35ee71c847e33d766e44a80eed0a9': set(['12b83436154b166e70f3cbb48dafc90396f46c3486ce87889808eb9768584f50', '4f80b96a44bd1adac5d1a6199b545b32a7c1a4975da81e54a65ed2bf798cd7c9', '909a19c8ae68216fddcde925475d6fee127a6345e45250d6ecc7911dd48e24c2']),
-}
+DEFAULT_ABLATION_SOURCE_TRANSITIONS = {}
 
 # Only knobs that can change the learned policy/pool are part of the training
 # signature. Logging/output-path settings are intentionally excluded so moving
@@ -95,9 +93,9 @@ TRAINING_KEYS = (
 # Files that can affect a training trajectory or the stored analysis needed by
 # the upcoming lineage/KL investigations. Plotting-only files are excluded so a
 # cosmetic plot edit does not force model retraining.
-PRE_LINEAGE_BALANCING_SOURCE_FINGERPRINTS = {'8ab92dde4d65d370311a3dce70871804ad3ae6ef426c9e38ae63ea7348b7485c', '1e598563580b6ffbba6830f48cc866bb0e3cce81c43aea7f7213e4cad2ee2702', '29ed1d675cfe9ce90ad07b288d084a2e7548e833f4d9032960d9fe24c4c520c1'}
+PRE_LINEAGE_BALANCING_SOURCE_FINGERPRINTS = {'15075233874f929c2ea5146a2bd259b5e147781c537a47b3a04b35fad667dd52', 'b8dce66f12a3902dd4ecbbdc1a30031fb322437577258b8460f609a800329e76', 'bec81d2249d9391fb07dfa94b8c3886f54603a2e0cf3d5bbe38944b9cc5b6be6'}
 
-PRE_ALPHA_MASS_LR_SOURCE_FINGERPRINTS = {'0418793c2c93a5573294a207a60214496d166a9422bc30246db53813b63d57a1'}
+PRE_ALPHA_MASS_LR_SOURCE_FINGERPRINTS = {'773c7cb53384f127985d17ebf066563738e9f0a75576c106335c8f13b028b0a4'}
 
 SOURCE_CANDIDATES = (
     "run_sac.py",
@@ -109,7 +107,7 @@ SOURCE_CANDIDATES = (
     "shared_arch.py",
     "policy_utils.py",
     "tasks.py",
-    'walker2d_envs.py',
+    "antdir_envs.py",
     "analysis_logging.py",
 )
 

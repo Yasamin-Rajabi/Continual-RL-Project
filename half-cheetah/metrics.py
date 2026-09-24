@@ -154,7 +154,7 @@ RETURN_UPPER_BOUND = 0.0
 def _benchmark_cache_config(args):
     """Configuration knobs that materially determine cached metrics."""
     keys = (
-        "composition_spaces", "projection_epochs", "projection_max_samples",
+        "composition_spaces", "merge_ablation", "projection_epochs", "projection_max_samples",
         "frozen_eval_policy", "eval_action_mode", "skip_forward_transfer",
         "task_sequence", "save_root", "runs_root", "analysis_root",
         "total_timesteps", "learning_starts", "random_actions_end",

@@ -21,6 +21,10 @@ from typing import Any, Mapping, Sequence
 MANIFEST_NAME = "run_manifest.json"
 MANIFEST_SCHEMA_VERSION = 2
 
+DEFAULT_ABLATION_SOURCE_TRANSITIONS = {
+    '86e61cf7dbc8b07a57e189a0441e0c6d3adc6c828f67eb20b6dcca610ffc1b43': set(['43078ca10c1a198a31b3f945d10a1bbbb00fef378973ded8188cdd4aaa9cab14', 'e3b03cff039a1d8dfba48640d1e8f3b5cadfeac165cdca0c4a53fd760b666d1e', 'f09aba4dff18aff0922620644af693777e4095f6dea428cb27c663d6d4c79a28']),
+}
+
 # Only knobs that can change the learned policy/pool are part of the training
 # signature. Logging/output-path settings are intentionally excluded so moving
 # an experiment directory does not invalidate its model identity.
@@ -33,6 +37,7 @@ TRAINING_KEYS = (
     "torch_deterministic",
     "cuda",
     "fusion_mode",
+    "merge_ablation",
     "composition_space",
     "policy_student_replay",
     "projection_epochs",
@@ -272,6 +277,7 @@ def runtime_versions() -> dict:
 
 def training_config(mapping: Mapping[str, Any]) -> dict:
     config = {key: _jsonable(mapping[key]) for key in TRAINING_KEYS if key in mapping}
+    config.setdefault("merge_ablation", "kl_merge")
     # None means "reuse alpha_lr" so store the effective value in manifests.
     # This makes explicit --alpha-mass-lr=<alpha_lr> and the legacy/default
     # behavior semantically identical.
@@ -352,6 +358,8 @@ def checkpoint_matches(
     expected = training_config(expected_mapping)
     actual = manifest.get("training_config", {})
     for key, value in expected.items():
+        if key == "merge_ablation" and key not in actual and value == "kl_merge":
+            continue  # all pre-integration SAC runs used the default path
         # Checkpoints created before the lineage-balancing ablation existed are
         # exactly the current default when the new flag is False.
         if key == "balance_source_lineages" and key not in actual and value is False:
@@ -381,8 +389,15 @@ def checkpoint_matches(
             expected.get("alpha_mass_lr", expected.get("alpha_lr")) == expected.get("alpha_lr")
             and saved_source in PRE_ALPHA_MASS_LR_SOURCE_FINGERPRINTS
         )
+        # Only this reviewed source transition is compatible, and only with
+        # the original compression rule. Future source changes are NOT waived.
+        allow_default_ablation_upgrade = (
+            expected.get("merge_ablation", "kl_merge") == "kl_merge"
+            and saved_source in DEFAULT_ABLATION_SOURCE_TRANSITIONS.get(current_source, set())
+        )
         if (
-            saved_source not in _compatible_legacy_source_fingerprints(root)
+            not allow_default_ablation_upgrade
+            and saved_source not in _compatible_legacy_source_fingerprints(root)
             and not allow_pre_lineage
             and not allow_pre_alpha_mass_lr
         ):

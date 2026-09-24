@@ -1,0 +1,339 @@
+{
+  "main_archive": "Continual-RL-Project(4).zip",
+  "donor_archive": "Continual-RL-Project-narges.zip",
+  "modified_existing": [
+    {
+      "path": "Walker2D/cka_rl.py",
+      "before_sha256": "98b35f1f09860bcac2e646313067d569c939df76148d189aa0d9bbab5eb4716f",
+      "after_sha256": "7da3a380be146659583da05a7e5727278d7c2c3b0376bd619c1690ecaae2629e"
+    },
+    {
+      "path": "Walker2D/experiment_identity.py",
+      "before_sha256": "f914afa64ef46abd2e2f5869a7a73fd8401bc8f2415a9110e02f38610c2d7c48",
+      "after_sha256": "4032cdf78092357134cd6d4e44526e0de926299aad326718a60e233dc3a5aa47"
+    },
+    {
+      "path": "Walker2D/metrics.py",
+      "before_sha256": "c0f382b04551e670fad065c1745b9cb286c2e394bb478c302b17a4fc9cc0b7f8",
+      "after_sha256": "4b2a1f19d16ee7690160c43b0e496dbed78ed0522f54849b9dca5329fd3e3211"
+    },
+    {
+      "path": "Walker2D/run_continual_benchmark.py",
+      "before_sha256": "f4d8da0c3baaab12acc9caf440c7ccd5a10a6d7a0125ed2cdbdb7c80f6d2754a",
+      "after_sha256": "bb18882e26a81771e32a7229a26436e55d4190920c529a6ecc05c8cc49910181"
+    },
+    {
+      "path": "Walker2D/run_sac.py",
+      "before_sha256": "e1a633acff76cb2bb9ff17a3875365ff71b0957b4c719061d4e119cd5289ef6c",
+      "after_sha256": "f81da75b9ee1acdeb4e3ae39ca13841a566308dc621df4463fda439dd3a7e5d3"
+    },
+    {
+      "path": "collect_paper_metrics.py",
+      "before_sha256": "402eb20ea370cdab426b274e4cd2840c92a8b9ed784d5932e185594a3fddeff2",
+      "after_sha256": "012ed7e4d1a4f43295dfdf445705baaeb3c6ef3ab5eef340cf22c28aba08b822"
+    },
+    {
+      "path": "half-cheetah/cka_rl.py",
+      "before_sha256": "98b35f1f09860bcac2e646313067d569c939df76148d189aa0d9bbab5eb4716f",
+      "after_sha256": "7da3a380be146659583da05a7e5727278d7c2c3b0376bd619c1690ecaae2629e"
+    },
+    {
+      "path": "half-cheetah/experiment_identity.py",
+      "before_sha256": "d88b72f1d6542ade8e2bf6274364754953197b502fd36a3247182f7b6f44e88d",
+      "after_sha256": "3e860a4259ed05e9eeea6604854144ce6b0e7a4e6c64fdb64e06bd748ecc6361"
+    },
+    {
+      "path": "half-cheetah/metrics.py",
+      "before_sha256": "b99bd956190be156da72f2a0193039f451d2d78a04f4d84c7e285fa44059efda",
+      "after_sha256": "65041f3155c9d38870dbd56664d0bc3850439fe61d27be344a69821abcb98b9a"
+    },
+    {
+      "path": "half-cheetah/run_continual_benchmark.py",
+      "before_sha256": "4a2d9e11058333ab1a496b6b50ea3a29b30a7a5dd34040b8c779d20b9638a1da",
+      "after_sha256": "74dbc98b7016eb79bc6d9600e960dc190f484c9547e5a8fcbc89c154655db940"
+    },
+    {
+      "path": "half-cheetah/run_sac.py",
+      "before_sha256": "b3d54bfec51701cabdabab88823965cee059e561199d53ca9fddfdac751f5868",
+      "after_sha256": "84b27c78b734ea79634d7e57f4304d112f6b87c19bdb2558e87ddc81dbd195d1"
+    }
+  ],
+  "added": [
+    {
+      "path": "AntDir/README.md",
+      "sha256": "17933efdea0e8f38f18735cf0cfd722d9e3d4b3b6e5f8e29cb3141829811c4aa"
+    },
+    {
+      "path": "AntDir/analysis_logging.py",
+      "sha256": "cad72bf8058660345f636945043e1c8cd3a88b727956f466295d601bca50ea0f"
+    },
+    {
+      "path": "AntDir/antdir_envs.py",
+      "sha256": "8b4e240bfbe62dfe29abc6f9b9dbf5da28974d6ac1af64a37d16427dc6ed54e5"
+    },
+    {
+      "path": "AntDir/checkpoint_evaluation.py",
+      "sha256": "e1ee918a8825031f730e55a1877c59e74e56d2b484521a5e6fa536cf91058a04"
+    },
+    {
+      "path": "AntDir/cka_rl.py",
+      "sha256": "7da3a380be146659583da05a7e5727278d7c2c3b0376bd619c1690ecaae2629e"
+    },
+    {
+      "path": "AntDir/csv_summary_writer.py",
+      "sha256": "0727d4e5247b303263218dd2a74e1f3824ff1dc04a6122f210800821c8959247"
+    },
+    {
+      "path": "AntDir/experiment_identity.py",
+      "sha256": "d19dac68a28e2cfdce99d9a8713890f7189e8e009f53decd8dcf68dd8124e206"
+    },
+    {
+      "path": "AntDir/job.sh",
+      "sha256": "9c5f673af4924e3249b212a8460dee5728c68f4d459b057cad85114ce9080613"
+    },
+    {
+      "path": "AntDir/job_eval.sh",
+      "sha256": "3498b8970fee1d4611ba7f5ea8ef892c9314bbab4d103315b3d6ac03e3663e5b"
+    },
+    {
+      "path": "AntDir/job_scratch.sh",
+      "sha256": "18a0822e34bbbdd19143e2d5a7156e7204134ca072c348172773f5163678be22"
+    },
+    {
+      "path": "AntDir/knowledge_pools.py",
+      "sha256": "b0b2aa7216f50e77e0ebdb3bbda6f32a6eb5ad2429efd0a2698af357bcb162b5"
+    },
+    {
+      "path": "AntDir/metrics.py",
+      "sha256": "9e1960d679bf6f748f49b9188af55dc431a739c7cd67b9b2ea5a521c5d9b46b0"
+    },
+    {
+      "path": "AntDir/plots.py",
+      "sha256": "bd77501c8361c30970ddc8b75bf42456b7caad1f8fcb0bea2815a9485169d9c3"
+    },
+    {
+      "path": "AntDir/policy_composition.py",
+      "sha256": "ad365e3edbdcd8300fac4589d13c9915c7f635e800b43c5f2f96587c258e5574"
+    },
+    {
+      "path": "AntDir/policy_space.py",
+      "sha256": "250127f0c3b7a8a77a4b34df778d1b15315170e91ee7abbb1bbda0a8216d52c5"
+    },
+    {
+      "path": "AntDir/policy_utils.py",
+      "sha256": "cd973c9e3a0db7a70ba701798535599c9554cd57ef21fc64ef67ce032e0e5660"
+    },
+    {
+      "path": "AntDir/requirements-dev.txt",
+      "sha256": "7617ff3f3e6410ee294836978ee6bee967e44fbec3e80df1da0862b847088b53"
+    },
+    {
+      "path": "AntDir/requirements.txt",
+      "sha256": "b21c783f0ff3acb83bf045b66f5d0fe906962362540bf5bbd9fb9f819d6ba7c5"
+    },
+    {
+      "path": "AntDir/run_continual_benchmark.py",
+      "sha256": "bcf60d066531962dc0b926001d5343c6167cffac0baa9d98b057ddaa5d607693"
+    },
+    {
+      "path": "AntDir/run_eval_custom.py",
+      "sha256": "d5ff633f0fd6c625d7dec591545b6efdb952e6ddefa5dd5666476cfd0f905402"
+    },
+    {
+      "path": "AntDir/run_sac.py",
+      "sha256": "1d3a2103afad19b376368ef23b5dbbd679be863573256bc522da90bb1e1dfb0e"
+    },
+    {
+      "path": "AntDir/sanity_check_pool.py",
+      "sha256": "3cf485326fab2b3a4c98721663ac84c839af54784175a4804c75ca990afd22c3"
+    },
+    {
+      "path": "AntDir/scratch_baselines.py",
+      "sha256": "2a19360bc9713a1f3a227df9935bb6d42501e2ce62319adef9d8883e4adf0ce7"
+    },
+    {
+      "path": "AntDir/shared_arch.py",
+      "sha256": "88687ea77ef3b469f24d208f285fbc2c08e3dbf9c81184b3ac1453467f8c3f9b"
+    },
+    {
+      "path": "AntDir/tasks.py",
+      "sha256": "fa9ee21a83862da0ad21390536112b8ae6eed945c91e38ba111d87db3ec3be20"
+    },
+    {
+      "path": "AntDir/training_protocol.py",
+      "sha256": "24e08811c6cf6348f445307a0e0f1a0902924c03f17baa5f007dc61f9a487f82"
+    },
+    {
+      "path": "BASELINE_PROTOCOL.md",
+      "sha256": "d04415f0c348b9d06bcf7ac7ee3aba48d9be92ce6590ad1f2746e1ab56d5b763"
+    },
+    {
+      "path": "INTEGRATION_DIFF.patch",
+      "sha256": "06f19bd6c0bb900fc86adeaa0b5bb1b30604e22e2cf7e126ba91407e563d8053"
+    },
+    {
+      "path": "INTEGRATION_README.md",
+      "sha256": "ac52a9a4e6a06c4ce4fb5b7f0baf3d7c23ecd8a7504d458306ba0521254ebf72"
+    },
+    {
+      "path": "INTEGRATION_VALIDATION.md",
+      "sha256": "ce91eec7fb8ec2e20cee321d5564e7c283ea8d30e072a6aaed28c29d3e4fd678"
+    },
+    {
+      "path": "job_paper.sh",
+      "sha256": "d6ecaccc71f5cca1e69d2f5533f1ec5376da4ec5b3e6a8831b4368da71173b95"
+    },
+    {
+      "path": "paper_experiments.py",
+      "sha256": "449df451b1c572863d99f6ab5cc73af6a3b8ec47991b4d9a99ebb99fd6ba47ef"
+    },
+    {
+      "path": "paper_runs/DONOR_PROVENANCE.json",
+      "sha256": "9363f26e3fd7ebffe260ff0ce316eb6e4caa6b872ebfa952ec4b29623f51e3bb"
+    },
+    {
+      "path": "paper_runs/__init__.py",
+      "sha256": "69b0d4b35953a8aa718813eb0da62838a6cdffcd677a8560041ab308abd40c5b"
+    },
+    {
+      "path": "paper_runs/baseline_runner.py",
+      "sha256": "3ff72ccbe4e2ded93f4296b757eec36e9c1d3ffbc1008953a3d4b017778dee61"
+    },
+    {
+      "path": "paper_runs/baseline_sac.py",
+      "sha256": "ea18a9a355aa91636e2220dd29e567c98a77f86e76e7ecde01a46b9155f333b5"
+    },
+    {
+      "path": "paper_runs/baselines.py",
+      "sha256": "4fe25a182a0c200eee30a19fd912e64c885ec1ef754b47dd4bde2ebd6fa1beae"
+    },
+    {
+      "path": "paper_runs/config.py",
+      "sha256": "88a1609143ed9213f0c6e0a4c9346d89fa6cb8f4d48669c511fe28c546b98d4c"
+    },
+    {
+      "path": "paper_runs/evaluation.py",
+      "sha256": "5e333b689a9731dcc6cd9bebdd48ca9a01f139b7e817ab7159084a95fa1e53ce"
+    },
+    {
+      "path": "paper_runs/io.py",
+      "sha256": "e853d5bed0c2e6b12c27f8f66fd91c599754172dc3e506ee47b8f201a9abcfaa"
+    },
+    {
+      "path": "paper_runs/layers.py",
+      "sha256": "bda741c0bbce62669e6b8fe098b024ad16f1ec7d8384b4ae758958f692febd88"
+    },
+    {
+      "path": "paper_runs/smoke_real.py",
+      "sha256": "bc5ee4542056e0eae2e459e065b5c3334b06f900f68b584bce5735b40c380b77"
+    },
+    {
+      "path": "paper_runs/vendor/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "paper_runs/vendor/cbp_modules.py",
+      "sha256": "8c4ac4e782821e2abd3d3c4e707f794434d0cc5356a39ef64b80959abc308cdd"
+    },
+    {
+      "path": "paper_runs/vendor/componet_modules.py",
+      "sha256": "a59a92cdde878bacc6212f2ea58290e796053fa8b847f44ed6ca55e4d0913262"
+    },
+    {
+      "path": "paper_runs/vendor/mask_modules.py",
+      "sha256": "99ed9ad7510247aa04c08347503a139946a400331da8c0e77b3d02f877429ff9"
+    },
+    {
+      "path": "paper_runs/vendor/progressive_column.py",
+      "sha256": "ee93490e1113dec62985bd0fd4e5b2ec41b4f37451b8efa1dbd3f6c3aff385b7"
+    },
+    {
+      "path": "paper_runs/vendor/reference/four_baselines/half-cheetah/baselines/ft_n.py",
+      "sha256": "d309e01d04f1bde7e3054f38d336c2c33b7f83855863eaf4ae4de5845a083f15"
+    },
+    {
+      "path": "paper_runs/vendor/reference/four_baselines/half-cheetah/baselines/packnet.py",
+      "sha256": "701ee6b5daa10e3bcf8d6a7e36e6acf2434635e6335931c8cef5aba0d29fc0a6"
+    },
+    {
+      "path": "paper_runs/vendor/reference/pointmaze/src/baselines/agents.py",
+      "sha256": "e9cbe65dd9a2b5f96bdd7481ce263abb64d4ceadf93c94943410f58903f0f9ea"
+    },
+    {
+      "path": "paper_runs/worker.py",
+      "sha256": "876c822780b22f1c91a0cb174475b3a786c08259bd53707d9d686374059f3933"
+    },
+    {
+      "path": "paper_worker.sh",
+      "sha256": "11a0bd8dbfd48f33502c25ab39d3750cf6f4bb670c327d019f62320ae0ff44d6"
+    },
+    {
+      "path": "tests_paper/fake_dependencies.py",
+      "sha256": "86c70f73a2c4ca14e58ed1d81230065d778991588aae3457a4b6bc128d757962"
+    },
+    {
+      "path": "tests_paper/original_shell_sha256.json",
+      "sha256": "1900bba29c5229326735c3519314920c9e6e115dd97a6a710047304eac1e3047"
+    },
+    {
+      "path": "tests_paper/test_ablation.py",
+      "sha256": "0717f5a4558c882e05cd1af39e205f21e250a7b0b67ec47da9cd7ff51a99a7ab"
+    },
+    {
+      "path": "tests_paper/test_collection.py",
+      "sha256": "0d6d277a554fdfd0a410a2205ba0e8d2a34b50f68bbf58a6f32295d5f8d288fa"
+    },
+    {
+      "path": "tests_paper/test_identity_and_config.py",
+      "sha256": "c61edb9ae10d7716df3af000002a4a37f1902c5632f8a1fc269c9decf4b965d5"
+    },
+    {
+      "path": "tests_paper/test_main_sac_pipeline.py",
+      "sha256": "3b415923947a6837d0fdb6e153a4c4ac1284f4b84806dfe1edc7d5cad6d3a7dc"
+    },
+    {
+      "path": "tests_paper/test_models.py",
+      "sha256": "8b3ae45ff47bc17831690de3c8f6fe3fe2c22beb2cd57af3027994df476dd860"
+    },
+    {
+      "path": "tests_paper/test_orchestration.py",
+      "sha256": "db6a0303dae66e1bde4938da0799e61405b5ac46f5d02f0e8cb0110ca1b315b7"
+    },
+    {
+      "path": "tests_paper/test_training_pipeline.py",
+      "sha256": "67426c448751dff31a10b585ff03781187ad1a8c9bf8c243b845ad1404c68252"
+    },
+    {
+      "path": "validation_reports/core_final.txt",
+      "sha256": "a7760ab033eb14de7a824f728d99cfe34788f60b5d09854e5efa5c6dfd3a7d7e"
+    },
+    {
+      "path": "validation_reports/default_parity.txt",
+      "sha256": "de6df2af12d06e7716a4ad666b2e0f339f523951e9a9966c378633b610a0e783"
+    },
+    {
+      "path": "validation_reports/existing_AntDir_final.txt",
+      "sha256": "e4e8cfc4b815b8c1407dfe860df16acdb4ab88db1eb32eb2a64d3b857deceec9"
+    },
+    {
+      "path": "validation_reports/existing_Walker2D_final.txt",
+      "sha256": "785ce0de31731fecee268abc65e266e9c8f07842c5c58149d34a13545eda3fa6"
+    },
+    {
+      "path": "validation_reports/existing_half-cheetah_final.txt",
+      "sha256": "3cd30b6e150c99c9a2848ea98ddee76b16272b7cf3093be50fba8163947b4668"
+    },
+    {
+      "path": "validation_reports/main_sac_final.txt",
+      "sha256": "b67d6350e46029461e5ccb36cbdf19f90e66da5027e3f039ad3f9df88ec0f358"
+    },
+    {
+      "path": "validation_reports/training_pipeline_final.txt",
+      "sha256": "61b996564bc6b924535d363fc86005cf05491dc01f4a675ada2c8406307bf20a"
+    }
+  ],
+  "removed": [],
+  "original_shell_files_preserved": 30,
+  "unchanged_existing_files": 322,
+  "validation": "See INTEGRATION_VALIDATION.md; no real simulator/GPU test in development sandbox."
+}

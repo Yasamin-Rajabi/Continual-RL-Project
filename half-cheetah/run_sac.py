@@ -38,6 +38,7 @@ class Args:
     fusion_mode: Literal["classic_cka", "weight_delta"] = "classic_cka"
     eval_action_mode: Literal["deterministic", "stochastic"] = "deterministic"
     composition_space: Literal["parameter", "policy"] = "parameter"
+    merge_ablation: Literal["kl_merge", "random_merge", "kl_discard"] = "kl_merge"
     policy_student_replay: bool = False
     """Policy-space student variant: execute the full mixture, train only the
     standalone novel expert from replay, then update alpha/alpha-mass in a
@@ -516,6 +517,7 @@ if __name__ == "__main__":
         projection_epochs=args.projection_epochs,
         projection_max_samples=args.projection_max_samples,
         policy_student_replay=args.policy_student_replay,
+        merge_ablation=args.merge_ablation,
         use_alpha_mass=args.use_alpha_mass,
         use_alpha_scale=args.use_alpha_scale,
         fix_alpha_scale=args.fix_alpha_scale,
@@ -992,10 +994,16 @@ if __name__ == "__main__":
                 writer.add_scalar("analysis/merge/pairwise_cosine_min", merge_info["pairwise_cosine_min"], global_step)
                 writer.add_scalar("analysis/merge/pairwise_cosine_mean", merge_info["pairwise_cosine_mean"], global_step)
                 writer.add_scalar("analysis/merge/pairwise_cosine_max", merge_info["pairwise_cosine_max"], global_step)
+            elif merge_info["similarity_metric"] == "random":
+                writer.add_scalar("analysis/merge/random_pair", 1.0, global_step)
             else:
                 raise RuntimeError(f"unknown merge similarity metric: {merge_info['similarity_metric']}")
             writer.add_scalar("analysis/merge/idx1", merge_info["idx1"], global_step)
             writer.add_scalar("analysis/merge/idx2", merge_info["idx2"], global_step)
+            if merge_info.get("discard_only", False):
+                writer.add_scalar("analysis/merge/discard_only", 1.0, global_step)
+                writer.add_scalar("analysis/merge/discarded_index", merge_info["discarded_index"], global_step)
+                writer.add_scalar("analysis/merge/surviving_index_before_removal", merge_info["surviving_index_before_removal"], global_step)
             if "similarity_states" in merge_info:
                 writer.add_scalar("analysis/merge/similarity_states", merge_info["similarity_states"], global_step)
             writer.add_scalar("analysis/merge/used_distillation", float(merge_info["used_distillation"]), global_step)

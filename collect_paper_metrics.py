@@ -294,6 +294,16 @@ def main():
         if parsed is not None:
             candidates.append((path, *parsed))
 
+    # AntDir has no finite theoretical return upper bound. Preserve the existing
+    # FT_return column as NaN there and carry its explicitly UNNORMALIZED AUC
+    # difference as a separate optional metric. Existing suites are unchanged.
+    extra_return_auc = any(
+        "FT_return_auc_delta" in row
+        for candidate, *_ in candidates
+        for row in _read_rows(candidate / "plots" / args.suite / "survey_metrics.csv")
+    )
+    survey_keys = SURVEY + (("FT_return_auc_delta",) if extra_return_auc else ())
+
     aggregate_rows = []
     per_seed_rows = []
     all_occurrence_rows = []
@@ -341,7 +351,7 @@ def main():
                 "PERF_success": perf["PERF_success"],
                 "PERF_occurrences": perf["PERF_occurrences"],
             }
-            for key in SURVEY:
+            for key in survey_keys:
                 seed_row[key] = _as_float(survey.get(key))
             # Keep final retention return/success explicit so they cannot be
             # accidentally confused with PERF again.
@@ -371,7 +381,7 @@ def main():
             row[f"{metric}_n"] = n
 
         # Retention/transfer metrics remain exactly as produced by metrics.py.
-        for key in SURVEY:
+        for key in survey_keys:
             mu, sd, n = _stats(_finite(survey_rows, key))
             row[f"{key}_mean"] = mu
             row[f"{key}_std"] = sd
@@ -408,16 +418,18 @@ def main():
         writer.writerows(aggregate_rows)
 
     per_seed_path = output.parent / f"paper_metrics_per_seed_{args.eval_mode}.csv"
-    with per_seed_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(per_seed_rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(per_seed_rows)
+    if per_seed_rows:
+        with per_seed_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(per_seed_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(per_seed_rows)
 
     occurrence_path = output.parent / f"paper_PERF_occurrences_{args.eval_mode}.csv"
-    with occurrence_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(all_occurrence_rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(all_occurrence_rows)
+    if all_occurrence_rows:
+        with occurrence_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(all_occurrence_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(all_occurrence_rows)
 
     print(output)
     print(per_seed_path)
@@ -433,6 +445,10 @@ def main():
             f"FT_success={row['FT_success_mean']:.4g}+-{row['FT_success_std']:.3g}, "
             f"FT_return={row['FT_return_mean']:.4g}+-{row['FT_return_std']:.3g}"
         )
+
+        if extra_return_auc:
+            print(f"  FT_return_auc_delta (raw return units)="
+                  f"{row['FT_return_auc_delta_mean']:.4g}+-{row['FT_return_auc_delta_std']:.3g}")
 
     plot_dir = output.parent
     _plot_perf(

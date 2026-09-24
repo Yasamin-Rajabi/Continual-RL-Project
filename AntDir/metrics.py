@@ -1,36 +1,17 @@
-"""All numeric-metric computation for the continual HalfCheetah benchmark.
+"""Numeric metrics and caches for the new fixed-direction AntDir suite.
 
-Pure computation + JSON caching: reads TensorBoard scalars, evaluates saved
-checkpoints, returns numbers. No matplotlib anywhere in this file -- see
-plots.py for all drawing, which consumes exactly the dict/JSON structures
-this module produces.
+This reuses the original continual-control retention protocol, path layout and
+success-based A_N/FG/BWT definitions. AntDir success is an explicitly custom
+heading/speed diagnostic; raw return should also be reported.
 
-This module owns the path-construction helpers (run_name, event_dir,
-checkpoint_dir, ...) so it has NO dependency on run_continual_benchmark.py;
-run_continual_benchmark.py imports these back FROM here instead, to avoid a
-circular import (run_continual_benchmark -> metrics -> run_continual_benchmark).
+AntDir's directional-velocity reward has no finite upper bound supplied by the
+environment. Accordingly RETURN_UPPER_BOUND is None: normalized FT_return is
+undefined (NaN), and FT_return_auc_delta reports continual-minus-scratch raw
+return AUC. Never apply HalfCheetah's zero-upper-bound shortcut here.
 
-SURVEY METRICS (p_i(t) = charts/test_success throughout, already in [0,1],
-periodically evaluated -- NOT the noisier training-time charts/success, and
-NOT charts/episodic_return, which is unbounded and needs no [0,1] range to
-begin with):
-
-- A_N            : mean final-checkpoint success across every unique task
-                   in the sequence (survey Eq. 7, final value A_N).
-- FG  (forgetting): mean over i=0..len(seq)-2 of max(p_i,i - p_N,i, 0)
-                    (survey Eq. 8) -- LAST position excluded (forgetting
-                    relative to itself at the final step is trivially 0).
-- BWT (backward)  : mean over the same range of (p_N,i - p_i,i), signed,
-                    no floor (survey Eq. 10).
-- FT  (forward)   : two variants, averaged only over FIRST encounters of
-                    previously unseen tasks after the initial stream task. A
-                    repeated task is relearning/savings, not forward transfer.
-      FT_success  : the literal survey formula, AUC over test_success in
-                    [0,1] vs. a from-scratch baseline's AUC.
-      FT_return   : (AUC_return - AUC_scratch) / (U - AUC_scratch),
-                    with the suite-specific achievable return upper bound U.
-                    FG/BWT use matching frozen/adapted checkpoint evaluations.
-                    FT comes from monitored active-policy learning curves.
+FT reads saved learning curves. It does not retrain or require runtime/source
+compatibility with the post-hoc metrics process. Training/checkpoint reuse
+continues to use the existing strict identity checks.
 """
 from __future__ import annotations
 
@@ -140,7 +121,7 @@ def checkpoint_matches(path, expected_mapping, *, parent_dirs=(), pretrained_enc
 CACHE_SCHEMA_VERSION = 7
 ERROR_KEY = "velocity_error"
 EPISODIC_SUCCESS = False
-RETURN_UPPER_BOUND = 1000.0
+RETURN_UPPER_BOUND = None
 
 
 def _benchmark_cache_config(args):
@@ -578,7 +559,8 @@ def compute_forward_transfer_return(args, suite, condition, seed, scratch_seeds,
     and Hopper have a survival reward, so the zero-bound shortcut is invalid.
     MetaWorld uses its retained shaped-reward bound, 10 * 200 = 2000.
     """
-    per_position, positions = [], []
+    per_position, positions, raw_deltas = [], [], []
+    upper_bound = getattr(args, "return_upper_bound", RETURN_UPPER_BOUND)
     variant = _scratch_variant(args, condition)
     for seq_idx, task_id in _first_unseen_positions(args.task_sequence):
         steps, values = load_scalar(event_dir(args.runs_root, suite, condition, seed, seq_idx, task_id),
@@ -597,14 +579,19 @@ def compute_forward_transfer_return(args, suite, condition, seed, scratch_seeds,
         if not baselines:
             continue
         reference = float(np.mean(baselines))
-        denominator = RETURN_UPPER_BOUND - reference
+        raw_deltas.append(auc - reference)
+        if upper_bound is None:
+            continue
+        denominator = float(upper_bound) - reference
         if denominator <= 1e-12:
             continue
         per_position.append((auc - reference) / denominator)
         positions.append({"seq_idx": int(seq_idx), "task_id": int(task_id)})
     return {"FT_return": float(np.mean(per_position)) if per_position else float("nan"),
             "FT_return_per_position": per_position, "FT_return_positions": positions,
-            "FT_return_upper_bound": RETURN_UPPER_BOUND}
+            "FT_return_upper_bound": upper_bound,
+            "FT_return_auc_delta": float(np.mean(raw_deltas)) if raw_deltas else float("nan"),
+            "FT_return_note": "Normalized FT undefined without a finite return bound; raw AUC delta supplied."}
 
 
 # ==========================================================================
