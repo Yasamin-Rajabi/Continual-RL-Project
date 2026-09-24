@@ -1,0 +1,7 @@
+# Kaggle GPU images already provide all of these.
+# Versions are lower bounds, not pins: the code uses no version-specific API.
+numpy>=1.24
+torch>=2.0
+gymnasium>=0.29
+matplotlib>=3.6      # plots.py only; everything else runs without it
+tensorboard>=2.12    # optional; logging falls back to CSV if absent
