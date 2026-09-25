@@ -26,8 +26,8 @@ task), and calls into metrics.py / plots.py for everything else:
     survey metrics -- A_N, FG, BWT, FT (two variants) -- per the CRL survey's
     Eq. 7-10. See metrics.py's module docstring for exact formulas and which
     TensorBoard scalar backs p_i(t).
-  - plots.py draws every PNG/CSV from whatever metrics.py computed. No
-    training, no environment rollouts, no checkpoint loading happens there.
+  - plots.py draws every PNG/CSV from metrics.py outputs and scalar logs;
+    merge-lineage plots can read finalized pool metadata when snapshots are off.
 
 Forward transfer needs a from-scratch, single-task baseline per unique
 task_id -- see scratch_baselines.py, which trains and caches those
@@ -49,6 +49,7 @@ from tasks import DEFAULT_CONTINUAL_SEQUENCE, TASK_SUITES, get_task_name
 import metrics
 import plots
 import scratch_baselines
+import storage_compaction
 
 
 CONDITIONS = OrderedDict([
@@ -140,6 +141,14 @@ def parse_args():
     p.add_argument("--runs-root", default="runs")
     p.add_argument("--plots-root", default="plots_walker2d_continual")
     p.add_argument("--analysis-root", default="analysis_runs")
+    p.add_argument(
+        "--save-analysis-snapshots", action=argparse.BooleanOptionalAction, default=False,
+        help="Save large start/pre/post task .pt analysis snapshots. Scalar metrics are always logged; disabled by default to save disk.",
+    )
+    p.add_argument(
+        "--compact-storage", action=argparse.BooleanOptionalAction, default=True,
+        help="After task k+1 is safely saved, strip training-only rollout buffers from task k while preserving finalized pool weights for all post-hoc metrics.",
+    )
     p.add_argument("--skip-training", action="store_true")
     p.add_argument(
         "--skip-invalid-seeds", action="store_true",
@@ -348,7 +357,15 @@ def train_chain(args, suite, condition, cfg, seed):
             )
             if matches:
                 print(f"[{suite}/{condition}/seed={seed}] seq{seq_idx} already complete: {run_dir}")
+                predecessor = previous[-1] if previous else None
                 previous.append(run_dir)
+                if args.compact_storage and not args.skip_training and predecessor is not None:
+                    report = storage_compaction.compact_checkpoint(predecessor)
+                    if report.get("disk_bytes_saved", 0):
+                        print(
+                            f"[storage] compacted {predecessor}: "
+                            f"saved {report['disk_bytes_saved'] / (1024 ** 2):.1f} MiB"
+                        )
                 continue
             print(f"[{suite}/{condition}/seed={seed}] seq{seq_idx} stale checkpoint: {reason}; retraining")
 
@@ -356,6 +373,9 @@ def train_chain(args, suite, condition, cfg, seed):
             raise FileNotFoundError(
                 f"Missing/stale checkpoint while --skip-training was set: {run_dir}"
             )
+
+        if prev_args:
+            storage_compaction.require_resumable(prev_args[-1])
 
         # Remove partial outputs before a retry, otherwise TensorBoard can mix
         # stale and fresh event files from two different attempts.
@@ -404,6 +424,7 @@ def train_chain(args, suite, condition, cfg, seed):
             f"--distill-batch-size={args.distill_batch_size}",
             f"--distill-test-frac={args.distill_test_frac}",
             f"--analysis-log-every={args.analysis_log_every}",
+            "--save-analysis-snapshots" if args.save_analysis_snapshots else "--no-save-analysis-snapshots",
             f"--merge-ablation={args.merge_ablation}",
             f"--fusion-mode={cfg['fusion_mode']}",
             f"--composition-space={cfg.get('composition_space', 'parameter')}",
@@ -449,7 +470,15 @@ def train_chain(args, suite, condition, cfg, seed):
         )
         if not matches:
             raise RuntimeError(f"Training produced a checkpoint with unexpected identity: {reason}")
+        predecessor = previous[-1] if previous else None
         previous.append(run_dir)
+        if args.compact_storage and not args.skip_training and predecessor is not None:
+            report = storage_compaction.compact_checkpoint(predecessor)
+            if report.get("disk_bytes_saved", 0):
+                print(
+                    f"[storage] compacted {predecessor}: "
+                    f"saved {report['disk_bytes_saved'] / (1024 ** 2):.1f} MiB"
+                )
     return previous
 
 

@@ -192,6 +192,8 @@ COMMON_ARGS=(
     --distill-test-frac 0.2
     --distill-select-best-val
     --analysis-log-every 5000
+    --compact-storage
+    --no-save-analysis-snapshots
     --no-train-shared
     --no-freeze-root-encoder
     --encoder-from-base

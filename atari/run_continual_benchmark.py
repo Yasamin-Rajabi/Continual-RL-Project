@@ -17,9 +17,9 @@ This file is orchestration only.  It launches run_ppo_continual.py once per
 sequence position, validates resumable checkpoints, calls metrics.py for
 retention/survey metrics, and calls plots.py for visualization.
 
-The Atari PPO trainer now exposes the same task-boundary analysis lifecycle as
-the HalfCheetah trainer (start/pre_finalize/post_finalize snapshots), so this
-orchestrator forwards and cleans the matching analysis directory as well.
+The Atari PPO trainer exposes the same optional task-boundary analysis lifecycle
+as the HalfCheetah trainer. These tensor snapshots are disabled by default here
+because all benchmark scalars and merge metadata are retained elsewhere.
 """
 from __future__ import annotations
 
@@ -37,6 +37,7 @@ from atari_tasks import TASK_SUITES, get_continual_sequence, get_task_name
 import metrics
 import plots
 import scratch_baselines
+import storage_compaction
 
 
 CONDITIONS = OrderedDict([
@@ -308,7 +309,14 @@ def parse_args():
     p.add_argument(
         "--save-analysis-snapshots",
         action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Save large start/pre/post task .pt analysis snapshots. Scalar metrics are always logged; disabled by default to save disk.",
+    )
+    p.add_argument(
+        "--compact-storage",
+        action=argparse.BooleanOptionalAction,
         default=True,
+        help="After task k+1 is safely saved, strip training-only rollout buffers from task k while preserving finalized pool weights for all post-hoc metrics.",
     )
     p.add_argument(
         "--scratch-save-root", default=scratch_baselines.SCRATCH_SAVE_ROOT
@@ -567,7 +575,15 @@ def train_chain(args, suite, condition, raw_cfg, seed):
                     f"[{suite}/{condition}/seed={seed}] seq{seq_idx} already "
                     f"complete: {run_dir}"
                 )
+                predecessor = previous[-1] if previous else None
                 previous.append(run_dir)
+                if args.compact_storage and not args.skip_training and predecessor is not None:
+                    report = storage_compaction.compact_checkpoint(predecessor)
+                    if report.get("disk_bytes_saved", 0):
+                        print(
+                            f"[storage] compacted {predecessor}: "
+                            f"saved {report['disk_bytes_saved'] / (1024 ** 2):.1f} MiB"
+                        )
                 continue
             print(
                 f"[{suite}/{condition}/seed={seed}] seq{seq_idx} stale "
@@ -578,6 +594,9 @@ def train_chain(args, suite, condition, raw_cfg, seed):
             raise FileNotFoundError(
                 f"Missing/stale checkpoint while --skip-training was set: {run_dir}"
             )
+
+        if prev_args:
+            storage_compaction.require_resumable(prev_args[-1])
 
         # Clear partial/stale outputs before retry so EventAccumulator never
         # merges old and new PPO learning curves.
@@ -720,7 +739,15 @@ def train_chain(args, suite, condition, raw_cfg, seed):
                 f"Training produced a checkpoint with unexpected identity: {reason}"
             )
 
+        predecessor = previous[-1] if previous else None
         previous.append(run_dir)
+        if args.compact_storage and not args.skip_training and predecessor is not None:
+            report = storage_compaction.compact_checkpoint(predecessor)
+            if report.get("disk_bytes_saved", 0):
+                print(
+                    f"[storage] compacted {predecessor}: "
+                    f"saved {report['disk_bytes_saved'] / (1024 ** 2):.1f} MiB"
+                )
 
     return previous
 

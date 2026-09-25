@@ -205,6 +205,8 @@ srun python -u run_continual_benchmark.py \
     --distill-lr 5e-4 \
     --distill-batch-size 256 \
     --distill-test-frac 0.2 \
+    --compact-storage \
+    --no-save-analysis-snapshots \
     --save-root "$RUN_ROOT/agents" \
     --runs-root "$RUN_ROOT/runs" \
     --plots-root "$RUN_ROOT/plots" \

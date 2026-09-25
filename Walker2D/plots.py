@@ -2,9 +2,9 @@
 
 Pure drawing: every function here takes already-computed data (or reads
 already-logged TensorBoard scalars via metrics.py's path helpers) and writes
-PNG/CSV files. No training, no environment rollouts, no checkpoint loading --
-see run_continual_benchmark.py (orchestration) and metrics.py (all numeric
-computation) for those.
+PNG/CSV files. No training or environment rollouts happen here. Merge-lineage
+plots may read lightweight finalized pool metadata when optional analysis snapshots
+are disabled; all numeric evaluation remains in metrics.py.
 
 The existing plotting logic (plot_training_metrics, plot_sequence_diagnostics,
 plot_merge_lineage, plot_zero_shot, plot_retention, write_summary_csv) is
@@ -24,12 +24,41 @@ import numpy as np
 
 from metrics import (
     analysis_snapshot_path,
+    checkpoint_dir,
     event_dir,
     final_scalar,
     load_continual_scalar,
     load_scalar,
 )
 from tasks import get_task_name
+
+
+def _load_merge_info_from_saved_state(args, suite, condition, seed, seq_idx, task_id):
+    """Load merge metadata without requiring heavyweight analysis snapshots.
+
+    New compact runs keep this metadata in the finalized mean-pool checkpoint.
+    Old runs that already have post_finalize.pt remain fully supported.
+    """
+    import torch
+
+    path = analysis_snapshot_path(args.analysis_root, suite, condition, seed, seq_idx, task_id)
+    if path.exists():
+        try:
+            snap = torch.load(path, map_location="cpu", weights_only=False)
+            return snap["actor"]["mean_headpool"].get("last_merge_info")
+        except Exception:
+            pass
+
+    pool_path = checkpoint_dir(
+        args.save_root, suite, condition, seed, seq_idx, task_id
+    ) / "mean_pool.pt"
+    if pool_path.exists():
+        try:
+            pool = torch.load(pool_path, map_location="cpu", weights_only=False)
+            return getattr(pool, "last_merge_info", None)
+        except Exception:
+            pass
+    return None
 
 TRAIN_METRICS = {
     "charts/episodic_return": ("Training episodic return", "train_return"),
@@ -390,14 +419,9 @@ def plot_merge_lineage(args, suite, conditions):
         for seed in args.seeds:
             matrix = np.full((len(args.task_sequence), len(eval_task_ids)), np.nan, dtype=np.float64)
             for seq_idx, task_id in enumerate(args.task_sequence):
-                path = analysis_snapshot_path(args.analysis_root, suite, condition, seed, seq_idx, task_id)
-                if not path.exists():
-                    continue
-                try:
-                    snap = torch.load(path, map_location="cpu", weights_only=False)
-                    info = snap["actor"]["mean_headpool"].get("last_merge_info")
-                except Exception:
-                    continue
+                info = _load_merge_info_from_saved_state(
+                    args, suite, condition, seed, seq_idx, task_id
+                )
                 if not info or not info.get("merged_lineage"):
                     continue
                 lineage = info["merged_lineage"]
@@ -440,14 +464,9 @@ def plot_merge_lineage(args, suite, conditions):
                 np.nan, dtype=np.float64,
             )
             for seq_idx, task_id in enumerate(args.task_sequence):
-                path = analysis_snapshot_path(args.analysis_root, suite, condition, seed, seq_idx, task_id)
-                if not path.exists():
-                    continue
-                try:
-                    snap = torch.load(path, map_location="cpu", weights_only=False)
-                    info = snap["actor"]["mean_headpool"].get("last_merge_info")
-                except Exception:
-                    continue
+                info = _load_merge_info_from_saved_state(
+                    args, suite, condition, seed, seq_idx, task_id
+                )
                 if not info or not info.get("merged_source_lineage"):
                     continue
                 lineage = info["merged_source_lineage"]

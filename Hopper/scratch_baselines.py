@@ -226,6 +226,8 @@ def train_one_baseline(suite, task_id, total_timesteps, seed, args, variant="pla
         f"--distill-batch-size={args.distill_batch_size}",
         f"--distill-test-frac={args.distill_test_frac}",
         f"--analysis-log-every={args.analysis_log_every}",
+        # Scratch FT uses scalar learning curves; task-boundary tensor snapshots are redundant.
+        "--no-save-analysis-snapshots",
         # A scratch baseline is a lone root task, so no merge can happen. For
         # distill_skip, distillation=True exists only to construct the same
         # [phi(s), s] actor-head input used by continual distillation modes.
