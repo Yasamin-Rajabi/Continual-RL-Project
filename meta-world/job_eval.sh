@@ -57,7 +57,7 @@ BASE_STORAGE="${BASE_STORAGE:-$PROJECT_ROOT/crl_experiments}"
 EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-$BASE_STORAGE/ethos_student_metaworld_paper10_500k}"
 LOG_ROOT="$EXPERIMENT_ROOT/logs"
 SCRATCH_ROOT_BASE="$EXPERIMENT_ROOT/scratch"
-SCRATCH_SEEDS=(101 102 103)
+SCRATCH_SEEDS=(101 102)
 EVAL_MODES=(deterministic stochastic)
 
 clean_host_python_env() {
