@@ -1,6 +1,11 @@
-"""Four-way continual benchmark for HalfCheetahVel and HalfCheetahWindVel.
+"""Continual MiniGrid DoorKey benchmark with the full paper pipeline.
 
-The four experimental cases intentionally differ only along two method axes:
+Defaults run baseline and combined in parameter and policy composition spaces.
+Legacy ablations remain selectable using --condition-index 0, 2, or 3.
+Policy-space insertion includes an additional projection step documented in
+IMPLEMENTATION_NOTES.md; it is not claimed to be the published CKA-RL baseline.
+
+The legacy experimental cases are:
 
     baseline      = classic CKA vectors + arithmetic merge
     distil_only  = classic CKA vectors + KL distillation merge
@@ -10,7 +15,7 @@ The four experimental cases intentionally differ only along two method axes:
 Merge-pair selection follows the intended method for each condition:
 - baseline and weight_only select the highest-cosine pair in stored parameter space;
 - distil_only and combined select the lowest symmetric KL pair between full
-  Gaussian policy outputs on balanced stored states.
+  categorical policy outputs on balanced stored states.
 
 This file only ORCHESTRATES: it defines the experiment config (CONDITIONS,
 argparse), runs training (train_chain, one subprocess call to run_sac.py per
@@ -21,8 +26,8 @@ task), and calls into metrics.py / plots.py for everything else:
     survey metrics -- A_N, FG, BWT, FT (two variants) -- per the CRL survey's
     Eq. 7-10. See metrics.py's module docstring for exact formulas and which
     TensorBoard scalar backs p_i(t).
-  - plots.py draws every PNG/CSV from whatever metrics.py computed. No
-    training, no environment rollouts, no checkpoint loading happens there.
+  - plots.py draws every PNG/CSV from metrics.py outputs and scalar logs;
+    merge-lineage plots can read finalized pool metadata when snapshots are off.
 
 Forward transfer needs a from-scratch, single-task baseline per unique
 task_id -- see scratch_baselines.py, which trains and caches those
@@ -44,6 +49,7 @@ from tasks import DEFAULT_CONTINUAL_SEQUENCE, TASK_SUITES, get_task_name
 import metrics
 import plots
 import scratch_baselines
+import storage_compaction
 
 
 CONDITIONS = OrderedDict([
@@ -78,15 +84,17 @@ def parse_args():
         choices=sorted(TASK_SUITES.keys()),
     )
     p.add_argument("--seeds", nargs="+", type=int, default=[1, 2, 3])
-    p.add_argument("--task-sequence", nargs="+", type=int, default=list(DEFAULT_CONTINUAL_SEQUENCE))
+    p.add_argument("--task-sequence", nargs="+", type=int, default=None)
     p.add_argument("--total-timesteps", type=int, default=60_000)
     p.add_argument("--learning-starts", type=int, default=1_000)
     p.add_argument("--random-actions-end", type=int, default=2_000)
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--policy-lr", type=float, default=3e-4)
     p.add_argument("--alpha-lr", type=float, default=5e-3)
+    p.add_argument("--alpha-mass-lr", type=float, default=None,
+                   help="Learning rate for the raw alpha-mass gate; default reuses --alpha-lr (legacy behavior).")
     p.add_argument("--alpha-mass-reg", type=float, default=0.05)
-    p.add_argument("--alpha-warmup-steps", type=int, default=5_000)
+    p.add_argument("--alpha-warmup-steps", type=int, default=2_000)
     p.add_argument("--alpha-entropy-reg", type=float, default=0.01,
                    help="Knowledge-mixture entropy bonus during effective weight-delta warmup; 0 disables it.")
     p.add_argument("--drift-reg", type=float, default=1.0)
@@ -96,29 +104,56 @@ def parse_args():
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--tau", type=float, default=0.005)
     p.add_argument("--pool-size", type=int, default=4)
+    p.add_argument("--merge-ablation", choices=["kl_merge", "random_merge", "kl_discard"], default="kl_merge",
+                   help="Pool overflow ablation: KL pair + distill, random pair + distill, or KL pair with discard only.")
     p.add_argument("--eval-every", type=int, default=2_500)
     p.add_argument("--num-evals", type=int, default=5)
-    p.add_argument("--retention-eval-episodes", type=int, default=3)
-    p.add_argument("--test-adapt-steps", type=int, default=5_000,
+    p.add_argument("--retention-eval-episodes", type=int, default=5)
+    p.add_argument("--test-adapt-steps", type=int, default=0,
                    help="Test-time alpha-only adaptation steps for retention and FG/BWT checkpoint evaluation; 0 disables it.")
     p.add_argument("--test-adapt-lr", type=float, default=1e-2,
                    help="Learning rate for test-time alpha adaptation.")
-    p.add_argument("--distill-observation-skip", action=argparse.BooleanOptionalAction, default=True,
+    p.add_argument("--distill-observation-skip", action=argparse.BooleanOptionalAction, default=False,
                    help="Concatenate raw observations to encoder features before policy heads in distillation modes.")
-    p.add_argument("--distill-extra-steps", type=int, default=10_000)
+    p.add_argument("--distill-extra-steps", "--distill-buffer-steps", dest="distill_extra_steps",
+                   type=int, default=5_000, help="Frozen final B interactions INSIDE total-timesteps.")
+    p.add_argument("--composition-spaces", nargs="+", choices=["parameter", "policy"],
+                   default=["parameter", "policy"], help="Use parameter alone to disable policy-space runs.")
+    p.add_argument("--policy-student-replay", action=argparse.BooleanOptionalAction, default=False,
+                   help="Policy-space combined variant: execution mixture acts; novel expert learns from replay; then alpha/gate update separately.")
+    p.add_argument("--projection-epochs", type=int, default=16)
+    p.add_argument("--projection-max-samples", type=int, default=20_000)
+    p.add_argument("--frozen-eval-policy", choices=["pool", "snapshot"], default="pool")
+    p.add_argument("--eval-action-mode", choices=["deterministic", "stochastic"], default="deterministic")
+    p.add_argument("--skip-forward-transfer", action="store_true",
+                   help="Compute A_N/FG/BWT without scratch baselines; leave FT unreported.")
     p.add_argument("--max-distill-buffer", type=int, default=50_000)
     p.add_argument("--similarity-samples", type=int, default=2_048)
+    p.add_argument("--balance-source-lineages", action=argparse.BooleanOptionalAction, default=False,
+                   help="Balance behavioral-KL/distillation/merge-buffer sampling across original source_ids rather than immediate parents.")
     p.add_argument("--distill-max-samples", type=int, default=20_000)
     p.add_argument("--distill-epochs", type=int, default=16)
     p.add_argument("--distill-lr", type=float, default=5e-4)
     p.add_argument("--distill-batch-size", type=int, default=256)
     p.add_argument("--distill-test-frac", type=float, default=0.2)
-    p.add_argument("--analysis-log-every", type=int, default=5_000)
+    p.add_argument("--analysis-log-every", type=int, default=2_500)
     p.add_argument("--save-root", default="agents_minigrid")
     p.add_argument("--runs-root", default="runs")
     p.add_argument("--plots-root", default="plots_minigrid_continual")
     p.add_argument("--analysis-root", default="analysis_runs")
+    p.add_argument(
+        "--save-analysis-snapshots", action=argparse.BooleanOptionalAction, default=False,
+        help="Save large start/pre/post task .pt analysis snapshots. Scalar metrics are always logged; disabled by default to save disk.",
+    )
+    p.add_argument(
+        "--compact-storage", action=argparse.BooleanOptionalAction, default=True,
+        help="After task k+1 is safely saved, strip training-only rollout buffers from task k while preserving finalized pool weights for all post-hoc metrics.",
+    )
     p.add_argument("--skip-training", action="store_true")
+    p.add_argument(
+        "--skip-invalid-seeds", action="store_true",
+        help="With --skip-training, skip seeds whose checkpoint chain is missing, stale, or unreadable instead of aborting aggregation.",
+    )
     p.add_argument("--skip-retention", action="store_true")
     p.add_argument("--skip-survey-metrics", action="store_true")
     p.add_argument(
@@ -144,7 +179,7 @@ def parse_args():
     p.add_argument("--encoder-linear-out", action=argparse.BooleanOptionalAction, default=False,
                    help="Must match the serialized encoder architecture; also changes the critic.")
 
-    p.add_argument("--condition-alpha-scale", action=argparse.BooleanOptionalAction, default=True,
+    p.add_argument("--condition-alpha-scale", action=argparse.BooleanOptionalAction, default=False,
                    help="Use friend's condition-specific alpha-scale rule: learned for classic CKA, fixed at 5 for weight_delta.")
     p.add_argument("--use-alpha-scale", action=argparse.BooleanOptionalAction, default=False,
                    help="Global learned alpha-scale ablation used when --no-condition-alpha-scale.")
@@ -153,11 +188,11 @@ def parse_args():
     p.add_argument("--weight-use-alpha-mass", action=argparse.BooleanOptionalAction, default=True,
                    help="Enable alpha-mass in weight_delta modes. Disable to isolate representation alone.")
     p.add_argument("--constrain-alpha-mass", action=argparse.BooleanOptionalAction, default=True,
-                   help="Positive softplus alpha-mass stabilization; disable for the legacy ablation.")
+                   help="Bounded sigmoid alpha-mass; disable for the legacy ablation.")
     p.add_argument("--distill-select-best-val", action=argparse.BooleanOptionalAction, default=True,
                    help="Restore the lowest held-out-KL distillation epoch; disable for last-epoch legacy behavior.")
     p.add_argument("--collect-cosine-buffers", action=argparse.BooleanOptionalAction, default=False,
-                   help="Cosine modes do not need rollout buffers. Enable only to equalize post-training interactions.")
+                   help="Cosine modes do not need rollout buffers. Enable to retain otherwise-unused cosine-mode tail states.")
 
     p.add_argument("--alpha", type=float, default=0.2,
                    help="Fixed SAC entropy coefficient, or optional autotune initialization.")
@@ -166,7 +201,7 @@ def parse_args():
                    help="If enabled, entropy autotuning starts at --alpha instead of legacy 1.0.")
     p.add_argument("--cpu", action="store_true")
     p.add_argument(
-        "--condition-index", nargs="+", type=int, default=[0], choices=[0, 1, 2, 3, 4],
+        "--condition-index", nargs="+", type=int, default=[1, 4], choices=[0, 1, 2, 3, 4],
         help="0 = run all 4 CONDITIONS. Otherwise provide one or more of 1-4 "
              "(1=baseline, 2=distil_only, 3=weight_only, 4=combined), e.g. --condition-index 1 4.",
     )
@@ -177,12 +212,12 @@ def parse_args():
         # Exercises at least one merge without committing to the full paper run.
         args.task_suites = ["mg_smoke2"]
         args.seeds = [1]
-        args.task_sequence = [0, 1, 2, 3]
-        args.total_timesteps = 20_000
+        args.task_sequence = [0, 1, 0]
+        args.total_timesteps = 8_000
         args.learning_starts = 1_000
-        args.random_actions_end = 2_000
+        args.random_actions_end = 1_500
         args.pool_size = 2
-        args.eval_every = 5_000
+        args.eval_every = 2_000
         args.num_evals = 1
         args.retention_eval_episodes = 1
         args.distill_extra_steps = 1_000
@@ -206,7 +241,16 @@ def parse_args():
         p.error("--distill-encoder-lr-mult must be > 0")
     if 0 in args.condition_index and len(args.condition_index) > 1:
         p.error("--condition-index 0 means all conditions and cannot be combined with other indices")
+    if args.policy_student_replay:
+        if args.composition_spaces != ["policy"]:
+            p.error("--policy-student-replay must be run with --composition-spaces policy only")
+        if args.condition_index != [4]:
+            p.error("--policy-student-replay is defined for --condition-index 4 (combined) only")
 
+    if not 0 <= args.distill_extra_steps < args.total_timesteps:
+        p.error("Require 0 <= B < Delta")
+    if args.test_adapt_steps and args.frozen_eval_policy != "pool":
+        p.error("Test-time adaptation requires --frozen-eval-policy pool")
     return args
 
 
@@ -233,6 +277,11 @@ def _expected_training_config(args, suite, task_id, seq_idx, seed, cfg):
         "seed": int(seed),
         "cuda": not bool(args.cpu),
         "fusion_mode": cfg["fusion_mode"],
+        "composition_space": cfg.get("composition_space", "parameter"),
+        "policy_student_replay": bool(args.policy_student_replay),
+        "projection_epochs": int(args.projection_epochs),
+        "projection_max_samples": int(args.projection_max_samples),
+        "eval_action_mode": args.eval_action_mode,
         "total_timesteps": int(args.total_timesteps),
         "gamma": float(args.gamma),
         "tau": float(args.tau),
@@ -241,6 +290,7 @@ def _expected_training_config(args, suite, task_id, seq_idx, seed, cfg):
         "random_actions_end": int(args.random_actions_end),
         "policy_lr": float(args.policy_lr),
         "alpha_lr": float(args.alpha_lr),
+        "alpha_mass_lr": float(args.alpha_lr if args.alpha_mass_lr is None else args.alpha_mass_lr),
         "alpha_warmup_steps": int(args.alpha_warmup_steps),
         "alpha_entropy_reg": float(args.alpha_entropy_reg),
         "distill_encoder_lr_mult": float(args.distill_encoder_lr_mult),
@@ -249,6 +299,7 @@ def _expected_training_config(args, suite, task_id, seq_idx, seed, cfg):
         "autotune": bool(args.autotune),
         "autotune_init_from_alpha": bool(args.autotune_init_from_alpha),
         "pool_size": int(args.pool_size),
+        "merge_ablation": str(args.merge_ablation),
         "eval_every": int(args.eval_every),
         "num_evals": int(args.num_evals),
         "encoder_from_base": bool(args.encoder_from_base),
@@ -267,6 +318,7 @@ def _expected_training_config(args, suite, task_id, seq_idx, seed, cfg):
         "collect_cosine_buffers": bool(args.collect_cosine_buffers),
         "max_distill_buffer": int(args.max_distill_buffer),
         "similarity_samples": int(args.similarity_samples),
+        "balance_source_lineages": bool(args.balance_source_lineages),
         "distill_max_samples": int(args.distill_max_samples),
         "distill_epochs": int(args.distill_epochs),
         "distill_lr": float(args.distill_lr),
@@ -305,7 +357,15 @@ def train_chain(args, suite, condition, cfg, seed):
             )
             if matches:
                 print(f"[{suite}/{condition}/seed={seed}] seq{seq_idx} already complete: {run_dir}")
+                predecessor = previous[-1] if previous else None
                 previous.append(run_dir)
+                if args.compact_storage and not args.skip_training and predecessor is not None:
+                    report = storage_compaction.compact_checkpoint(predecessor)
+                    if report.get("disk_bytes_saved", 0):
+                        print(
+                            f"[storage] compacted {predecessor}: "
+                            f"saved {report['disk_bytes_saved'] / (1024 ** 2):.1f} MiB"
+                        )
                 continue
             print(f"[{suite}/{condition}/seed={seed}] seq{seq_idx} stale checkpoint: {reason}; retraining")
 
@@ -313,6 +373,9 @@ def train_chain(args, suite, condition, cfg, seed):
             raise FileNotFoundError(
                 f"Missing/stale checkpoint while --skip-training was set: {run_dir}"
             )
+
+        if prev_args:
+            storage_compaction.require_resumable(prev_args[-1])
 
         # Remove partial outputs before a retry, otherwise TensorBoard can mix
         # stale and fresh event files from two different attempts.
@@ -338,6 +401,7 @@ def train_chain(args, suite, condition, cfg, seed):
             f"--batch-size={args.batch_size}",
             f"--policy-lr={args.policy_lr}",
             f"--alpha-lr={args.alpha_lr}",
+            f"--alpha-mass-lr={args.alpha_lr if args.alpha_mass_lr is None else args.alpha_mass_lr}",
             f"--alpha-mass-reg={args.alpha_mass_reg}",
             f"--alpha-warmup-steps={args.alpha_warmup_steps}",
             f"--alpha-entropy-reg={args.alpha_entropy_reg}",
@@ -353,13 +417,21 @@ def train_chain(args, suite, condition, cfg, seed):
             f"--distill-extra-steps={args.distill_extra_steps}",
             f"--max-distill-buffer={args.max_distill_buffer}",
             f"--similarity-samples={args.similarity_samples}",
+            "--balance-source-lineages" if args.balance_source_lineages else "--no-balance-source-lineages",
             f"--distill-max-samples={args.distill_max_samples}",
             f"--distill-epochs={args.distill_epochs}",
             f"--distill-lr={args.distill_lr}",
             f"--distill-batch-size={args.distill_batch_size}",
             f"--distill-test-frac={args.distill_test_frac}",
             f"--analysis-log-every={args.analysis_log_every}",
+            "--save-analysis-snapshots" if args.save_analysis_snapshots else "--no-save-analysis-snapshots",
+            f"--merge-ablation={args.merge_ablation}",
             f"--fusion-mode={cfg['fusion_mode']}",
+            f"--composition-space={cfg.get('composition_space', 'parameter')}",
+            "--policy-student-replay" if args.policy_student_replay else "--no-policy-student-replay",
+            f"--projection-epochs={args.projection_epochs}",
+            f"--projection-max-samples={args.projection_max_samples}",
+            f"--eval-action-mode={args.eval_action_mode}",
             f"--alpha={args.alpha}",
             "--autotune" if args.autotune else "--no-autotune",
             "--autotune-init-from-alpha" if args.autotune_init_from_alpha else "--no-autotune-init-from-alpha",
@@ -398,7 +470,15 @@ def train_chain(args, suite, condition, cfg, seed):
         )
         if not matches:
             raise RuntimeError(f"Training produced a checkpoint with unexpected identity: {reason}")
+        predecessor = previous[-1] if previous else None
         previous.append(run_dir)
+        if args.compact_storage and not args.skip_training and predecessor is not None:
+            report = storage_compaction.compact_checkpoint(predecessor)
+            if report.get("disk_bytes_saved", 0):
+                print(
+                    f"[storage] compacted {predecessor}: "
+                    f"saved {report['disk_bytes_saved'] / (1024 ** 2):.1f} MiB"
+                )
     return previous
 
 
@@ -426,83 +506,141 @@ def main():
             name = all_condition_names[idx - 1]
             if name not in conditions:
                 conditions.append(name)
-    selected_conditions = {name: CONDITIONS[name] for name in conditions}
+    # Cross selected methods with composition space without changing the legacy
+    # ablation indices. The replay-trained standalone-expert variant gets its own
+    # label so it never reuses/overwrites ordinary combined_policy checkpoints.
+    selected_conditions = {}
+    for name in conditions:
+        for space in dict.fromkeys(args.composition_spaces):
+            if space == "parameter":
+                label = name
+            elif args.policy_student_replay:
+                label = name + "_policy_student"
+            else:
+                label = name + "_policy"
+            selected_conditions[label] = {**CONDITIONS[name], "composition_space": space}
+    conditions = list(selected_conditions)
     print(f"Conditions: {conditions}")
 
+    requested_sequence = args.task_sequence
+    requested_seeds = list(args.seeds)
     for suite in args.task_suites:
+        from tasks import DEFAULT_CONTINUAL_SEQUENCE
+        import tasks as task_definitions
+        suite_default = (task_definitions.default_sequence(suite) if hasattr(task_definitions, "default_sequence")
+                         else DEFAULT_CONTINUAL_SEQUENCE)
+        args.task_sequence = list(requested_sequence if requested_sequence is not None else suite_default)
+        args.seeds = list(requested_seeds)
         print(f"\n================ {suite} ================")
-        for condition, cfg in selected_conditions.items():
-            for seed in args.seeds:
-                train_chain(args, suite, condition, cfg, seed)
+
+        # During evaluation-only aggregation, optionally validate each complete
+        # continual seed independently.  A failed/partial seed is excluded from
+        # the aggregate instead of aborting the good seeds.  Normal training and
+        # strict --skip-training behavior are unchanged unless the explicit
+        # --skip-invalid-seeds flag is present.
+        if args.skip_training and args.skip_invalid_seeds:
+            valid_seeds = []
+            invalid_seed_reasons = {}
+            for seed in requested_seeds:
+                try:
+                    for condition, cfg in selected_conditions.items():
+                        train_chain(args, suite, condition, cfg, seed)
+                except Exception as exc:
+                    invalid_seed_reasons[seed] = f"{type(exc).__name__}: {exc}"
+                    print(
+                        f"[skip-invalid-seeds] skipping {suite} seed {seed}: "
+                        f"{invalid_seed_reasons[seed]}",
+                        file=sys.stderr,
+                    )
+                    continue
+                valid_seeds.append(seed)
+
+            if not valid_seeds:
+                details = "; ".join(
+                    f"seed {seed}: {reason}" for seed, reason in invalid_seed_reasons.items()
+                )
+                raise RuntimeError(
+                    f"No valid seeds remain for {suite} after checkpoint validation. {details}"
+                )
+            args.seeds = valid_seeds
+            print(f"[skip-invalid-seeds] checkpoint-valid seeds for {suite}: {args.seeds}")
+        else:
+            for condition, cfg in selected_conditions.items():
+                for seed in args.seeds:
+                    train_chain(args, suite, condition, cfg, seed)
 
         plots.plot_training_metrics(args, suite, conditions)
         plots.plot_sequence_diagnostics(args, suite, conditions)
         plots.plot_merge_lineage(args, suite, conditions)
         plots.plot_zero_shot(args, suite, conditions)
 
-        if not args.skip_retention:
+        if args.skip_training and args.skip_invalid_seeds:
+            # Evaluate each seed transactionally: a seed contributes to the
+            # aggregate only if every requested metric can be computed for every
+            # selected condition.  This also catches unreadable/corrupt .pt files
+            # that may pass the lightweight manifest/file-existence checks above.
             all_payloads = {condition: [] for condition in conditions}
-            for condition in conditions:
-                for seed in args.seeds:
-                    all_payloads[condition].append(
-                        metrics.build_retention_matrix(args, suite, condition, seed, device)
+            survey_payloads = {condition: [] for condition in conditions}
+            metric_valid_seeds = []
+            for seed in list(args.seeds):
+                seed_retention = {}
+                seed_survey = {}
+                try:
+                    for condition in conditions:
+                        if not args.skip_retention:
+                            seed_retention[condition] = metrics.build_retention_matrix(
+                                args, suite, condition, seed, device
+                            )
+                        if not args.skip_survey_metrics:
+                            seed_survey[condition] = metrics.compute_survey_metrics(
+                                args, suite, condition, seed, device,
+                                args.scratch_seeds, args.total_timesteps
+                            )
+                except Exception as exc:
+                    print(
+                        f"[skip-invalid-seeds] skipping {suite} seed {seed} during metric "
+                        f"evaluation: {type(exc).__name__}: {exc}",
+                        file=sys.stderr,
                     )
-            plots.plot_retention(args, suite, conditions, all_payloads)
-            plots.write_summary_csv(args, suite, conditions, all_payloads)
+                    continue
 
-        if not args.skip_survey_metrics:
-            used_task_ids = sorted(set(args.task_sequence))
-            required_variants = sorted({
-                scratch_baselines.variant_for_condition(
-                    condition, args.distill_observation_skip
+                metric_valid_seeds.append(seed)
+                for condition, payload in seed_retention.items():
+                    all_payloads[condition].append(payload)
+                for condition, payload in seed_survey.items():
+                    survey_payloads[condition].append(payload)
+
+            if not metric_valid_seeds:
+                raise RuntimeError(
+                    f"No valid seeds remain for {suite} after metric evaluation."
                 )
-                for condition in conditions
-            })
-            missing_baselines = []
-            stale_baselines = []
-            for variant in required_variants:
-                for task_id in used_task_ids:
-                    for scratch_seed in args.scratch_seeds:
-                        scratch_dir = scratch_baselines.scratch_checkpoint_dir(
-                            args.scratch_save_root, suite, task_id, args.total_timesteps,
-                            scratch_seed, variant,
+            args.seeds = metric_valid_seeds
+            print(f"[skip-invalid-seeds] aggregate seeds for {suite}: {args.seeds}")
+
+            if not args.skip_retention:
+                plots.plot_retention(args, suite, conditions, all_payloads)
+                plots.write_summary_csv(args, suite, conditions, all_payloads)
+            if not args.skip_survey_metrics:
+                plots.plot_survey_metrics(args, suite, conditions, survey_payloads)
+                plots.write_survey_metrics_csv(args, suite, conditions, survey_payloads)
+        else:
+            if not args.skip_retention:
+                all_payloads = {condition: [] for condition in conditions}
+                for condition in conditions:
+                    for seed in args.seeds:
+                        all_payloads[condition].append(
+                            metrics.build_retention_matrix(args, suite, condition, seed, device)
                         )
-                        if not scratch_baselines.checkpoint_complete(scratch_dir):
-                            missing_baselines.append((variant, task_id))
-                            continue
-                        matches, reason = scratch_baselines.checkpoint_matches(
-                            scratch_dir, suite, task_id, args.total_timesteps,
-                            scratch_seed, args, variant,
-                        )
-                        if not matches:
-                            stale_baselines.append((variant, task_id, scratch_seed, reason))
-            if stale_baselines:
-                print("\n!!! Scratch baseline identity mismatch(es):")
-                for variant, task_id, scratch_seed, reason in stale_baselines:
-                    print(f"    {variant}: task {task_id}, seed {scratch_seed}: {reason}")
-                missing_baselines.extend((variant, task_id) for variant, task_id, _, _ in stale_baselines)
-            if missing_baselines:
-                missing_text = ", ".join(
-                    f"{variant}/task_{task_id}" for variant, task_id in sorted(set(missing_baselines))
-                )
-                print(
-                    f"\n!!! Skipping survey metrics for {suite}: missing/incompatible "
-                    f"scratch baselines: {missing_text}. Run:\n"
-                    f"    {sys.executable} scratch_baselines.py --task-suites {suite} "
-                    f"--variants {' '.join(required_variants)} "
-                    f"--total-timesteps {args.total_timesteps} --seeds {' '.join(map(str, args.scratch_seeds))} "
-                    f"--save-root {args.scratch_save_root} --runs-root {args.runs_root}\n"
-                )
-            else:
+                plots.plot_retention(args, suite, conditions, all_payloads)
+                plots.write_summary_csv(args, suite, conditions, all_payloads)
+
+            if not args.skip_survey_metrics:
                 survey_payloads = {condition: [] for condition in conditions}
                 for condition in conditions:
                     for seed in args.seeds:
-                        survey_payloads[condition].append(
-                            metrics.compute_survey_metrics(
-                                args, suite, condition, seed, device,
-                                args.scratch_seeds, args.total_timesteps,
-                            )
-                        )
+                        survey_payloads[condition].append(metrics.compute_survey_metrics(
+                            args, suite, condition, seed, device,
+                            args.scratch_seeds, args.total_timesteps))
                 plots.plot_survey_metrics(args, suite, conditions, survey_payloads)
                 plots.write_survey_metrics_csv(args, suite, conditions, survey_payloads)
 

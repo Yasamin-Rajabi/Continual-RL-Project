@@ -1,45 +1,9 @@
-"""Pilot check: is a 150k-step budget actually enough for these four tasks?
+"""Cheap single-task pilot for the 60k MiniGrid paper budget.
 
-RUN THIS BEFORE ANYTHING ELSE. It costs about one GPU-hour and decides whether
-the whole experimental plan is viable.
-
-WHY IT IS NOT OPTIONAL
-----------------------
-No published source reports single-task SAC learning curves for MiniGrid at
-the 150k scale -- the community convention is 1M steps per task (Continual
-World, TD-MPC). Our task selection is an argued extrapolation from the MT50
-difficulty partition, not a measured fact. If the four chosen tasks do not
-reach a meaningful success rate in 150k steps, every downstream comparison
-between fusion modes is comparing noise, and no amount of seeds will fix it.
-
-WHAT IT DOES
-------------
-Trains from-scratch SAC on each task in the suite for --steps steps, one seed,
-and reports the success curve. Reuses run_sac.py exactly, so what it measures
-is what the benchmark will do.
-
-HOW TO READ THE RESULT
-----------------------
-For each task the script prints final success and the step at which success
-first exceeds 0.5.
-
-  - final success >= 0.6 on all four         -> proceed as planned.
-  - final success >= 0.6 but reached before
-    ~30k steps on most tasks                 -> tasks saturate too early; the
-                                                comparison window is tiny. Move
-                                                to the mw_easy6 suite or lower
-                                                --steps so the curve, not the
-                                                plateau, dominates the AUC.
-  - any task stuck near 0                    -> drop that task. Easy-tier
-                                                alternatives that keep the
-                                                interference structure:
-                                                door-close-v2, drawer-close-v2,
-                                                button-press-topdown-v2,
-                                                plate-slide-v2.
-
-The from-scratch runs this produces are ALSO the FT baselines the benchmark
-needs, so nothing here is wasted work -- point scratch_baselines at the same
---runs-root and it will reuse them.
+This is a screening tool, not part of metric collection. It trains the same
+categorical SAC implementation used by the continual benchmark on each task and
+reports its observed success curve. The canonical FT scratch references are
+created by `job_paper.sh --phase scratch` / the normal paper launcher.
 """
 from __future__ import annotations
 
@@ -53,9 +17,7 @@ import numpy as np
 
 from tasks import TASK_SUITES, get_task_name
 
-TEST_LINE = re.compile(
-    r"TEST:\s*return=(?P<ret>[-0-9.]+),\s*success=(?P<succ>[0-9.]+)"
-)
+TEST_LINE = re.compile(r"TEST:\s*return=(?P<ret>[-0-9.]+),\s*success=(?P<succ>[0-9.]+)")
 
 
 def parse_args():
@@ -64,9 +26,8 @@ def parse_args():
     p.add_argument("--steps", type=int, default=60_000)
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--eval-every", type=int, default=2_500)
-    p.add_argument("--tasks", nargs="+", type=int, default=None,
-                   help="Task ids to check. Default: all in the suite.")
-    p.add_argument("--runs-root", default="runs")
+    p.add_argument("--tasks", nargs="+", type=int, default=None)
+    p.add_argument("--runs-root", default="runs_pilot")
     p.add_argument("--save-dir", default="agents_pilot")
     p.add_argument("--analysis-root", default="analysis_pilot")
     p.add_argument("--cpu", action="store_true")
@@ -86,26 +47,29 @@ def run_one(args, task_id: int):
         f"--analysis-root={args.analysis_root}",
         f"--total-timesteps={args.steps}",
         f"--eval-every={args.eval_every}",
+        "--learning-starts=1000",
+        "--random-actions-end=2000",
         "--fusion-mode=classic_cka",
+        "--composition-space=parameter",
         "--no-use-alpha-scale",
         "--no-distillation",
         "--no-use-alpha-mass",
+        "--no-save-analysis-snapshots",
     ]
     if args.cpu:
         cmd.append("--no-cuda")
 
     print(f"\n>>> pilot task {task_id} ({get_task_name(task_id, args.task_suite)})")
     print("   ", " ".join(cmd), flush=True)
-
     successes = []
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, bufsize=1)
     assert proc.stdout is not None
     for line in proc.stdout:
         sys.stdout.write(line)
-        m = TEST_LINE.search(line)
-        if m:
-            successes.append(float(m.group("succ")))
+        match = TEST_LINE.search(line)
+        if match:
+            successes.append(float(match.group("succ")))
     proc.wait()
     if proc.returncode != 0:
         raise SystemExit(f"pilot run for task {task_id} failed ({proc.returncode})")
@@ -115,61 +79,28 @@ def run_one(args, task_id: int):
 def main():
     args = parse_args()
     if not pathlib.Path("run_sac.py").exists():
-        raise SystemExit("run this from the project directory containing run_sac.py")
-
+        raise SystemExit("run this from the minigrid directory")
     task_ids = args.tasks if args.tasks is not None else list(range(len(TASK_SUITES[args.task_suite])))
+    results = {task_id: run_one(args, task_id) for task_id in task_ids}
 
-    results = {}
-    for tid in task_ids:
-        results[tid] = run_one(args, tid)
-
-    print("\n" + "=" * 74)
-    print(f"PILOT RESULT  ({args.steps} steps, seed {args.seed}, 1 seed only)")
-    print("=" * 74)
-    print(f"{'task':28s} {'final':>7s} {'best':>7s} {'step@0.5':>10s}  verdict")
-
-    verdicts = []
-    for tid, curve in results.items():
-        name = get_task_name(tid, args.task_suite)
+    print("\n" + "=" * 78)
+    print(f"MINIGRID PILOT ({args.steps} steps, seed {args.seed}; screening only)")
+    print("=" * 78)
+    print(f"{'task':30s} {'final':>7s} {'best':>7s} {'first >=0.5':>12s}")
+    for task_id, curve in results.items():
+        name = get_task_name(task_id, args.task_suite)
         if not curve:
-            print(f"{name:28s} {'--':>7s} {'--':>7s} {'--':>10s}  NO EVAL DATA")
-            verdicts.append("bad")
+            print(f"{name:30s} {'--':>7s} {'--':>7s} {'--':>12s}")
             continue
-        arr = np.asarray(curve)
-        final, best = float(arr[-1]), float(arr.max())
-        over = np.nonzero(arr >= 0.5)[0]
-        step_half = int((over[0] + 1) * args.eval_every) if over.size else -1
+        values = np.asarray(curve, dtype=np.float64)
+        above = np.flatnonzero(values >= 0.5)
+        first = int((above[0] + 1) * args.eval_every) if above.size else None
+        first_text = str(first) if first is not None else "never"
+        print(f"{name:30s} {values[-1]:7.3f} {values.max():7.3f} {first_text:>12s}")
 
-        if final >= 0.6 and 0 < step_half <= 0.2 * args.steps:
-            verdict, tag = "saturates early", "early"
-        elif final >= 0.6:
-            verdict, tag = "good", "good"
-        elif best >= 0.3:
-            verdict, tag = "marginal - needs more steps", "marginal"
-        else:
-            verdict, tag = "NOT LEARNED - replace this task", "bad"
-        verdicts.append(tag)
-        shown = f"{step_half}" if step_half > 0 else "never"
-        print(f"{name:28s} {final:7.2f} {best:7.2f} {shown:>10s}  {verdict}")
-
-    print("-" * 74)
-    if "bad" in verdicts:
-        print("ACTION: at least one task never learned. Replace it before running the "
-              "benchmark -- it would contribute pure noise to FG, BWT and FT.\n"
-              "        Cheaper substitutes: MiniGrid-Empty-6x6-v0,\n"
-              "        MiniGrid-DistShift1-v0, MiniGrid-LavaGapS5-v0.")
-    elif verdicts.count("early") >= len(verdicts) // 2:
-        print("ACTION: most tasks saturate in the first fifth of the budget, so the "
-              "AUC is dominated by the plateau and methods will look identical.\n"
-              "        Either lower --total-timesteps, or switch to the mw_easy6 suite.")
-    elif "marginal" in verdicts:
-        print("ACTION: some tasks are marginal. Either raise the budget for those, or "
-              "accept that they mostly measure forgetting rather than transfer.")
-    else:
-        print("ACTION: all four tasks learn inside the budget. Proceed with the "
-              "full benchmark.")
-    print("\nThese from-scratch runs double as the FT baselines -- point "
-          "scratch_baselines.py at the same --runs-root to reuse them.")
+    print("\nInterpret this as an empirical budget check. If a task remains near-zero, "
+          "do not launch the full grid blindly; inspect its curve/horizon or increase "
+          "the budget. Use job_paper.sh for the canonical scratch references and paper metrics.")
 
 
 if __name__ == "__main__":

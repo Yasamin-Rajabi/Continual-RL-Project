@@ -15,12 +15,17 @@ import torch.nn.functional as F
 import torch.optim as optim
 import tyro
 from stable_baselines3.common.buffers import ReplayBuffer
-from torch.utils.tensorboard import SummaryWriter
+from csv_summary_writer import CsvSummaryWriter
 from tqdm import tqdm
 
 from analysis_logging import effective_theta_vector, log_training_state, save_task_snapshot
 from cka_rl import CkaRlAgent
 from experiment_identity import write_manifest
+from policy_composition import (
+    sample_action, representative_action, mixture_distribution, sac_actor_objective,
+    novel_sac_actor_objective, mixture_weight_sac_actor_objective,
+)
+from training_protocol import TaskBudget, mixture_warmup_active, bounded_buffer
 from shared_arch import shared
 from tasks import get_task, get_task_name
 
@@ -30,6 +35,17 @@ class Args:
     model_type: Literal["cka-rl"] = "cka-rl"
     task_suite: Literal["doorkey4", "doorkey6", "mg_smoke2"] = "doorkey4"
     fusion_mode: Literal["classic_cka", "weight_delta"] = "classic_cka"
+    eval_action_mode: Literal["deterministic", "stochastic"] = "deterministic"
+    composition_space: Literal["parameter", "policy"] = "parameter"
+    merge_ablation: Literal["kl_merge", "random_merge", "kl_discard"] = "kl_merge"
+    policy_student_replay: bool = False
+    """Policy-space student variant: execute the full mixture, train only the
+    standalone novel expert from replay, then update alpha/alpha-mass in a
+    separate routing step. Historical expert heads remain frozen."""
+    projection_epochs: int = 16
+    projection_max_samples: int = 20_000
+    distill_buffer_steps: Optional[int] = None
+    """Alias for distill_extra_steps. B is INCLUDED in total_timesteps, not added."""
     save_dir: Optional[str] = None
     prev_units: Tuple[pathlib.Path, ...] = ()
 
@@ -38,7 +54,7 @@ class Args:
     torch_deterministic: bool = True
     cuda: bool = True
     track: bool = False
-    wandb_project_name: str = "cka-minigrid"
+    wandb_project_name: str = "ethos-minigrid"
     wandb_entity: Optional[str] = None
     capture_video: bool = False
 
@@ -58,7 +74,10 @@ class Args:
     random_actions_end: int = 2_000
     policy_lr: float = 3e-4
     alpha_lr: float = 5e-3
-    alpha_warmup_steps: int = 1_000
+    alpha_mass_lr: Optional[float] = None
+    """Learning rate for the raw historical-vs-novel alpha-mass gate.
+    None preserves the legacy behavior by reusing --alpha-lr."""
+    alpha_warmup_steps: int = 5_000
     q_lr: float = 3e-4
     policy_frequency: int = 2
     target_network_frequency: int = 1
@@ -90,7 +109,7 @@ class Args:
     warmup. Set to 0 to disable it."""
     constrain_alpha_mass: bool = True
     """When alpha-mass is enabled, map its raw scalar through a positive
-    softplus transform. Disable only for the legacy/unconstrained ablation."""
+    sigmoid transform into [0,1]. Disable only for the legacy/unconstrained ablation."""
     # Was True, which contradicted both cka_rl.py's own docstring ("train_shared=False
     # (default)") and run_continual_benchmark.py, which always passes --no-train-shared.
     # Running run_sac.py directly (as the README examples do) therefore used a
@@ -113,15 +132,19 @@ class Args:
 
     # Distillation modes require rollout states for behavioral KL.
     # Cosine modes do not; collect_cosine_buffers=True is available when an
-    # equal post-training interaction budget is desired for an ablation.
-    distill_observation_skip: bool = True
+    # equal retained-buffer ablation is desired for an ablation.
+    distill_observation_skip: bool = False
     """Friend-method skip connection: in distillation modes concatenate raw
     observations to shared features before the policy heads. Disable for the
     pre-merge architecture ablation."""
-    distill_extra_steps: int = 4_000
+    distill_extra_steps: int = 5_000
+    """Legacy flag name: the final B steps INSIDE Delta; never extra interactions."""
     collect_cosine_buffers: bool = False
     max_distill_buffer: int = 50_000
     similarity_samples: int = 2_048
+    balance_source_lineages: bool = False
+    """Balance behavioral-similarity, distillation, and retained merge-buffer
+    samples across original source_ids instead of only immediate merge parents."""
     distill_max_samples: int = 20_000
     distill_epochs: int = 16
     distill_select_best_val: bool = True
@@ -132,7 +155,7 @@ class Args:
     distill_test_frac: float = 0.2
 
     analysis_log_every: int = 2_500
-    save_analysis_snapshots: bool = True
+    save_analysis_snapshots: bool = False
     analysis_root: str = "analysis_runs"
 
 
@@ -154,13 +177,7 @@ def make_vector_env(task_id: int, task_suite: str):
 
 
 class SoftQNetwork(nn.Module):
-    """Discrete-action critic: Q(s) -> one value per action.
-
-    The continuous version took (s, a) and returned a scalar. With 7 discrete
-    actions it is both cheaper and lower variance to output all |A| values at
-    once, because the SAC-Discrete targets and the actor loss both need an
-    expectation over the full action distribution, not a single sampled action.
-    """
+    """SAC-Discrete critic: Q(s) for every categorical action."""
 
     def __init__(self, envs, linear_out=False):
         super().__init__()
@@ -174,14 +191,7 @@ class SoftQNetwork(nn.Module):
 
 
 class Actor(nn.Module):
-    """Categorical policy over the discrete action set.
-
-    The knowledge pool still holds TWO heads, exactly as in the continuous
-    setting, and their outputs are summed to form the logits. That keeps the
-    pool machinery, the checkpoint layout and the per-entry memory cost
-    unchanged; it is simply an over-parameterized logits head. See the comment
-    in CkaRlAgent.__init__ for why this is preferable to dropping a pool.
-    """
+    """Categorical actor executing the exact routed policy mixture."""
 
     def __init__(self, envs, model):
         super().__init__()
@@ -192,51 +202,57 @@ class Actor(nn.Module):
         head_a, head_b = self.model(x)
         return head_a + head_b
 
+    def distribution(self, x):
+        return mixture_distribution(self.model, x)
+
     def get_action(self, x):
-        """Return (sampled action, log-probs of ALL actions, action probs).
+        return sample_action(self.model, x)
 
-        SAC-Discrete needs the full distribution rather than the log-prob of one
-        sample: both the critic target and the actor loss are exact
-        expectations over the action set, which removes the sampling variance
-        that the continuous version has to live with.
-        """
-        logits = self(x)
-        probs = torch.softmax(logits, dim=-1)
-        log_probs = torch.log_softmax(logits, dim=-1)
-        action = torch.distributions.Categorical(probs=probs).sample()
-        return action, log_probs, probs
+    def deterministic_action(self, x):
+        return representative_action(self.model, x)
 
-    @torch.no_grad()
-    def greedy_action(self, x):
-        return torch.argmax(self(x), dim=-1)
+    def actor_objective(self, obs, q1, q2, temperature):
+        return sac_actor_objective(self.model, obs, q1, q2, temperature)
+
+    def novel_actor_objective(self, obs, q1, q2, temperature):
+        return novel_sac_actor_objective(self.model, obs, q1, q2, temperature)
+
+    def mixture_weight_objective(self, obs, q1, q2, temperature):
+        return mixture_weight_sac_actor_objective(self.model, obs, q1, q2, temperature)
 
 
 @torch.no_grad()
 def eval_agent(agent, test_env, num_evals, global_step, writer, device):
-    returns, success_rates, mean_task_errors, mean_aux_metrics = [], [], [], []
+    cuda_devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type == "cuda" else []
+    with torch.random.fork_rng(devices=cuda_devices):
+        torch.manual_seed(10_000)
+        return _eval_agent_impl(agent, test_env, num_evals, global_step, writer, device)
+
+
+def _eval_agent_impl(agent, test_env, num_evals, global_step, writer, device):
+    returns, success_rates, mean_task_errors = [], [], []
     for ep in range(num_evals):
         obs, _ = test_env.reset(seed=10_000 + ep)
         ep_return = 0.0
         ep_success = []
         ep_task_error = []
-        ep_aux_metric = []
         while True:
             obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-            action = agent.greedy_action(obs_t)
+            action = (agent.get_action(obs_t)[0] if getattr(agent, "evaluation_action_mode", "deterministic") == "stochastic"
+                      else agent.deterministic_action(obs_t))
+            agent.evaluation_env_steps = getattr(agent, "evaluation_env_steps", 0) + 1
             obs, reward, terminated, truncated, info = test_env.step(int(action[0].item()))
             ep_return += float(reward)
             if "success" in info:
                 ep_success.append(float(info["success"]))
             if "task_error" in info:
                 ep_task_error.append(float(info["task_error"]))
-            if "aux_metric" in info:
-                ep_aux_metric.append(float(info["aux_metric"]))
             if terminated or truncated:
                 break
         returns.append(ep_return)
-        success_rates.append(float(np.mean(ep_success)) if ep_success else np.nan)
+        # success is latched by MiniGridFlatWrapper, so max = solved episode.
+        success_rates.append(float(np.max(ep_success)) if ep_success else np.nan)
         mean_task_errors.append(float(np.mean(ep_task_error)) if ep_task_error else np.nan)
-        mean_aux_metrics.append(float(np.mean(ep_aux_metric)) if ep_aux_metric else np.nan)
 
     def finite_mean(values):
         arr = np.asarray(values, dtype=np.float64)
@@ -247,17 +263,14 @@ def eval_agent(agent, test_env, num_evals, global_step, writer, device):
         "return": float(np.mean(returns)),
         "success": finite_mean(success_rates),
         "task_error": finite_mean(mean_task_errors),
-        "aux_metric": finite_mean(mean_aux_metrics),
     }
     print(
         f"\nTEST: return={metrics['return']:.3f}, success={metrics['success']:.3f}, "
-        f"task_error={metrics['task_error']:.4f}, "
-        f"aux_metric={metrics['aux_metric']:.4f}\n"
+        f"task_error={metrics['task_error']:.4f}\n"
     )
     writer.add_scalar("charts/test_episodic_return", metrics["return"], global_step)
     writer.add_scalar("charts/test_success", metrics["success"], global_step)
     writer.add_scalar("charts/test_task_error", metrics["task_error"], global_step)
-    writer.add_scalar("charts/test_aux_metric", metrics["aux_metric"], global_step)
     return metrics
 
 
@@ -331,7 +344,7 @@ def _replace_autoreset_observations(next_obs, terminations, truncations, infos):
 
 def collect_merge_buffer(actor, envs, steps, task_id, seq_idx, device, seed):
     """Collect raw on-policy states/actions for KL similarity and distillation."""
-    obs_rows, action_rows, velocity_rows, error_rows = [], [], [], []
+    obs_rows, action_rows, error_rows = [], [], []
     obs, _ = envs.reset(seed=seed)
     actor.eval()
     start = time.time()
@@ -340,17 +353,12 @@ def collect_merge_buffer(actor, envs, steps, task_id, seq_idx, device, seed):
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device)
         with torch.no_grad():
             actions, _, _ = actor.get_action(obs_t)
-        actions_np = np.asarray(actions.cpu().numpy()).reshape(envs.num_envs)
+        actions_np = actions.cpu().numpy().reshape(envs.num_envs)
         obs_rows.append(obs.copy())
         action_rows.append(actions_np.copy())
 
         next_obs, _, _, _, infos = envs.step(actions_np)
-        aux_metric = infos.get("aux_metric")
         task_error = infos.get("task_error")
-        if aux_metric is None:
-            velocity_rows.append(np.full((envs.num_envs, 1), np.nan, dtype=np.float32))
-        else:
-            velocity_rows.append(np.asarray(aux_metric, dtype=np.float32).reshape(envs.num_envs, 1))
         if task_error is None:
             error_rows.append(np.full((envs.num_envs, 1), np.nan, dtype=np.float32))
         else:
@@ -359,25 +367,42 @@ def collect_merge_buffer(actor, envs, steps, task_id, seq_idx, device, seed):
 
     buffer = {
         "obs": np.concatenate(obs_rows, axis=0).astype(np.float32, copy=False),
-        "actions": np.concatenate(action_rows, axis=0).astype(np.float32, copy=False),
+        "actions": np.concatenate(action_rows, axis=0).astype(np.int64, copy=False),
         "task_ids": np.full(steps * envs.num_envs, int(task_id), dtype=np.int32),
-        # source_ids identify the UNIQUE occurrence that produced each row.
-        # This is deliberately separate from task_ids because the continual
-        # sequence revisits the same task IDs.
         "source_ids": np.full(steps * envs.num_envs, int(seq_idx), dtype=np.int32),
-        "aux_metric": np.concatenate(velocity_rows, axis=0),
         "task_error": np.concatenate(error_rows, axis=0),
     }
     return buffer, time.time() - start
 
 
 def _validate_args(args):
+    if args.distill_buffer_steps is not None:
+        args.distill_extra_steps = int(args.distill_buffer_steps)
+    budget = TaskBudget(args.total_timesteps, args.distill_extra_steps)
+    if args.learning_starts < 0 or args.random_actions_end < 0:
+        raise ValueError("learning_starts and random_actions_end must be nonnegative")
+    if budget.training <= args.learning_starts + 1:
+        raise ValueError("Delta - B must exceed learning_starts + 1 so SAC can update")
+    if args.composition_space == "policy":
+        if args.distill_extra_steps < 2 or args.projection_epochs < 1 or args.projection_max_samples < 2:
+            raise ValueError("Policy composition requires B >= 2 and a nonempty projection budget")
+        if args.use_alpha_mass and not args.constrain_alpha_mass:
+            raise ValueError("Policy mixtures require --constrain-alpha-mass")
+    if args.policy_student_replay:
+        if args.composition_space != "policy":
+            raise ValueError("--policy-student-replay requires --composition-space=policy")
+        if args.fusion_mode != "weight_delta" or not args.use_alpha_mass:
+            raise ValueError("--policy-student-replay requires weight_delta with alpha-mass")
+        if not args.distillation:
+            raise ValueError("--policy-student-replay is the combined behavioral-distillation variant")
     if args.fusion_mode == "classic_cka" and args.use_alpha_mass:
         raise ValueError("--use-alpha-mass is only valid with --fusion-mode=weight_delta")
     if args.use_alpha_scale and args.fix_alpha_scale:
         raise ValueError("--use-alpha-scale and --fix-alpha-scale are mutually exclusive")
     if args.alpha_lr <= 0 or args.policy_lr <= 0 or args.q_lr <= 0:
         raise ValueError("policy/q/alpha learning rates must be > 0")
+    if args.alpha_mass_lr is not None and args.alpha_mass_lr <= 0:
+        raise ValueError("alpha_mass_lr must be > 0 when specified")
     if args.alpha_warmup_steps < 0:
         raise ValueError("alpha_warmup_steps must be >= 0")
     if args.alpha_mass_reg < 0 or args.drift_reg < 0 or args.alpha_entropy_reg < 0:
@@ -422,7 +447,7 @@ if __name__ == "__main__":
     task_name = get_task_name(args.task_id, args.task_suite)
     print(f"\n*** Run name: {run_name} | {task_name} ***\n")
 
-    writer = SummaryWriter(str(pathlib.Path(args.runs_root) / args.tag / run_name))
+    writer = CsvSummaryWriter(str(pathlib.Path(args.runs_root) / args.tag / run_name))
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n%s" % "\n".join(f"|{k}|{v}|" for k, v in vars(args).items()),
@@ -439,15 +464,13 @@ if __name__ == "__main__":
     # during evaluation was a real replay-buffer corruption bug in the old code.
     envs = make_vector_env(args.task_id, args.task_suite)
     eval_env = get_task(args.task_id, task_suite=args.task_suite)
-    # Box.sample() owns an RNG separate from NumPy's global RNG.  The first
-    # random_actions_end exploration actions come from this space, so seed it
-    # explicitly for reproducibility across identical seeds/modes.
+    # Discrete.sample() has its own RNG; seed it explicitly so the random
+    # exploration prefix is reproducible across identical seeds/modes.
     envs.single_action_space.seed(args.seed)
     if not isinstance(envs.single_action_space, gym.spaces.Discrete):
-        raise TypeError("this build targets discrete action spaces (MiniGrid)")
+        raise TypeError("MiniGrid runner requires a Discrete action space")
 
     obs_dim = int(np.prod(envs.single_observation_space.shape))
-    # Each pool head outputs one logit per action; the two heads are summed.
     act_dim = int(envs.single_action_space.n)
     base_dir = args.prev_units[0] if args.prev_units else None
     latest_dir = args.prev_units[-1] if args.prev_units else None
@@ -456,19 +479,25 @@ if __name__ == "__main__":
         latest_dir=latest_dir,
         obs_dim=obs_dim,
         act_dim=act_dim,
-        discrete=True,
         pool_size=args.pool_size,
         encoder_from_base=args.encoder_from_base,
         distillation=args.distillation,
         distill_observation_skip=args.distill_observation_skip,
         max_distill_buffer=args.max_distill_buffer,
         fusion_mode=args.fusion_mode,
+        composition_space=args.composition_space,
+        projection_epochs=args.projection_epochs,
+        projection_max_samples=args.projection_max_samples,
+        policy_student_replay=args.policy_student_replay,
+        merge_ablation=args.merge_ablation,
+        discrete=True,
         use_alpha_mass=args.use_alpha_mass,
         use_alpha_scale=args.use_alpha_scale,
         fix_alpha_scale=args.fix_alpha_scale,
         constrain_alpha_mass=args.constrain_alpha_mass,
         distill_test_frac=args.distill_test_frac,
         similarity_samples=args.similarity_samples,
+        balance_source_lineages=args.balance_source_lineages,
         distill_max_samples=args.distill_max_samples,
         distill_epochs=args.distill_epochs,
         distill_select_best_val=args.distill_select_best_val,
@@ -481,6 +510,7 @@ if __name__ == "__main__":
     )
 
     actor = Actor(envs, model).to(device)
+    actor.evaluation_action_mode = args.eval_action_mode
 
     # Friend-method continual encoder stabilization. When the shared encoder is
     # explicitly trainable in a distillation condition, keep a frozen copy of
@@ -515,14 +545,20 @@ if __name__ == "__main__":
 
     fc_param_ids = {id(p) for p in actor.model.fc.parameters()}
     fc_params = [p for p in actor.model.fc.parameters() if p.requires_grad]
-    alpha_param_objs = []
+    # Keep the within-history routing parameters and the historical-vs-novel
+    # mass gate in separate optimizer groups.  Historically they shared
+    # --alpha-lr; --alpha-mass-lr=None preserves exactly that behavior.
+    alpha_route_param_objs = []
     if actor.model.alpha is not None and actor.model.alpha.requires_grad:
-        alpha_param_objs.append(actor.model.alpha)
+        alpha_route_param_objs.append(actor.model.alpha)
     if actor.model.alpha_scale is not None and actor.model.alpha_scale.requires_grad:
-        alpha_param_objs.append(actor.model.alpha_scale)
+        alpha_route_param_objs.append(actor.model.alpha_scale)
+    alpha_mass_param_objs = []
     if actor.model.alpha_mass is not None and actor.model.alpha_mass.requires_grad:
-        alpha_param_objs.append(actor.model.alpha_mass)
+        alpha_mass_param_objs.append(actor.model.alpha_mass)
+    alpha_param_objs = alpha_route_param_objs + alpha_mass_param_objs
     alpha_param_ids = {id(p) for p in alpha_param_objs}
+    alpha_mass_lr = args.alpha_lr if args.alpha_mass_lr is None else args.alpha_mass_lr
     own_params = [
         p for p in actor_params
         if id(p) not in alpha_param_ids and id(p) not in fc_param_ids
@@ -540,9 +576,32 @@ if __name__ == "__main__":
         param_groups.append({"params": own_params, "lr": args.policy_lr})
     if fc_params:
         param_groups.append({"params": fc_params, "lr": encoder_lr})
-    if alpha_param_objs:
-        param_groups.append({"params": alpha_param_objs, "lr": args.alpha_lr})
-    actor_optimizer = optim.Adam(param_groups)
+    if alpha_route_param_objs:
+        param_groups.append({"params": alpha_route_param_objs, "lr": args.alpha_lr})
+    if alpha_mass_param_objs:
+        param_groups.append({"params": alpha_mass_param_objs, "lr": alpha_mass_lr})
+
+    actor_optimizer = None
+    novel_optimizer = None
+    mixture_optimizer = None
+    if args.policy_student_replay:
+        novel_groups = []
+        if own_params:
+            novel_groups.append({"params": own_params, "lr": args.policy_lr})
+        if fc_params:
+            novel_groups.append({"params": fc_params, "lr": encoder_lr})
+        if not novel_groups:
+            raise RuntimeError("Policy-student mode has no trainable novel-expert parameters")
+        novel_optimizer = optim.Adam(novel_groups)
+        mixture_groups = []
+        if alpha_route_param_objs:
+            mixture_groups.append({"params": alpha_route_param_objs, "lr": args.alpha_lr})
+        if alpha_mass_param_objs:
+            mixture_groups.append({"params": alpha_mass_param_objs, "lr": alpha_mass_lr})
+        if mixture_groups:
+            mixture_optimizer = optim.Adam(mixture_groups)
+    else:
+        actor_optimizer = optim.Adam(param_groups)
 
     # The whole knowledge-vector formulation assumes a FIXED basis: every stored
     # pool entry was learned relative to one particular encoder. If the encoder
@@ -566,12 +625,7 @@ if __name__ == "__main__":
             ).clone()
 
     if args.autotune:
-        # SAC-Discrete target entropy: a fraction of the maximum entropy of a
-        # uniform policy. The continuous rule (-dim(A)) has no meaning here,
-        # and 0.98 * log|A| is the value used in the original SAC-Discrete
-        # paper. On a 7-action grid world it keeps the policy exploratory for
-        # long enough to find the sparse reward without collapsing to uniform.
-        target_entropy = 0.98 * float(np.log(int(envs.single_action_space.n)))
+        target_entropy = 0.98 * float(np.log(envs.single_action_space.n))
         initial_log_alpha = np.log(args.alpha) if args.autotune_init_from_alpha else 0.0
         log_alpha = torch.tensor(
             [initial_log_alpha], dtype=torch.float32, requires_grad=True, device=device
@@ -592,6 +646,9 @@ if __name__ == "__main__":
         handle_timeout_termination=False,
     )
 
+    actor.model.set_mixture_warmup(mixture_warmup_active(
+        0, args.learning_starts, args.alpha_warmup_steps, args.fusion_mode,
+        actor.model.mean_pool.pool_length()))
     theta_task_start = effective_theta_vector(actor.model).detach().clone()
     analysis_dir = f"{args.analysis_root}/{args.tag}/{run_name}"
     if args.save_analysis_snapshots:
@@ -603,24 +660,34 @@ if __name__ == "__main__":
     log_training_state(writer, 0, actor.model, qf1, qf2, qf1_target, qf2_target, theta_task_start)
     # Zero-shot performance before any update on this task is a useful
     # continual-transfer diagnostic and is plotted by run_continual_benchmark.py.
+    actor.model.set_mixture_warmup(mixture_warmup_active(
+        0, args.learning_starts, args.alpha_warmup_steps, args.fusion_mode,
+        actor.model.mean_pool.pool_length()))
     eval_agent(actor, eval_env, args.num_evals, 0, writer, device)
 
     obs, _ = envs.reset(seed=args.seed)
     actor_loss = None
+    novel_actor_loss = None
+    mixture_actor_loss = None
     alpha_loss = None
     drift_loss = None
     alpha_entropy = None
     mass_loss = None
     start_time = time.time()
 
-    for global_step in tqdm(range(args.total_timesteps)):
+    budget = TaskBudget(args.total_timesteps, args.distill_extra_steps)
+    for global_step in tqdm(range(budget.training)):
+        mixture_warmup = mixture_warmup_active(
+            global_step, args.learning_starts, args.alpha_warmup_steps,
+            args.fusion_mode, actor.model.mean_pool.pool_length())
+        actor.model.set_mixture_warmup(mixture_warmup)
         if global_step < args.random_actions_end:
-            actions = np.asarray([envs.single_action_space.sample() for _ in range(envs.num_envs)])
+            actions = np.asarray([envs.single_action_space.sample() for _ in range(envs.num_envs)], dtype=np.int64)
         else:
             with torch.no_grad():
                 actions, _, _ = actor.get_action(torch.as_tensor(obs, dtype=torch.float32, device=device))
-            actions = actions.cpu().numpy()
-        actions = np.asarray(actions).reshape(envs.num_envs)
+            actions = actions.cpu().numpy().astype(np.int64, copy=False)
+        actions = np.asarray(actions, dtype=np.int64).reshape(envs.num_envs)
 
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
         _log_finished_episodes(writer, infos, global_step)
@@ -636,11 +703,9 @@ if __name__ == "__main__":
         if global_step > args.learning_starts:
             data = rb.sample(args.batch_size)
             with torch.no_grad():
-                _, next_log_probs, next_probs = actor.get_action(data.next_observations)
+                _, _, next_probs, next_log_probs, _ = actor.distribution(data.next_observations)
                 q1_next = qf1_target(data.next_observations)
                 q2_next = qf2_target(data.next_observations)
-                # Exact soft value: expectation over the whole action set rather
-                # than a single sample, which is what SAC-Discrete buys us.
                 min_q_next = (
                     next_probs * (torch.min(q1_next, q2_next) - alpha * next_log_probs)
                 ).sum(dim=-1)
@@ -660,71 +725,113 @@ if __name__ == "__main__":
 
             if global_step % args.policy_frequency == 0:
                 for _ in range(args.policy_frequency):
-                    _, log_probs, probs = actor.get_action(data.observations)
-                    with torch.no_grad():
-                        min_q = torch.min(qf1(data.observations), qf2(data.observations))
-                    actor_loss = (probs * (alpha * log_probs - min_q)).sum(dim=-1).mean()
-                    # Entropy of the categorical policy, reused by the alpha
-                    # update below so the distribution is not recomputed.
-                    policy_entropy = -(probs * log_probs).sum(dim=-1)
-
                     drift_loss = None
-                    if (
-                        args.distillation and old_fc is not None and past_obs_pool is not None
-                        and args.drift_reg > 0
-                    ):
-                        drift_idx = np.random.randint(0, len(past_obs_pool), size=args.batch_size)
-                        s_past = torch.as_tensor(
-                            past_obs_pool[drift_idx], dtype=torch.float32, device=device
-                        )
-                        with torch.no_grad():
-                            phi_old = old_fc(s_past)
-                        phi_curr = actor.model.fc(s_past)
-                        drift_loss = args.drift_reg * F.mse_loss(phi_curr, phi_old)
-                        actor_loss = actor_loss + drift_loss
-
-                    in_warmup = global_step < (args.learning_starts + args.alpha_warmup_steps)
-                    # Warmup is meaningful only when there are at least two historical
-                    # slots to mix. With one slot softmax(alpha) is identically 1, so
-                    # freezing the new residual would make the first non-root actor
-                    # effectively untrainable for the entire warmup window.
-                    mixture_warmup = bool(
-                        args.fusion_mode == "weight_delta"
-                        and in_warmup
-                        and actor.model.alpha is not None
-                        and actor.model.alpha.numel() > 1
-                    )
                     alpha_entropy = None
-                    if mixture_warmup and args.alpha_entropy_reg > 0:
-                        scale = actor.model.alpha_scale if actor.model.alpha_scale is not None else 1.0
-                        probs = torch.softmax(actor.model.alpha * scale, dim=-1)
-                        alpha_entropy = -(probs * torch.log(probs + 1e-8)).sum()
-                        actor_loss = actor_loss - args.alpha_entropy_reg * alpha_entropy
-
                     mass_loss = None
-                    if (
-                        not mixture_warmup and actor.model.alpha_mass is not None
-                        and actor.model.alpha_mass.requires_grad and args.alpha_mass_reg > 0
-                    ):
-                        eff_mass = actor.model.mean_pool.effective_alpha_mass()
-                        mass_loss = args.alpha_mass_reg * (eff_mass ** 2) * ((eff_mass - 1.0) ** 2)
-                        actor_loss = actor_loss + mass_loss.mean()
+                    novel_actor_loss = None
+                    mixture_actor_loss = None
 
-                    actor_optimizer.zero_grad()
-                    actor_loss.backward()
+                    if args.policy_student_replay:
+                        # Alternating policy-student update. The replay buffer is
+                        # generated by the execution mixture. During warmup only
+                        # routing coefficients move. Afterwards: (1) update the
+                        # standalone novel expert from replay states using SAC;
+                        # then (2) update alpha/alpha-mass against the freshly
+                        # updated execution mixture, with all expert functions
+                        # detached in the routing objective.
+                        if not mixture_warmup:
+                            novel_actor_loss = actor.novel_actor_objective(
+                                data.observations, qf1, qf2, alpha
+                            )
+                            if (
+                                args.distillation and old_fc is not None and past_obs_pool is not None
+                                and args.drift_reg > 0
+                            ):
+                                drift_idx = np.random.randint(0, len(past_obs_pool), size=args.batch_size)
+                                s_past = torch.as_tensor(
+                                    past_obs_pool[drift_idx], dtype=torch.float32, device=device
+                                )
+                                with torch.no_grad():
+                                    phi_old = old_fc(s_past)
+                                phi_curr = actor.model.fc(s_past)
+                                drift_loss = args.drift_reg * F.mse_loss(phi_curr, phi_old)
+                                novel_actor_loss = novel_actor_loss + drift_loss
+                            novel_optimizer.zero_grad()
+                            novel_actor_loss.backward()
+                            novel_optimizer.step()
 
-                    # Friend method: weight-delta warmup first learns how to mix
-                    # historical slots before allowing the new residual or mass to move.
-                    if mixture_warmup:
-                        for p in own_params:
-                            if p.grad is not None:
-                                p.grad.zero_()
-                        if actor.model.alpha_mass is not None and actor.model.alpha_mass.grad is not None:
-                            actor.model.alpha_mass.grad.zero_()
+                        if mixture_optimizer is not None:
+                            mixture_actor_loss = actor.mixture_weight_objective(
+                                data.observations, qf1, qf2, alpha
+                            )
+                            if mixture_warmup and args.alpha_entropy_reg > 0:
+                                scale = actor.model.alpha_scale if actor.model.alpha_scale is not None else 1.0
+                                probs = torch.softmax(actor.model.alpha * scale, dim=-1)
+                                alpha_entropy = -(probs * torch.log(probs + 1e-8)).sum()
+                                mixture_actor_loss = mixture_actor_loss - args.alpha_entropy_reg * alpha_entropy
+                            if (
+                                not mixture_warmup and actor.model.alpha_mass is not None
+                                and actor.model.alpha_mass.requires_grad and args.alpha_mass_reg > 0
+                            ):
+                                eff_mass = actor.model.mean_pool.effective_alpha_mass()
+                                mass_loss = args.alpha_mass_reg * (eff_mass ** 2) * ((eff_mass - 1.0) ** 2)
+                                mixture_actor_loss = mixture_actor_loss + mass_loss.mean()
+                            mixture_optimizer.zero_grad()
+                            mixture_actor_loss.backward()
+                            mixture_optimizer.step()
 
-                    actor_optimizer.step()
+                        actor_loss = novel_actor_loss if novel_actor_loss is not None else mixture_actor_loss
+                    else:
+                        actor_loss = actor.actor_objective(data.observations, qf1, qf2, alpha)
+
+                        if (
+                            args.distillation and old_fc is not None and past_obs_pool is not None
+                            and args.drift_reg > 0
+                        ):
+                            drift_idx = np.random.randint(0, len(past_obs_pool), size=args.batch_size)
+                            s_past = torch.as_tensor(
+                                past_obs_pool[drift_idx], dtype=torch.float32, device=device
+                            )
+                            with torch.no_grad():
+                                phi_old = old_fc(s_past)
+                            phi_curr = actor.model.fc(s_past)
+                            drift_loss = args.drift_reg * F.mse_loss(phi_curr, phi_old)
+                            actor_loss = actor_loss + drift_loss
+
+                        # mixture_warmup was set before choosing this step's action.
+                        # A singleton pool still gets a historical-only phase;
+                        # its alpha gradient is correctly zero (there is no choice).
+                        if mixture_warmup and args.alpha_entropy_reg > 0:
+                            scale = actor.model.alpha_scale if actor.model.alpha_scale is not None else 1.0
+                            probs = torch.softmax(actor.model.alpha * scale, dim=-1)
+                            alpha_entropy = -(probs * torch.log(probs + 1e-8)).sum()
+                            actor_loss = actor_loss - args.alpha_entropy_reg * alpha_entropy
+
+                        if (
+                            not mixture_warmup and actor.model.alpha_mass is not None
+                            and actor.model.alpha_mass.requires_grad and args.alpha_mass_reg > 0
+                        ):
+                            eff_mass = actor.model.mean_pool.effective_alpha_mass()
+                            mass_loss = args.alpha_mass_reg * (eff_mass ** 2) * ((eff_mass - 1.0) ** 2)
+                            actor_loss = actor_loss + mass_loss.mean()
+
+                        actor_optimizer.zero_grad()
+                        actor_loss.backward()
+
+                        # Weight-delta warmup first learns how to mix historical
+                        # slots before allowing the new residual or mass to move.
+                        if mixture_warmup:
+                            for p in own_params + fc_params:
+                                p.grad = None
+                            if actor.model.alpha_mass is not None:
+                                actor.model.alpha_mass.grad = None
+
+                        actor_optimizer.step()
 
                     if args.autotune:
+                        with torch.no_grad():
+                            _, _, alpha_probs, alpha_log_probs, _ = actor.distribution(data.observations)
+                            policy_entropy = -(alpha_probs * alpha_log_probs).sum(dim=-1)
                         alpha_loss = (
                             log_alpha.exp() * (policy_entropy.detach() - target_entropy)
                         ).mean()
@@ -747,6 +854,10 @@ if __name__ == "__main__":
                 writer.add_scalar("losses/qf_loss", 0.5 * qf_loss.item(), global_step)
                 if actor_loss is not None:
                     writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
+                if novel_actor_loss is not None:
+                    writer.add_scalar("losses/novel_actor_loss", novel_actor_loss.item(), global_step)
+                if mixture_actor_loss is not None:
+                    writer.add_scalar("losses/mixture_weight_actor_loss", mixture_actor_loss.item(), global_step)
                 if drift_loss is not None:
                     writer.add_scalar("losses/encoder_drift_reg", float(drift_loss.item()), global_step)
                 if alpha_entropy is not None:
@@ -783,27 +894,31 @@ if __name__ == "__main__":
     train_loop_seconds = time.time() - start_time
     writer.add_scalar("timing/train_loop_seconds", train_loop_seconds, global_step)
     print(
-        f"*** TRAIN_LOOP_SECONDS: {train_loop_seconds:.2f} for {args.total_timesteps} steps "
-        f"({args.total_timesteps / max(train_loop_seconds, 1e-9):.2f} steps/sec) ***"
+        f"*** TRAIN_LOOP_SECONDS: {train_loop_seconds:.2f} for {budget.training} optimization-phase steps "
+        f"({budget.training / max(train_loop_seconds, 1e-9):.2f} steps/sec) ***"
     )
 
-    needs_merge_buffer = bool(args.distillation or args.collect_cosine_buffers)
-    if needs_merge_buffer:
-        print(f"*** Collecting {args.distill_extra_steps} post-training states for merge diagnostics/distillation ***")
-        merge_buffer, buffer_seconds = collect_merge_buffer(
-            actor, envs, args.distill_extra_steps, args.task_id, args.seq_idx, device,
+    eval_agent(actor, eval_env, args.num_evals, budget.training, writer, device)
+
+    # Every condition receives the SAME Delta-B training steps and B frozen
+    # policy-controlled tail interactions. No optimizer is called in the tail.
+    needs_merge_buffer = bool(args.distillation or args.collect_cosine_buffers
+                              or args.composition_space == "policy")
+    if budget.frozen_tail:
+        print(f"*** Frozen tail: {budget.frozen_tail} steps INSIDE Delta={budget.total} ***")
+        tail_buffer, buffer_seconds = collect_merge_buffer(
+            actor, envs, budget.frozen_tail, args.task_id, args.seq_idx, device,
             seed=args.seed + 123_456,
         )
+        merge_buffer = bounded_buffer(tail_buffer, args.max_distill_buffer) if needs_merge_buffer else None
         writer.add_scalar("timing/merge_buffer_seconds", buffer_seconds, global_step)
-        writer.add_scalar("analysis/buffer/rows", len(merge_buffer["obs"]), global_step)
-        finite_errors = np.asarray(merge_buffer["task_error"]).reshape(-1)
-        finite_errors = finite_errors[np.isfinite(finite_errors)]
-        if finite_errors.size:
-            writer.add_scalar("analysis/buffer/mean_task_error", float(finite_errors.mean()), global_step)
+        writer.add_scalar("analysis/buffer/rows", 0 if merge_buffer is None else len(merge_buffer["obs"]), global_step)
     else:
         merge_buffer = None
         writer.add_scalar("timing/merge_buffer_seconds", 0.0, global_step)
-        print("*** Skipping merge-buffer collection (cosine mode; --no-collect-cosine-buffers) ***")
+    writer.add_scalar("budget/optimization_phase_env_steps", budget.training, global_step)
+    writer.add_scalar("budget/frozen_tail_env_steps", budget.frozen_tail, global_step)
+    writer.add_scalar("budget/total_learning_env_steps", budget.total, global_step)
 
     final_eval = eval_agent(actor, eval_env, args.num_evals, global_step, writer, device)
     actor.model.set_own_buffer(merge_buffer)
@@ -812,6 +927,11 @@ if __name__ == "__main__":
         print(f"Saving trained agent in `{args.save_dir}` with name `{run_name}`")
         run_dir = f"{args.save_dir}/{run_name}"
         actor.model.save_policy_snapshot(run_dir)
+        with open(pathlib.Path(run_dir) / "interaction_budget.json", "w") as f:
+            json.dump({"Delta": budget.total, "optimization_phase_steps": budget.training,
+                       "frozen_tail_steps": budget.frozen_tail,
+                       "monitor_evaluation_steps": getattr(actor, "evaluation_env_steps", 0),
+                       "evaluation_updates_policy": False}, f, indent=2)
 
         if args.save_analysis_snapshots:
             save_task_snapshot(
@@ -825,6 +945,10 @@ if __name__ == "__main__":
             actor.model.set_base()
         else:
             actor.model.finalize()
+        for key, value in actor.model.last_projection_metrics.items():
+            writer.add_scalar(key, value, global_step)
+        with open(pathlib.Path(run_dir) / "projection_metrics.json", "w") as f:
+            json.dump(actor.model.last_projection_metrics, f, indent=2)
         finalize_seconds = time.time() - merge_start
         writer.add_scalar("timing/finalize_seconds", finalize_seconds, global_step)
         print(f"*** FINALIZE_SECONDS: {finalize_seconds:.4f} ***")
@@ -850,13 +974,39 @@ if __name__ == "__main__":
                 writer.add_scalar("analysis/merge/pairwise_cosine_min", merge_info["pairwise_cosine_min"], global_step)
                 writer.add_scalar("analysis/merge/pairwise_cosine_mean", merge_info["pairwise_cosine_mean"], global_step)
                 writer.add_scalar("analysis/merge/pairwise_cosine_max", merge_info["pairwise_cosine_max"], global_step)
+            elif merge_info["similarity_metric"] == "random":
+                writer.add_scalar("analysis/merge/random_pair", 1.0, global_step)
             else:
                 raise RuntimeError(f"unknown merge similarity metric: {merge_info['similarity_metric']}")
             writer.add_scalar("analysis/merge/idx1", merge_info["idx1"], global_step)
             writer.add_scalar("analysis/merge/idx2", merge_info["idx2"], global_step)
+            if merge_info.get("discard_only", False):
+                writer.add_scalar("analysis/merge/discard_only", 1.0, global_step)
+                writer.add_scalar("analysis/merge/discarded_index", merge_info["discarded_index"], global_step)
+                writer.add_scalar("analysis/merge/surviving_index_before_removal", merge_info["surviving_index_before_removal"], global_step)
             if "similarity_states" in merge_info:
                 writer.add_scalar("analysis/merge/similarity_states", merge_info["similarity_states"], global_step)
             writer.add_scalar("analysis/merge/used_distillation", float(merge_info["used_distillation"]), global_step)
+            writer.add_scalar(
+                "analysis/merge/balance_source_lineages",
+                float(merge_info.get("balance_source_lineages", False)),
+                global_step,
+            )
+            writer.add_scalar(
+                "analysis/merge/source_lineages_parent_1",
+                len(merge_info.get("parent_1_source_lineage", {})),
+                global_step,
+            )
+            writer.add_scalar(
+                "analysis/merge/source_lineages_parent_2",
+                len(merge_info.get("parent_2_source_lineage", {})),
+                global_step,
+            )
+            writer.add_scalar(
+                "analysis/merge/source_lineages_merged",
+                len(merge_info.get("merged_source_lineage", {})),
+                global_step,
+            )
             writer.add_scalar("analysis/merge/pool_size_before", merge_info["pool_size_before"], global_step)
             writer.add_scalar("analysis/merge/pool_size_after", merge_info["pool_size_after"], global_step)
             lineage = {
@@ -898,7 +1048,6 @@ if __name__ == "__main__":
         writer.add_scalar("charts/final_return", final_eval["return"], global_step)
         writer.add_scalar("charts/final_success", final_eval["success"], global_step)
         writer.add_scalar("charts/final_task_error", final_eval["task_error"], global_step)
-        writer.add_scalar("charts/final_aux_metric", final_eval["aux_metric"], global_step)
         actor.model.save(dirname=run_dir)
         manifest = write_manifest(
             run_dir, vars(args), parent_dirs=args.prev_units,

@@ -11,7 +11,7 @@ Run this once, BEFORE computing forward transfer, with the SAME
 --total-timesteps you use for the real continual run:
 
     python3 scratch_baselines.py --task-suites doorkey4 \
-        --total-timesteps 300000
+        --total-timesteps 60000
 
 Resumable: an already-complete (variant, suite, task_id, seed) combination is
 detected via checkpoint_complete() and skipped, not retrained. The current
@@ -47,8 +47,9 @@ def normalize_variant(variant):
     return variant
 
 
-def variant_for_condition(condition, distill_observation_skip=True):
+def variant_for_condition(condition, distill_observation_skip=False):
     """Return the scratch actor architecture matching a continual condition."""
+    condition = condition.removesuffix("_policy")
     if distill_observation_skip and condition in ("distil_only", "combined"):
         return "distill_skip"
     return "plain"
@@ -105,6 +106,8 @@ def _expected_training_config(suite, task_id, total_timesteps, seed, args, varia
         "seed": int(seed),
         "cuda": not bool(args.cpu),
         "fusion_mode": "classic_cka",
+        "composition_space": "parameter",
+        "eval_action_mode": getattr(args, "eval_action_mode", "deterministic"),
         "total_timesteps": int(total_timesteps),
         "gamma": float(args.gamma),
         "tau": float(args.tau),
@@ -135,7 +138,7 @@ def _expected_training_config(suite, task_id, total_timesteps, seed, args, varia
         "train_shared": bool(args.train_shared),
         "encoder_linear_out": bool(args.encoder_linear_out),
         "distill_observation_skip": use_skip_arch,
-        "distill_extra_steps": 1 if use_skip_arch else int(args.distill_extra_steps),
+        "distill_extra_steps": int(args.distill_extra_steps),
         "collect_cosine_buffers": False,
         "max_distill_buffer": int(args.max_distill_buffer),
         "similarity_samples": int(args.similarity_samples),
@@ -148,12 +151,16 @@ def _expected_training_config(suite, task_id, total_timesteps, seed, args, varia
     }
 
 
-def checkpoint_matches(path, suite, task_id, total_timesteps, seed, args, variant="plain"):
+def checkpoint_matches(
+    path, suite, task_id, total_timesteps, seed, args, variant="plain", *,
+    check_runtime=True,
+):
     expected = _expected_training_config(suite, task_id, total_timesteps, seed, args, variant)
     if not checkpoint_complete(path):
         return False, "checkpoint files or valid run_manifest.json are missing"
     return identity_checkpoint_matches(
-        path, expected, pretrained_encoder=args.pretrained_encoder
+        path, expected, pretrained_encoder=args.pretrained_encoder,
+        check_runtime=check_runtime,
     )
 
 
@@ -183,6 +190,8 @@ def train_one_baseline(suite, task_id, total_timesteps, seed, args, variant="pla
     cmd = [
         sys.executable, "run_sac.py",
         "--model-type=cka-rl",
+        "--composition-space=parameter",
+        f"--eval-action-mode={getattr(args, 'eval_action_mode', 'deterministic')}",
         f"--task-suite={suite}",
         f"--task-id={task_id}",
         "--seq-idx=0",
@@ -212,7 +221,7 @@ def train_one_baseline(suite, task_id, total_timesteps, seed, args, variant="pla
         f"--eval-every={args.eval_every}",
         f"--num-evals={args.num_evals}",
         "--distill-observation-skip" if use_skip_arch else "--no-distill-observation-skip",
-        f"--distill-extra-steps={1 if use_skip_arch else args.distill_extra_steps}",
+        f"--distill-extra-steps={args.distill_extra_steps}",
         f"--max-distill-buffer={args.max_distill_buffer}",
         f"--similarity-samples={args.similarity_samples}",
         f"--distill-max-samples={args.distill_max_samples}",
@@ -221,6 +230,8 @@ def train_one_baseline(suite, task_id, total_timesteps, seed, args, variant="pla
         f"--distill-batch-size={args.distill_batch_size}",
         f"--distill-test-frac={args.distill_test_frac}",
         f"--analysis-log-every={args.analysis_log_every}",
+        # Scratch FT uses scalar learning curves; task-boundary tensor snapshots are redundant.
+        "--no-save-analysis-snapshots",
         # A scratch baseline is a lone root task, so no merge can happen. For
         # distill_skip, distillation=True exists only to construct the same
         # [phi(s), s] actor-head input used by continual distillation modes.
@@ -270,12 +281,12 @@ def parse_args():
         choices=sorted(TASK_SUITES.keys()),
     )
     p.add_argument("--seeds", nargs="+", type=int, default=DEFAULT_SCRATCH_SEEDS)
-    p.add_argument("--variants", nargs="+", choices=list(SCRATCH_VARIANTS), default=list(SCRATCH_VARIANTS),
-                   help="Actor architectures to cache for FT. Default trains both plain and distill_skip.")
-    p.add_argument("--total-timesteps", type=int, default=300_000,
+    p.add_argument("--variants", nargs="+", choices=list(SCRATCH_VARIANTS), default=["plain"],
+                   help="Actor architectures to cache for FT. Default trains plain; distill_skip remains optional.")
+    p.add_argument("--total-timesteps", type=int, default=60_000,
                     help="MUST match the continual run's --total-timesteps for FT to be valid.")
-    p.add_argument("--learning-starts", type=int, default=5_000)
-    p.add_argument("--random-actions-end", type=int, default=10_000)
+    p.add_argument("--learning-starts", type=int, default=1_000)
+    p.add_argument("--random-actions-end", type=int, default=2_000)
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--policy-lr", type=float, default=3e-4)
     p.add_argument("--alpha-lr", type=float, default=5e-3)
@@ -290,11 +301,12 @@ def parse_args():
     p.add_argument("--alpha", type=float, default=0.2)
     p.add_argument("--autotune", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--autotune-init-from-alpha", action=argparse.BooleanOptionalAction, default=False)
-    p.add_argument("--pool-size", type=int, default=5)
-    p.add_argument("--eval-every", type=int, default=10_000)
+    p.add_argument("--pool-size", type=int, default=4)
+    p.add_argument("--eval-every", type=int, default=2_500)
     p.add_argument("--num-evals", type=int, default=5)
-    p.add_argument("--distill-observation-skip", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--distill-extra-steps", type=int, default=10_000)
+    p.add_argument("--distill-observation-skip", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--distill-extra-steps", "--distill-buffer-steps", dest="distill_extra_steps", type=int, default=5_000)
+    p.add_argument("--eval-action-mode", choices=["deterministic", "stochastic"], default="deterministic")
     p.add_argument("--max-distill-buffer", type=int, default=50_000)
     p.add_argument("--similarity-samples", type=int, default=2_048)
     p.add_argument("--distill-max-samples", type=int, default=20_000)
@@ -303,7 +315,7 @@ def parse_args():
     p.add_argument("--distill-batch-size", type=int, default=256)
     p.add_argument("--distill-test-frac", type=float, default=0.2)
     p.add_argument("--distill-select-best-val", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--analysis-log-every", type=int, default=5_000)
+    p.add_argument("--analysis-log-every", type=int, default=2_500)
     p.add_argument("--save-root", default=SCRATCH_SAVE_ROOT)
     p.add_argument("--runs-root", default="runs")
     p.add_argument("--analysis-root", default="analysis_runs_scratch")

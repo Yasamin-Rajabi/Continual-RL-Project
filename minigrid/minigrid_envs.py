@@ -14,10 +14,9 @@ WHY MINIGRID FITS THIS PROJECT
    ``1 - 0.9 * (steps / max_steps)`` on success and 0 otherwise, so episodic
    return lies in [0, 1] and the survey's forward-transfer formula applies with
    no per-task reference scaling.
-3. A step of MiniGrid costs roughly two orders of magnitude less than a MuJoCo
-   step. On the HalfCheetah suite the environment was the bottleneck at about
-   60 steps/s; here the SAC update dominates instead, which is what makes a
-   multi-task, multi-seed sweep affordable at all.
+3. MiniGrid is computationally lightweight relative to the MuJoCo suites used
+   elsewhere in this project, making it suitable for a short-budget additional
+   benchmark.
 4. The action space is discrete, so the behavioural similarity between two pool
    entries is an exact categorical KL rather than the diagonal-Gaussian
    approximation used on continuous control. The merge criterion is therefore
@@ -51,7 +50,7 @@ INFO KEYS EXPOSED
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Sequence
 
 import gymnasium
 import numpy as np
@@ -82,8 +81,14 @@ class MiniGridFlatWrapper(gymnasium.Env):
     gymnasium forms, so the rest of the codebase sees exactly one API.
     """
 
-    def __init__(self, env):
+    def __init__(self, env, progress_stages: Sequence[str] = ("goal",)):
         self.env = env
+        self.progress_stages = tuple(progress_stages)
+        unknown = set(self.progress_stages) - {"key", "door", "goal"}
+        if unknown:
+            raise ValueError(f"Unknown MiniGrid progress stages: {sorted(unknown)}")
+        if not self.progress_stages:
+            raise ValueError("progress_stages must contain at least one stage")
         inner = env.observation_space
         image_space = inner["image"] if hasattr(inner, "spaces") else inner
         self.obs_dim = int(np.prod(image_space.shape))
@@ -135,7 +140,8 @@ class MiniGridFlatWrapper(gymnasium.Env):
                         door_open = 1.0
                     break
 
-        return float(holds_key + door_open + reached) / 3.0
+        values = {"key": holds_key, "door": door_open, "goal": reached}
+        return float(sum(values[name] for name in self.progress_stages)) / float(len(self.progress_stages))
 
     # -- gym API --------------------------------------------------------- #
     def reset(self, *, seed=None, options=None):
@@ -178,7 +184,8 @@ class MiniGridFlatWrapper(gymnasium.Env):
         return self.env.close()
 
 
-def make_env(env_id: str, max_episode_steps: Optional[int] = None, render: bool = False):
+def make_env(env_id: str, max_episode_steps: Optional[int] = None, render: bool = False,
+             progress_stages: Sequence[str] = ("goal",)):
     """Build one MiniGrid task, wrapped for this codebase.
 
     max_episode_steps overrides MiniGrid's default horizon. The defaults scale
@@ -207,7 +214,7 @@ def make_env(env_id: str, max_episode_steps: Optional[int] = None, render: bool 
         env = gym.make(env_id, **kwargs)
 
     env = ImgObsWrapper(env)
-    wrapped = MiniGridFlatWrapper(env)
+    wrapped = MiniGridFlatWrapper(env, progress_stages=progress_stages)
     if max_episode_steps is not None:
         wrapped = gymnasium.wrappers.TimeLimit(wrapped, max_episode_steps=int(max_episode_steps))
     return wrapped

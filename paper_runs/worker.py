@@ -247,6 +247,18 @@ def main():
     spec=read_json(opt.spec)
     if not spec:raise ValueError('Invalid job spec')
     env=Path(spec['project_root'])/spec['environment'];sys.path.insert(0,str(env));os.chdir(env)
+    if spec['environment']=='minigrid':
+        # Fail on the login-node preflight rather than after an H100 allocation.
+        try:
+            import gymnasium as _gymnasium  # noqa: F401
+            import minigrid as _minigrid  # noqa: F401
+            from tasks import get_task as _get_task
+            _probe=_get_task(0, task_suite=spec['suite']); _probe.reset(seed=0); _probe.close()
+        except Exception as exc:
+            raise RuntimeError(
+                'MiniGrid runtime dependency/task registration check failed. '
+                'Run: bash minigrid/setup_cluster_env.sh'
+            ) from exc
     args=benchmark_args(spec)
     if args.force_retrain:
         raise ValueError('The safe launcher refuses --force-retrain. Use a distinct --comment instead.')

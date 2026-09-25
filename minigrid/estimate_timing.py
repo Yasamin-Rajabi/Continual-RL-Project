@@ -6,7 +6,7 @@ import json
 import pathlib
 
 import numpy as np
-from tensorboard.backend.event_processing import event_accumulator
+from metrics import load_scalar
 
 
 def parse_args():
@@ -16,17 +16,8 @@ def parse_args():
 
 
 def last_scalar(directory, tag):
-    try:
-        ea = event_accumulator.EventAccumulator(
-            str(directory), size_guidance={event_accumulator.SCALARS: 0}
-        )
-        ea.Reload()
-    except Exception:
-        return None
-    if tag not in ea.Tags().get("scalars", []):
-        return None
-    vals = ea.Scalars(tag)
-    return vals[-1].value if vals else None
+    _, values = load_scalar(directory, tag)
+    return float(values[-1]) if len(values) else None
 
 
 def main():
@@ -38,9 +29,11 @@ def main():
         )
     config = json.load(open(config_path))
     runs_root = pathlib.Path(config["runs_root"])
-    event_dirs = sorted({p.parent for p in runs_root.rglob("events.out.tfevents.*")})
+    event_dirs = {p.parent for p in runs_root.rglob("events.out.tfevents.*")}
+    event_dirs.update(p.parent for p in runs_root.rglob("scalars.csv"))
+    event_dirs = sorted(event_dirs)
     if not event_dirs:
-        raise SystemExit(f"No TensorBoard event files under {runs_root}")
+        raise SystemExit(f"No timing scalar logs under {runs_root}")
 
     train, buffer, finalize = [], [], []
     for directory in event_dirs:

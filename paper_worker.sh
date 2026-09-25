@@ -13,6 +13,12 @@ PY
 PROJECT_ROOT="${SETTINGS[0]}"; ENV_DIR="${SETTINGS[1]}"; IMAGE="${SETTINGS[2]}"
 [[ -r "$IMAGE" ]] || { echo "Missing image: $IMAGE" >&2; exit 2; }
 export APPTAINERENV_PYTHONNOUSERSITE=1
+# Optional project-local dependencies. MiniGrid is not part of every MuJoCo
+# container, so minigrid/setup_cluster_env.sh can install only that package
+# under this bind-mounted directory without modifying the immutable image.
+if [[ "$ENV_DIR" == "minigrid" && -d "$PROJECT_ROOT/.paper_deps/minigrid" ]]; then
+    export APPTAINERENV_PYTHONPATH="$PROJECT_ROOT/.paper_deps/minigrid${PYTHONPATH:+:$PYTHONPATH}"
+fi
 export APPTAINERENV_MPLBACKEND=Agg
 export APPTAINERENV_MUJOCO_GL=egl
 export APPTAINERENV_PYOPENGL_PLATFORM=egl

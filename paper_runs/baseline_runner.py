@@ -29,6 +29,17 @@ def path_for(spec,seed,index):
     root=Path(spec['run_root'])
     return root/'agents'/tag,root/'runs'/tag,root/'analysis'/tag
 
+# These are the exact hashes of the shared baseline trainer in the uploaded
+# pre-MiniGrid paper code. Keeping them for the continuous environments means
+# adding a discrete branch does not invalidate already-completed
+# HalfCheetah/Walker2D/AntDir baseline manifests. The MiniGrid source identity
+# always hashes the current files normally.
+_LEGACY_CONTINUOUS_SHARED_HASHES = {
+    "paper_runs/baseline_runner.py": "3ff72ccbe4e2ded93f4296b757eec36e9c1d3ffbc1008953a3d4b017778dee61",
+    "paper_runs/baseline_sac.py": "ea18a9a355aa91636e2220dd29e567c98a77f86e76e7ecde01a46b9155f333b5",
+}
+
+
 def source_signature(spec):
     root=Path(spec['project_root']);env=root/spec['environment']
     files=[root/'paper_runs'/name for name in
@@ -37,7 +48,10 @@ def source_signature(spec):
     # Evaluator, launcher and smoke-test edits are not training changes.
     files += [env/x for x in ('tasks.py','shared_arch.py','policy_composition.py','policy_utils.py','training_protocol.py')]
     files += sorted(env.glob('*envs.py'))
-    return digest({str(p.relative_to(root)):file_hash(p) for p in files})
+    hashes={str(path.relative_to(root)):file_hash(path) for path in files}
+    if spec['environment'] != 'minigrid':
+        hashes.update(_LEGACY_CONTINUOUS_SHARED_HASHES)
+    return digest(hashes)
 
 def expected(spec,args,seed,index,parent):
     import experiment_identity as identity
@@ -105,7 +119,10 @@ def train_one(spec,args,index):
         parent=read_json(prev/'baseline_manifest.json')['signature']
     else:
         probe=get_task(task,task_suite=spec['suite'])
-        obs=int(np.prod(probe.observation_space.shape));act=int(np.prod(probe.action_space.shape));probe.close()
+        obs=int(np.prod(probe.observation_space.shape))
+        act=(int(probe.action_space.n) if hasattr(probe.action_space, "n")
+             else int(np.prod(probe.action_space.shape)))
+        probe.close()
         agent=BaselineAgent(spec['method'],obs,act,len(spec['sequence']),
                  **{k:cfg[k] for k in ('hidden_dim','encoder_linear_out','packnet_capacity','packnet_keep',
                    'packnet_retrain_fraction','cbp_replacement_rate','cbp_maturity_threshold','cbp_decay_rate')})

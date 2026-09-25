@@ -27,18 +27,20 @@ def parse_args():
     )
     p.add_argument("--seeds", nargs="+", type=int, default=[101])
     p.add_argument("--task-sequence", nargs="+", type=int, default=list(DEFAULT_CONTINUAL_SEQUENCE))
-    p.add_argument("--total-timesteps", type=int, default=80_000)
+    p.add_argument("--total-timesteps", type=int, default=60_000)
 
     # Metric and test-time adaptation controls.
     p.add_argument("--retention-eval-episodes", type=int, default=3)
-    p.add_argument("--test-adapt-steps", type=int, default=1000,
+    p.add_argument("--test-adapt-steps", type=int, default=0,
                    help="Number of alpha-only adaptation steps before retention/final evaluation; 0 disables it.")
+    p.add_argument("--frozen-eval-policy", choices=["pool", "snapshot"], default="pool")
+    p.add_argument("--eval-action-mode", choices=["deterministic", "stochastic"], default="deterministic")
     p.add_argument("--test-adapt-lr", type=float, default=1e-2,
                    help="Learning rate for test-time alpha adaptation.")
 
     p.add_argument("--save-root", default="agents_minigrid")
     p.add_argument("--runs-root", default="runs")
-    p.add_argument("--plots-root", default="plots_custom_evaluation")
+    p.add_argument("--plots-root", default="plots_minigrid_custom_evaluation")
     p.add_argument("--analysis-root", default="analysis_runs")
 
     p.add_argument("--skip-retention", action="store_true")

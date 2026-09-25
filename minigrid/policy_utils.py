@@ -76,10 +76,10 @@ def categorical_kl(logits_p: torch.Tensor, logits_q: torch.Tensor) -> torch.Tens
 
 
 def symmetric_categorical_kl(logits_p: torch.Tensor, logits_q: torch.Tensor) -> torch.Tensor:
-    """Jeffreys divergence, KL(p||q) + KL(q||p).
+    """Mean bidirectional KL: 0.5 * (KL(p||q) + KL(q||p)).
 
-    Symmetric because merging is symmetric: neither entry in a candidate pair
-    is privileged, so an asymmetric score would make the selected pair depend
-    on pool ordering.
+    This uses the same normalization as ``symmetric_diagonal_gaussian_kl`` in
+    the continuous-control environments and as the paper's pair-selection
+    definition.
     """
-    return categorical_kl(logits_p, logits_q) + categorical_kl(logits_q, logits_p)
+    return 0.5 * (categorical_kl(logits_p, logits_q) + categorical_kl(logits_q, logits_p))

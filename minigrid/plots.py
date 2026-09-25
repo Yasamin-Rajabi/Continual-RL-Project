@@ -1,18 +1,8 @@
-"""All plotting and table/CSV writing for the continual MiniGrid benchmark.
+"""Plotting and table/CSV writing for the continual MiniGrid benchmark.
 
-Pure drawing: every function here takes already-computed data (or reads
-already-logged TensorBoard scalars via metrics.py's path helpers) and writes
-PNG/CSV files. No training, no environment rollouts, no checkpoint loading --
-see run_continual_benchmark.py (orchestration) and metrics.py (all numeric
-computation) for those.
-
-The existing plotting logic (plot_training_metrics, plot_sequence_diagnostics,
-plot_merge_lineage, plot_zero_shot, plot_retention, write_summary_csv) is
-carried over UNCHANGED from the previous run_continual_benchmark.py -- only
-the imports changed (load_scalar/final_scalar/path helpers now come from
-metrics.py instead of being defined locally). Two things are new at the
-bottom: plot_survey_metrics and write_survey_metrics_csv, for the four
-survey metrics (A_N, FG, BWT, FT_success, FT_return) computed in metrics.py.
+All numeric evaluation is delegated to ``metrics.py``. Merge-lineage plots can
+read lightweight metadata from finalized pool checkpoints when optional
+analysis snapshots are disabled by the compact-storage paper configuration.
 """
 from __future__ import annotations
 
@@ -24,6 +14,7 @@ import numpy as np
 
 from metrics import (
     analysis_snapshot_path,
+    checkpoint_dir,
     event_dir,
     final_scalar,
     load_continual_scalar,
@@ -31,12 +22,42 @@ from metrics import (
 )
 from tasks import get_task_name
 
+
+def _load_merge_info_from_saved_state(args, suite, condition, seed, seq_idx, task_id):
+    """Load merge metadata without requiring heavyweight analysis snapshots.
+
+    New compact runs keep this metadata in the finalized mean-pool checkpoint.
+    Old runs that already have post_finalize.pt remain fully supported.
+    """
+    import torch
+
+    path = analysis_snapshot_path(args.analysis_root, suite, condition, seed, seq_idx, task_id)
+    if path.exists():
+        try:
+            snap = torch.load(path, map_location="cpu", weights_only=False)
+            return snap["actor"]["mean_headpool"].get("last_merge_info")
+        except Exception:
+            pass
+
+    pool_path = checkpoint_dir(
+        args.save_root, suite, condition, seed, seq_idx, task_id
+    ) / "mean_pool.pt"
+    if pool_path.exists():
+        try:
+            pool = torch.load(pool_path, map_location="cpu", weights_only=False)
+            return getattr(pool, "last_merge_info", None)
+        except Exception:
+            pass
+    return None
+
 TRAIN_METRICS = {
     "charts/episodic_return": ("Training episodic return", "train_return"),
     "charts/test_episodic_return": ("Evaluation return", "eval_return"),
-    "charts/test_task_error": ("Evaluation velocity error", "eval_task_error"),
+    "charts/test_task_error": ("Evaluation task error", "eval_task_error"),
     "charts/test_success": ("Evaluation success fraction", "eval_success"),
     "losses/actor_loss": ("SAC actor loss", "actor_loss"),
+    "losses/novel_actor_loss": ("Standalone novel-expert SAC loss", "novel_actor_loss"),
+    "losses/mixture_weight_actor_loss": ("Execution-mixture routing loss", "mixture_weight_actor_loss"),
     "losses/qf_loss": ("SAC critic loss", "critic_loss"),
     "losses/alpha": ("SAC entropy coefficient", "entropy_alpha"),
     "analysis/theta/drift_from_task_start_l2": ("Actor drift from task start", "theta_drift"),
@@ -71,7 +92,7 @@ SEQUENCE_METRICS = {
     "timing/merge_buffer_seconds": ("Merge-buffer collection time (s)", "merge_buffer_seconds"),
     "timing/finalize_seconds": ("Finalize / merge time (s)", "finalize_seconds"),
     "analysis/pool/final_length": ("Final knowledge-pool length", "pool_length"),
-    "analysis/buffer/mean_task_error": ("Merge-buffer mean velocity error", "buffer_task_error"),
+    "analysis/buffer/mean_task_error": ("Merge-buffer mean task error", "buffer_task_error"),
 }
 
 
@@ -261,7 +282,7 @@ def plot_retention(args, suite, conditions, all_payloads):
 
     for metric, ylabel in (
         ("return", "Average return on seen tasks"),
-        ("task_error", "Average velocity error on seen tasks"),
+        ("task_error", "Average task error on seen tasks"),
         ("success", "Average success fraction on seen tasks"),
     ):
         fig, ax = plt.subplots(figsize=(10.5, 5.3))
@@ -361,8 +382,8 @@ def plot_retention(args, suite, conditions, all_payloads):
             yerr=final_returns.std() if len(final_returns) > 1 else None,
             marker="o", capsize=3, label=condition,
         )
-    ax.set_title(f"{suite}: final return / tracking-error trade-off")
-    ax.set_xlabel("Final average velocity error (lower is better)")
+    ax.set_title(f"{suite}: final return / task-error trade-off")
+    ax.set_xlabel("Final average task error (lower is better)")
     ax.set_ylabel("Final average return (higher is better)")
     ax.grid(True, linestyle=":", alpha=0.35)
     ax.legend(loc="best")
@@ -386,14 +407,9 @@ def plot_merge_lineage(args, suite, conditions):
         for seed in args.seeds:
             matrix = np.full((len(args.task_sequence), len(eval_task_ids)), np.nan, dtype=np.float64)
             for seq_idx, task_id in enumerate(args.task_sequence):
-                path = analysis_snapshot_path(args.analysis_root, suite, condition, seed, seq_idx, task_id)
-                if not path.exists():
-                    continue
-                try:
-                    snap = torch.load(path, map_location="cpu", weights_only=False)
-                    info = snap["actor"]["mean_headpool"].get("last_merge_info")
-                except Exception:
-                    continue
+                info = _load_merge_info_from_saved_state(
+                    args, suite, condition, seed, seq_idx, task_id
+                )
                 if not info or not info.get("merged_lineage"):
                     continue
                 lineage = info["merged_lineage"]
@@ -436,14 +452,9 @@ def plot_merge_lineage(args, suite, conditions):
                 np.nan, dtype=np.float64,
             )
             for seq_idx, task_id in enumerate(args.task_sequence):
-                path = analysis_snapshot_path(args.analysis_root, suite, condition, seed, seq_idx, task_id)
-                if not path.exists():
-                    continue
-                try:
-                    snap = torch.load(path, map_location="cpu", weights_only=False)
-                    info = snap["actor"]["mean_headpool"].get("last_merge_info")
-                except Exception:
-                    continue
+                info = _load_merge_info_from_saved_state(
+                    args, suite, condition, seed, seq_idx, task_id
+                )
                 if not info or not info.get("merged_source_lineage"):
                     continue
                 lineage = info["merged_source_lineage"]
@@ -485,7 +496,7 @@ def plot_zero_shot(args, suite, conditions):
     out_dir.mkdir(parents=True, exist_ok=True)
     for scalar_tag, title, filename in (
         ("charts/test_episodic_return", "Zero-shot return before training each task", "zero_shot_return"),
-        ("charts/test_task_error", "Zero-shot velocity error before training each task", "zero_shot_task_error"),
+        ("charts/test_task_error", "Zero-shot task error before training each task", "zero_shot_task_error"),
     ):
         fig, ax = plt.subplots(figsize=(10.5, 5.3))
         x = np.arange(len(args.task_sequence))

@@ -7,7 +7,7 @@ from __future__ import annotations
 import importlib.util, json, os, re, subprocess, sys
 from pathlib import Path
 
-ENVIRONMENTS=('half-cheetah','Walker2D','AntDir')
+ENVIRONMENTS=('half-cheetah','Walker2D','AntDir','minigrid')
 METHODS=('baseline','ft_n','prognet','packnet','masknet','crelus','componet','cbpnet','combined_policy')
 ARRAYS=('MAIN_SEEDS','SCRATCH_SEEDS','EVAL_MODES','COMMON_ARGS','COMBINED_POLICY_ARGS')
 VARIABLES=('PROJECT_ROOT','IMAGE','BASE_STORAGE','EXPERIMENT_ROOT')

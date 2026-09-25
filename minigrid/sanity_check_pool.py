@@ -1,9 +1,12 @@
-"""Fast CPU-only tests for the aligned policy pool and behavioral-KL merge.
+"""Fast CPU-only tests for MiniGrid categorical policy reuse/compression.
 
-Run before expensive MuJoCo experiments:
+Run before submitting the paper sweep::
+
     python3 sanity_check_pool.py
 
-No Gymnasium/MuJoCo installation is required for these tests.
+The tests do not require Gymnasium or MiniGrid; they exercise the aligned pool,
+categorical KL pair selection/distillation, policy-space projection, checkpoint
+snapshots, alpha-mass controls and the replay-trained student path.
 """
 from __future__ import annotations
 
@@ -26,11 +29,10 @@ def fake_buffer(n=128, task_id=0, source_id=None):
         source_id = task_id
     return {
         "obs": np.random.randn(n, OBS_DIM).astype(np.float32),
-        "actions": np.tanh(np.random.randn(n, ACT_DIM)).astype(np.float32),
+        "actions": np.random.randint(0, ACT_DIM, size=n, dtype=np.int64),
         "task_ids": np.full(n, task_id, dtype=np.int32),
         "source_ids": np.full(n, source_id, dtype=np.int32),
-        "aux_metric": np.random.randn(n, 1).astype(np.float32),
-        "task_error": np.abs(np.random.randn(n, 1)).astype(np.float32),
+        "task_error": np.random.rand(n, 1).astype(np.float32),
     }
 
 
@@ -39,8 +41,10 @@ def train_a_bit(model, steps=3):
     opt = torch.optim.Adam(params, lr=3e-3)
     for _ in range(steps):
         x = torch.randn(16, OBS_DIM)
-        mean, raw_logstd = model(x)
-        loss = mean.square().mean() + 0.01 * raw_logstd.square().mean()
+        head_a, head_b = model(x)
+        logits = head_a + head_b
+        targets = torch.randint(0, ACT_DIM, (len(x),))
+        loss = torch.nn.functional.cross_entropy(logits, targets)
         opt.zero_grad()
         loss.backward()
         opt.step()
@@ -219,9 +223,13 @@ def check_behavioral_pair_not_weight_cosine():
             # Entries 0 and 1 have wildly different hidden weights but l2=0,
             # so both output exactly mean=0. Entry 2 outputs mean=3.
             "l2_weight": torch.zeros_like(m.mean_pool.own_l2_weight),
-            "l2_bias": torch.zeros_like(m.mean_pool.own_l2_bias) if i < 2 else torch.full_like(m.mean_pool.own_l2_bias, 3.0),
+            "l2_bias": torch.zeros_like(m.mean_pool.own_l2_bias),
             "buffer": buffers[i],
         }
+        if i == 2:
+            # A non-constant categorical logit change; adding the same scalar to
+            # every action would leave the softmax policy unchanged.
+            mean_entry["l2_bias"][0] = 3.0
         log_entry = {
             "l0_weight": torch.randn_like(m.logstd_pool.own_l0_weight) * (15.0 if i == 1 else 1.0),
             "l0_bias": torch.randn_like(m.logstd_pool.own_l0_bias),
@@ -432,6 +440,64 @@ def check_friend_policy_controls():
     shutil.rmtree(root, ignore_errors=True)
     print("  observation-skip + learned/fixed alpha-scale modes OK")
 
+
+def check_policy_student_replay_mode():
+    print("\n=== replay-trained standalone policy-student check ===")
+    from policy_composition import novel_sac_actor_objective, mixture_weight_sac_actor_objective
+
+    root = f"{TMP_ROOT}/policy_student"
+    shutil.rmtree(root, ignore_errors=True)
+    d0 = f"{root}/task0"
+    m0 = CkaRlAgent(
+        OBS_DIM, ACT_DIM, None, None, pool_size=3, distillation=True,
+        fusion_mode="weight_delta", use_alpha_mass=True,
+        composition_space="policy", policy_student_replay=True,
+    )
+    train_a_bit(m0, steps=1)
+    m0.set_own_buffer(fake_buffer(32, task_id=0, source_id=0))
+    m0.set_base(); m0.save(d0)
+
+    m1 = CkaRlAgent(
+        OBS_DIM, ACT_DIM, d0, d0, pool_size=3, distillation=True,
+        fusion_mode="weight_delta", use_alpha_mass=True,
+        composition_space="policy", policy_student_replay=True,
+        encoder_from_base=True,
+    )
+    x = torch.randn(16, OBS_DIM)
+    class Q(torch.nn.Module):
+        def forward(self, obs):
+            # Fixed per-action values are enough to verify gradient routing.
+            base = torch.tensor([0.0, 0.5, 1.0], dtype=obs.dtype, device=obs.device)
+            return base.expand(len(obs), -1)
+    q1 = Q(); q2 = Q()
+
+    for p in m1.parameters():
+        p.grad = None
+    loss = novel_sac_actor_objective(m1, x, q1, q2, 0.2)
+    loss.backward()
+    own = [getattr(pool, "own_" + key) for pool in (m1.mean_pool, m1.logstd_pool) for key in
+           ("l0_weight", "l0_bias", "l2_weight", "l2_bias")]
+    assert any(p.grad is not None and torch.count_nonzero(p.grad) for p in own)
+    assert m1.alpha.grad is None and m1.alpha_mass.grad is None
+
+    for p in m1.parameters():
+        p.grad = None
+    routing = mixture_weight_sac_actor_objective(m1, x, q1, q2, 0.2)
+    routing.backward()
+    assert m1.alpha.grad is not None
+    assert m1.alpha_mass.grad is not None
+    assert all(p.grad is None for p in own), "routing loss leaked gradient into novel expert"
+
+    before = {key: getattr(m1.mean_pool, "own_" + key).detach().clone()
+              for key in ("l0_weight", "l0_bias", "l2_weight", "l2_bias")}
+    m1.set_own_buffer(fake_buffer(32, task_id=1, source_id=1))
+    m1.finalize()
+    assert m1.last_projection_metrics.get("policy/storage_used_novel_expert") == 1.0
+    for key, value in before.items():
+        assert torch.equal(m1.mean_pool.pool[0][key], value)
+    shutil.rmtree(root, ignore_errors=True)
+    print("  novel SAC gradient / alpha-only gradient / direct novel storage OK")
+
 def main():
     torch.manual_seed(0)
     np.random.seed(0)
@@ -447,6 +513,7 @@ def main():
     check_encoder_policy_flags()
     check_distill_selection_ablation()
     check_friend_policy_controls()
+    check_policy_student_replay_mode()
 
     shutil.rmtree(TMP_ROOT, ignore_errors=True)
     print("\n*** ALL CHECKS PASSED ***")

@@ -18,7 +18,7 @@ probability-distribution helpers. This gives the following shared protocol:
 
 Suite-specific behaviour is reached ONLY through ``metrics.ERROR_KEY`` and
 ``metrics.EPISODIC_SUCCESS``, which metrics.py already defines per folder. This
-module is shared by all three target environment folders.
+module is shared by all target environment folders, including discrete MiniGrid.
 
 WHAT IS DELIBERATELY DIFFERENT FROM run_sac.py
 ----------------------------------------------
@@ -79,69 +79,93 @@ def make_vector_env(task_id: int, task_suite: str):
 # Networks
 # ======================================================================
 class SoftQNetwork(nn.Module):
-    """The method's critic, unchanged.
-
-    Note it holds its OWN shared() encoder over [obs, act]; the actor encoder
-    and the critic encoder are separate networks in this codebase.
-    """
+    """Twin-critic network supporting both Box SAC and SAC-Discrete."""
 
     def __init__(self, envs, linear_out: bool = False):
         super().__init__()
-        input_dim = int(
-            np.prod(envs.single_observation_space.shape)
-            + np.prod(envs.single_action_space.shape)
-        )
-        self.fc = shared(input_dim, linear_out=linear_out)
-        self.fc_out = nn.Linear(256, 1)
+        self.discrete = isinstance(envs.single_action_space, gym.spaces.Discrete)
+        obs_dim = int(np.prod(envs.single_observation_space.shape))
+        if self.discrete:
+            self.n_actions = int(envs.single_action_space.n)
+            self.fc = shared(obs_dim, linear_out=linear_out)
+            self.fc_out = nn.Linear(256, self.n_actions)
+        else:
+            input_dim = obs_dim + int(np.prod(envs.single_action_space.shape))
+            self.fc = shared(input_dim, linear_out=linear_out)
+            self.fc_out = nn.Linear(256, 1)
 
-    def forward(self, x, a):
+    def forward(self, x, a=None):
+        if self.discrete:
+            return self.fc_out(self.fc(x))
+        if a is None:
+            raise TypeError("continuous critic requires an action tensor")
         x = torch.cat([x, a], dim=1)
         return self.fc_out(self.fc(x))
 
 
 class BaselineActor(nn.Module):
-    """Thin wrapper giving a baseline agent run_sac.py's Actor interface.
-
-    ``model`` is the ContinualAgent. Its ``policy`` attribute is what
-    policy_composition sees, so ``forward(obs)`` must return
-    ``(mean, raw_log_std)`` with raw, unbounded log-std.
-    """
+    """Thin actor wrapper for both continuous and categorical policies."""
 
     def __init__(self, envs, model):
         super().__init__()
         self.model = model
-        self.register_buffer(
-            "action_scale",
-            torch.as_tensor(
-                (envs.single_action_space.high - envs.single_action_space.low) / 2.0,
-                dtype=torch.float32,
-            ),
-        )
-        self.register_buffer(
-            "action_bias",
-            torch.as_tensor(
-                (envs.single_action_space.high + envs.single_action_space.low) / 2.0,
-                dtype=torch.float32,
-            ),
-        )
+        self.discrete = isinstance(envs.single_action_space, gym.spaces.Discrete)
+        if self.discrete:
+            self.n_actions = int(envs.single_action_space.n)
+        else:
+            self.register_buffer(
+                "action_scale",
+                torch.as_tensor(
+                    (envs.single_action_space.high - envs.single_action_space.low) / 2.0,
+                    dtype=torch.float32,
+                ),
+            )
+            self.register_buffer(
+                "action_bias",
+                torch.as_tensor(
+                    (envs.single_action_space.high + envs.single_action_space.low) / 2.0,
+                    dtype=torch.float32,
+                ),
+            )
 
     @property
     def policy(self):
         return self.model.policy
 
     def forward(self, x):
-        mean, raw_log_std = self.model.policy(x)
-        return mean, bound_log_std(raw_log_std)
+        head_a, head_b = self.model.policy(x)
+        if self.discrete:
+            return head_a + head_b
+        return head_a, bound_log_std(head_b)
+
+    def categorical_distribution(self, x):
+        if not self.discrete:
+            raise TypeError("categorical_distribution is only valid for Discrete actions")
+        logits = self.forward(x)
+        log_probs = torch.log_softmax(logits, dim=-1)
+        return log_probs.exp(), log_probs
 
     def get_action(self, x):
+        if self.discrete:
+            probs, log_probs = self.categorical_distribution(x)
+            action = torch.distributions.Categorical(probs=probs).sample()
+            selected = log_probs.gather(1, action[:, None])
+            return action, selected, probs.argmax(dim=-1)
         return sample_action(self.model.policy, x, self.action_scale, self.action_bias)
 
     def deterministic_action(self, x):
+        if self.discrete:
+            probs, _ = self.categorical_distribution(x)
+            return probs.argmax(dim=-1)
         return representative_action(
             self.model.policy, x, self.action_scale, self.action_bias
         )
 
     def actor_objective(self, obs, q1, q2, temperature):
+        if self.discrete:
+            probs, log_probs = self.categorical_distribution(obs)
+            q = torch.minimum(q1(obs), q2(obs))
+            return (probs * (temperature * log_probs - q)).sum(dim=-1).mean()
         return sac_actor_objective(
             self.model.policy, obs, q1, q2, temperature,
             self.action_scale, self.action_bias,
@@ -177,9 +201,8 @@ def _eval_agent_impl(actor, test_env, num_evals, global_step, writer, device):
                 else actor.deterministic_action(obs_t)
             )
             actor.evaluation_env_steps = getattr(actor, "evaluation_env_steps", 0) + 1
-            obs, reward, terminated, truncated, info = test_env.step(
-                action[0].cpu().numpy()
-            )
+            env_action = int(action[0].item()) if actor.discrete else action[0].cpu().numpy()
+            obs, reward, terminated, truncated, info = test_env.step(env_action)
             ep_return += float(reward)
             if "success" in info:
                 ep_success.append(float(info["success"]))
@@ -305,7 +328,10 @@ def run_frozen_tail(actor, envs, steps, device, seed):
         for _ in range(steps):
             obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device)
             actions, _, _ = actor.get_action(obs_t)
-            obs, _, _, _, _ = envs.step(actions.cpu().numpy())
+            actions_np = actions.cpu().numpy()
+            if actor.discrete:
+                actions_np = np.asarray(actions_np, dtype=np.int64).reshape(envs.num_envs)
+            obs, _, _, _, _ = envs.step(actions_np)
     actor.train()
     return time.time() - start
 
@@ -323,11 +349,10 @@ def train_task(agent, ctx, args, writer, device) -> Dict[str, float]:
 
     envs = make_vector_env(ctx.task_id, ctx.suite)
     eval_env = get_task(ctx.task_id, task_suite=ctx.suite)
-    # Box.sample() owns an RNG separate from NumPy's global RNG, and the first
-    # random_actions_end exploration actions come from it.
+    # Action-space sampling owns its own RNG; seed it for reproducible random exploration.
     envs.single_action_space.seed(args.seed)
-    if not isinstance(envs.single_action_space, gym.spaces.Box):
-        raise TypeError("SAC supports continuous Box actions only")
+    if not isinstance(envs.single_action_space, (gym.spaces.Box, gym.spaces.Discrete)):
+        raise TypeError("SAC supports Box or Discrete action spaces")
 
     agent.to(device)
     agent.on_task_start(ctx)
@@ -359,7 +384,11 @@ def train_task(agent, ctx, args, writer, device) -> Dict[str, float]:
     )
 
     if args.autotune:
-        target_entropy = -float(np.prod(envs.single_action_space.shape))
+        target_entropy = (
+            0.98 * float(np.log(envs.single_action_space.n))
+            if actor.discrete
+            else -float(np.prod(envs.single_action_space.shape))
+        )
         initial_log_alpha = np.log(args.alpha) if args.autotune_init_from_alpha else 0.0
         log_alpha = torch.tensor(
             [initial_log_alpha], dtype=torch.float32, requires_grad=True, device=device
@@ -401,6 +430,8 @@ def train_task(agent, ctx, args, writer, device) -> Dict[str, float]:
                     torch.as_tensor(obs, dtype=torch.float32, device=device)
                 )
             actions = actions.cpu().numpy()
+        if actor.discrete:
+            actions = np.asarray(actions, dtype=np.int64).reshape(envs.num_envs)
 
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
         _log_finished_episodes(writer, infos, global_step)
@@ -416,16 +447,29 @@ def train_task(agent, ctx, args, writer, device) -> Dict[str, float]:
         if global_step > args.learning_starts:
             data = rb.sample(args.batch_size)
             with torch.no_grad():
-                next_actions, next_log_pi, _ = actor.get_action(data.next_observations)
-                q1_next = qf1_target(data.next_observations, next_actions)
-                q2_next = qf2_target(data.next_observations, next_actions)
-                min_q_next = torch.min(q1_next, q2_next) - alpha * next_log_pi
+                if actor.discrete:
+                    next_probs, next_log_probs = actor.categorical_distribution(data.next_observations)
+                    q1_next = qf1_target(data.next_observations)
+                    q2_next = qf2_target(data.next_observations)
+                    min_q_next = (
+                        next_probs * (torch.min(q1_next, q2_next) - alpha * next_log_probs)
+                    ).sum(dim=-1)
+                else:
+                    next_actions, next_log_pi, _ = actor.get_action(data.next_observations)
+                    q1_next = qf1_target(data.next_observations, next_actions)
+                    q2_next = qf2_target(data.next_observations, next_actions)
+                    min_q_next = (torch.min(q1_next, q2_next) - alpha * next_log_pi).view(-1)
                 next_q_value = data.rewards.flatten() + (
                     1.0 - data.dones.flatten()
                 ) * args.gamma * min_q_next.view(-1)
 
-            qf1_values = qf1(data.observations, data.actions).view(-1)
-            qf2_values = qf2(data.observations, data.actions).view(-1)
+            if actor.discrete:
+                action_idx = data.actions.long().view(-1, 1)
+                qf1_values = qf1(data.observations).gather(1, action_idx).view(-1)
+                qf2_values = qf2(data.observations).gather(1, action_idx).view(-1)
+            else:
+                qf1_values = qf1(data.observations, data.actions).view(-1)
+                qf2_values = qf2(data.observations, data.actions).view(-1)
             qf1_loss = F.mse_loss(qf1_values, next_q_value)
             qf2_loss = F.mse_loss(qf2_values, next_q_value)
             qf_loss = qf1_loss + qf2_loss
@@ -451,9 +495,15 @@ def train_task(agent, ctx, args, writer, device) -> Dict[str, float]:
 
                     if args.autotune:
                         with torch.no_grad():
-                            _, log_pi_alpha, _ = actor.get_action(data.observations)
+                            if actor.discrete:
+                                alpha_probs, alpha_log_probs = actor.categorical_distribution(data.observations)
+                                policy_entropy = -(alpha_probs * alpha_log_probs).sum(dim=-1)
+                            else:
+                                _, log_pi_alpha, _ = actor.get_action(data.observations)
                         alpha_loss = (
-                            -log_alpha.exp() * (log_pi_alpha + target_entropy)
+                            log_alpha.exp() * (policy_entropy.detach() - target_entropy)
+                            if actor.discrete
+                            else -log_alpha.exp() * (log_pi_alpha + target_entropy)
                         ).mean()
                         a_optimizer.zero_grad()
                         alpha_loss.backward()

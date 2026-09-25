@@ -21,15 +21,15 @@ import metrics
 
 
 class HistoricalRouter(nn.Module):
-    def __init__(self,policies):
-        super().__init__();self.experts=nn.ModuleList(policies)
+    def __init__(self,policies,discrete=False):
+        super().__init__();self.experts=nn.ModuleList(policies);self.discrete=bool(discrete)
         self.alpha=nn.Parameter(torch.zeros(len(policies)))
         for expert in self.experts:freeze(expert)
     def policy_components(self,obs):
         with torch.no_grad():parts=[p(obs) for p in self.experts]
-        means=torch.stack([x[0] for x in parts],dim=1)
-        logs=torch.stack([bound_log_std(x[1]) for x in parts],dim=1)
-        return means,logs,torch.softmax(self.alpha,dim=0)
+        head_a=torch.stack([x[0] for x in parts],dim=1)
+        head_b=torch.stack([x[1] if self.discrete else bound_log_std(x[1]) for x in parts],dim=1)
+        return head_a,head_b,torch.softmax(self.alpha,dim=0)
 
 
 def finite_mean(values):
@@ -44,13 +44,17 @@ def eval_cell(agent,spec,args,task,seed,device):
         # Oracle is explicit; task identities select only a policy already stored.
         matches=[i for i,t in enumerate(agent.tasks) if t==task]
         if len(policies)>1:policies=[policies[matches[-1] if matches else -1]]
-    policy=HistoricalRouter(policies).to(device).eval();policy.requires_grad_(False)
+    env=get_task(task,task_suite=spec['suite'])
+    discrete=hasattr(env.action_space,'n')
+    policy=HistoricalRouter(policies,discrete=discrete).to(device).eval();policy.requires_grad_(False)
     adapt=int(args.test_adapt_steps) if protocol=='reward_route' else 0
     if adapt and len(policies)>1:policy.alpha.requires_grad_(True)
     opt=torch.optim.Adam([policy.alpha],lr=args.test_adapt_lr) if policy.alpha.requires_grad else None
-    env=get_task(task,task_suite=spec['suite'])
-    scale=torch.as_tensor((env.action_space.high-env.action_space.low)/2,dtype=torch.float32,device=device)
-    bias=torch.as_tensor((env.action_space.high+env.action_space.low)/2,dtype=torch.float32,device=device)
+    if discrete:
+        scale=bias=None
+    else:
+        scale=torch.as_tensor((env.action_space.high-env.action_space.low)/2,dtype=torch.float32,device=device)
+        bias=torch.as_tensor((env.action_space.high+env.action_space.low)/2,dtype=torch.float32,device=device)
     cuda=[device.index if device.index is not None else torch.cuda.current_device()] if device.type=='cuda' else []
     evaluation_steps=0
     try:
@@ -60,8 +64,13 @@ def eval_cell(agent,spec,args,task,seed,device):
                 obs,_=env.reset(seed=seed)
                 for _ in range(adapt):
                     x=torch.as_tensor(obs,dtype=torch.float32,device=device).unsqueeze(0)
-                    action,logp,_=sample_action(policy,x,scale,bias,score_function=True)
-                    obs,reward,done,trunc,_=env.step(action[0].detach().cpu().numpy())
+                    if discrete:
+                        action,logp,_=sample_action(policy,x,score_function=True)
+                        env_action=int(action[0].detach().item())
+                    else:
+                        action,logp,_=sample_action(policy,x,scale,bias,score_function=True)
+                        env_action=action[0].detach().cpu().numpy()
+                    obs,reward,done,trunc,_=env.step(env_action)
                     if opt is not None:
                         loss=-logp.mean()*float(reward);opt.zero_grad();loss.backward();opt.step()
                     if done or trunc:obs,_=env.reset()
@@ -72,9 +81,14 @@ def eval_cell(agent,spec,args,task,seed,device):
                 while True:
                     x=torch.as_tensor(obs,dtype=torch.float32,device=device).unsqueeze(0)
                     with torch.no_grad():
-                        a=(sample_action(policy,x,scale,bias)[0] if spec['mode']=='stochastic'
-                           else representative_action(policy,x,scale,bias))
-                    obs,r,done,trunc,info=env.step(a[0].cpu().numpy());ret+=float(r);evaluation_steps+=1
+                        if discrete:
+                            a=(sample_action(policy,x)[0] if spec['mode']=='stochastic'
+                               else representative_action(policy,x))
+                        else:
+                            a=(sample_action(policy,x,scale,bias)[0] if spec['mode']=='stochastic'
+                               else representative_action(policy,x,scale,bias))
+                    env_action=int(a[0].item()) if discrete else a[0].cpu().numpy()
+                    obs,r,done,trunc,info=env.step(env_action);ret+=float(r);evaluation_steps+=1
                     if 'success' in info:succ.append(float(info['success']))
                     if metrics.ERROR_KEY in info:error.append(float(info[metrics.ERROR_KEY]))
                     if done or trunc:break

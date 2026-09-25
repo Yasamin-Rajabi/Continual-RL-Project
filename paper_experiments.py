@@ -98,6 +98,9 @@ def main():
             else:
                 atomic_json(path,spec)
             e=os.environ.copy();e['APPTAINERENV_PYTHONNOUSERSITE']='1'
+            deps=root/'.paper_deps'/env
+            if deps.is_dir():
+                e['APPTAINERENV_PYTHONPATH']=str(deps)
             precheck=['apptainer','exec','--bind',f'{root}:{root}','--pwd',str(root/env),base['IMAGE'],
                       '/opt/conda/bin/python',str(root/'paper_runs/worker.py'),'--spec',str(path),'--check']
             if not args.no_precheck or args.phase=='status':
