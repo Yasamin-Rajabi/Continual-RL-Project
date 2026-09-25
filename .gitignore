@@ -6,6 +6,7 @@ __pycache__/
 # C extensions
 *.so
 
+.paper_deps
 # Distribution / packaging
 .Python
 build/
