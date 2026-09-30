@@ -30,11 +30,17 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from analysis_logging import effective_theta_vector, log_training_state, save_task_snapshot
+from analysis_logging import (
+    effective_theta_vector,
+    log_routing_values,
+    log_training_state,
+    save_task_snapshot,
+)
 from cka_rl import CkaRlAgent
 from csv_summary_writer import CsvSummaryWriter
 from experiment_identity import write_manifest
 from pointmaze_env import ACT_DIM, EPISODIC_SUCCESS, OBS_DIM
+from policy_composition import split_stacked
 from policy_utils import SquashedGaussian, clamp_log_std
 from replay_buffer import ReplayBuffer
 from tasks import DEFAULT_SUITE, SUITES, get_task, get_task_name, num_tasks
@@ -577,12 +583,48 @@ def main(argv=None):
                     mean, log_std = torch.split(raw, ACT_DIM, dim=-1)
                     novel = SquashedGaussian(mean, clamp_log_std(log_std))
                     a_new, logp = novel.rsample_with_log_prob()
+                    q_pi = agent.critic.min_q(feats, a_new)
+                    actor_loss = (ent_coef * logp - q_pi.squeeze(-1)).mean()
                 else:
-                    dist = agent._distribution_at_features(feats)
-                    a_new, logp = dist.rsample_with_log_prob()
-
-                q_pi = agent.critic.min_q(feats, a_new)
-                actor_loss = (ent_coef * logp - q_pi.squeeze(-1)).mean()
+                    # Exact expectation over every mixture component, rather
+                    # than scoring one torch.multinomial draw. Sampling a
+                    # component index is not differentiable, so the pathwise
+                    # gradient of a single sample never lets Q inform
+                    # `alpha`/`alpha_mass` -- only the entropy-like logp term
+                    # and the mass regularizer would drive them, which lets
+                    # alpha_mass collapse to whichever side of its unstable
+                    # equilibrium it was initialized on, independent of
+                    # whether the freshly trained expert is actually good.
+                    # Computing the loss as E_k~weights[ ent*logp_k - Q_k ]
+                    # keeps `weights` as an explicit differentiable factor,
+                    # so real task-performance gradient reaches the mixture
+                    # weights.
+                    raw, weights = agent._components_at_features(feats)
+                    if weights.numel() > 1:
+                        mean, log_std = split_stacked(raw, ACT_DIM)  # [B,K,A] each, log_std already clamped
+                        comp = SquashedGaussian(mean, log_std)
+                        a_comp, logp_comp = comp.rsample_with_log_prob()  # a_comp:[B,K,A], logp_comp:[B,K]
+                        b, k, a_dim = a_comp.shape
+                        feats_rep = feats.unsqueeze(1).expand(b, k, feats.shape[-1]).reshape(b * k, -1)
+                        q_comp = agent.critic.min_q(feats_rep, a_comp.reshape(b * k, a_dim)).view(b, k)
+                        per_component = ent_coef * logp_comp - q_comp
+                        actor_loss = (weights.unsqueeze(0) * per_component).sum(dim=1).mean()
+                        with torch.no_grad():
+                            # Routing telemetry. q_comp is already computed for
+                            # the loss, so this is free, and it is the one
+                            # measurement that separates "routing picked the
+                            # wrong expert" from "every expert is bad here".
+                            last["q_components"] = q_comp.mean(dim=0).detach().cpu()
+                            last["mix_weights"] = weights.detach().cpu()
+                        with torch.no_grad():
+                            idx = torch.multinomial(weights.expand(b, k), num_samples=1)
+                        a_new = a_comp.gather(1, idx.unsqueeze(-1).expand(b, 1, a_dim)).squeeze(1).detach()
+                        logp = logp_comp.gather(1, idx).squeeze(1).detach()
+                    else:
+                        dist = agent._distribution_at_features(feats)
+                        a_new, logp = dist.rsample_with_log_prob()
+                        q_pi = agent.critic.min_q(feats, a_new)
+                        actor_loss = (ent_coef * logp - q_pi.squeeze(-1)).mean()
 
                 alpha_entropy = None
                 if warmup and args.alpha_entropy_reg > 0 and agent.alpha is not None:
@@ -682,6 +724,7 @@ def main(argv=None):
                 next_eval += args.eval_every
         if next_analysis is not None and global_step >= next_analysis:
             log_training_state(writer, global_step, agent, theta_task_start)
+            log_routing_values(writer, global_step, last)
             while next_analysis is not None and next_analysis <= global_step:
                 next_analysis += args.analysis_log_every
 

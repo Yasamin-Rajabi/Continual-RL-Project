@@ -189,6 +189,50 @@ def _head_tensor_norm(tensors):
         return float(torch.sqrt(sum(t.detach().pow(2).sum() for t in tensors)))
 
 
+def log_routing_values(writer, step, last):
+    """Per-component Q telemetry captured during the actor update.
+
+    ``last["q_components"]`` is the critic's mean value for each mixture
+    component's own action, and ``last["mix_weights"]`` is the routing
+    distribution at that moment.  Both are produced for free by the
+    expectation-form actor loss, and together they answer the question no
+    other logged quantity can:
+
+        routing_regret = max_k Q_k  -  sum_k w_k Q_k
+
+    A regret near zero means routing is already choosing (near-)optimally and
+    a poor score for that task is a *training quality* ceiling.  A large,
+    persistent regret means the mixture is putting its mass on a component
+    the critic itself rates worse -- a routing failure, which is a different
+    problem with a different fix.
+    """
+    q = last.get("q_components")
+    w = last.get("mix_weights")
+    if q is None or w is None or q.numel() != w.numel():
+        return
+    with torch.no_grad():
+        q = q.reshape(-1).float()
+        w = w.reshape(-1).float()
+        routed = float((w * q).sum())
+        best = float(q.max())
+        best_idx = int(q.argmax())
+        writer.add_scalar("analysis/routing/q_routed", routed, step)
+        writer.add_scalar("analysis/routing/q_best", best, step)
+        writer.add_scalar("analysis/routing/regret", best - routed, step)
+        writer.add_scalar("analysis/routing/argmax_component", best_idx, step)
+        writer.add_scalar("analysis/routing/weight_on_argmax", float(w[best_idx]), step)
+        # The novel expert is the last component when alpha-mass is on.
+        writer.add_scalar("analysis/routing/q_novel", float(q[-1]), step)
+        if q.numel() > 1:
+            writer.add_scalar(
+                "analysis/routing/q_novel_minus_best_historical",
+                float(q[-1] - q[:-1].max()),
+                step,
+            )
+        for i in range(q.numel()):
+            writer.add_scalar(f"analysis/routing/q_component_{i}", float(q[i]), step)
+
+
 def log_training_state(writer, step, agent, theta_task_start=None):
     """Cheap scalar histories; safe to call every few thousand steps."""
     with torch.no_grad():
